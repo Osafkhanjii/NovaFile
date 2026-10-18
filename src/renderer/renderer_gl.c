@@ -89,7 +89,9 @@ static COLORREF g_af_key = 0;     // colour currently stored in the DIB
 static bool g_af_filled = false;
 
 // ---- font cache: one HFONT per pixel size (DPI scaling needs this) ----
-#define FONT_CACHE 8
+// 16 slots: DPI steps x the Interface Scaling slider (75-150%) produce
+// more distinct pixel sizes than the fixed DPI steps used to.
+#define FONT_CACHE 16
 static HFONT g_font_cache[FONT_CACHE];
 static int g_font_px[FONT_CACHE];
 static int g_font_cache_n = 0;

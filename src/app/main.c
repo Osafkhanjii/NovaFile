@@ -190,6 +190,29 @@ struct Pane {
 static float g_dpi = 1.0f;                      // 1.0 = 96 DPI, 2.0 = 4K
 #define SC(v) ((int)((v) * g_dpi + 0.5f))
 
+// ---- user UI scale (Settings -> Appearance -> Interface Scaling) ----
+// g_dpi stays THE single scale factor the whole UI multiplies through
+// (SC()); the user's percentage rides on top of the platform DPI, so
+// text, icons, spacing and every other metric scale together through
+// the existing pipeline and can never drift apart.  100% = the exact
+// appearance NovaFile has always had.
+#define UI_SCALE_MIN 75
+#define UI_SCALE_MAX 150
+static float g_hw_dpi = 1.0f;                   // platform DPI (hardware truth)
+static int   g_ui_scale = 100;                  // user scale percent
+
+static void ui_scale_refresh(void) {
+    g_dpi = g_hw_dpi * ((float)g_ui_scale / 100.0f);
+}
+
+static void ui_scale_set(int pct) {
+    if (pct < UI_SCALE_MIN) pct = UI_SCALE_MIN;
+    if (pct > UI_SCALE_MAX) pct = UI_SCALE_MAX;
+    if (pct == g_ui_scale) return;
+    g_ui_scale = pct;
+    ui_scale_refresh();
+}
+
 // Pane chrome: every tiled pane gets a title strip above its list
 // (folder path + close [x] + drag handle); workspace tabs never shrink
 // below TAB_MIN_W - they scroll instead of vanishing.
@@ -1725,6 +1748,8 @@ static void settings_defaults(void) {
         const SetEnt* e = &g_ents[i];
         if (e->kind == EK_OPTION && e->apply && e->var) e->apply(*e->var);
     }
+    g_ui_scale = 100;               // Interface Scaling: back to default
+    ui_scale_refresh();
     settings_save();
 }
 
@@ -1828,6 +1853,11 @@ static void settings_save(void) {
                       ? (*e->var ? 1 : 0) : (e->on ? 1 : 0);
         fprintf(f, "%s\t%d\t%d\t%d\n", e->id, e->key, e->mods, val);
     }
+    // Interface Scaling gets its own line: the entry table above only
+    // stores booleans, so the percentage lives here.  Older builds skip
+    // the unknown id, a missing line keeps the 100% default - this can
+    // never touch any other setting.
+    fprintf(f, "ui_scale\t%d\t0\t1\n", g_ui_scale);
     if (fclose(f) != 0) return;
     MoveFileExA(tmp, g_set_file,
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
@@ -1842,6 +1872,17 @@ static void settings_load(void) {
         size_t n = strlen(line);
         while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
         if (!line[0] || line[0] == '#') continue;
+        // Interface Scaling: its own line, parsed here so the entry
+        // table's boolean rules never see it.  Out of range or malformed
+        // keeps the default (100%) instead of guessing.
+        if (strncmp(line, "ui_scale\t", 9) == 0) {
+            char* end2 = NULL;
+            long sc = strtol(line + 9, &end2, 10);
+            if (end2 && (*end2 == '\0' || *end2 == '\t') &&
+                sc >= UI_SCALE_MIN && sc <= UI_SCALE_MAX)
+                g_ui_scale = (int)sc;
+            continue;
+        }
         char* t1 = strchr(line, '\t');
         if (!t1) continue;                        // malformed: keep default
         *t1 = '\0';
@@ -1891,6 +1932,45 @@ static void settings_load(void) {
             if (hit) { set_entry_default(i); break; }
         }
     }
+    ui_scale_refresh();   // an early caller may have staged the scale
+}
+
+// Read ONLY the Interface Scaling percentage before the window is
+// created: app_init() calls this before the first SC(), because the
+// window size itself is already scaled.  Same store, same TEST SEAM as
+// settings_init(); a missing file or line simply keeps 100%.
+static void ui_scale_pref_load(void) {
+    char p[1400];
+    p[0] = '\0';
+    char v[1100];
+    DWORD vn = GetEnvironmentVariableA("NOVA_SETTINGS_FILE", v,
+                                       (DWORD)sizeof(v));
+    if (vn > 0 && vn < sizeof(v)) {
+        snprintf(p, sizeof p, "%s", v);
+    } else {
+        char dir[1200];
+        if (ct_app_dir(dir, sizeof(dir))) {
+            int w = snprintf(p, sizeof p, "%s\\settings.txt", dir);
+            if (w <= 0 || (size_t)w >= sizeof(p)) p[0] = '\0';
+        }
+    }
+    if (!p[0]) return;
+    FILE* f = fopen(p, "rb");
+    if (!f) return;
+    char line[320];
+    while (fgets(line, sizeof(line), f)) {
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+            line[--n] = 0;
+        if (strncmp(line, "ui_scale\t", 9) != 0) continue;
+        char* end = NULL;
+        long sc = strtol(line + 9, &end, 10);
+        if (end && (*end == '\0' || *end == '\t') &&
+            sc >= UI_SCALE_MIN && sc <= UI_SCALE_MAX)
+            g_ui_scale = (int)sc;
+        break;                       // one line at most
+    }
+    fclose(f);
 }
 
 // (Re)point the store and load it - the test seam the selftest uses.
@@ -1957,6 +2037,10 @@ static char g_set_msg[128];         // conflict / status line
 static int  g_set_rows[CMD_COUNT];  // rows for the active view/filter
 static int  g_set_row_n = 0;
 static int  s_set_vis = 7;          // rows the panel can show (set by draw)
+// ---- "Interface Scaling" card state (drawn inside the panel) ----
+static RectI s_scale_track = {0};   // slider track (rebuilt every frame)
+static RectI s_scale_rst = {0};     // Reset to Default button
+static bool  g_scale_drag = false;  // mouse held on the slider track
 // rects rebuilt by draw_settings every frame (mouse + draw agree)
 static RectI s_set_panel, s_set_filter, s_set_close, s_set_resetall;
 static RectI s_set_cat[SCAT_COUNT];
@@ -10336,6 +10420,86 @@ static void draw_settings(const Layout* L, const InputState* in) {
     int ry0 = hdr_y + L->text_h + SC(16);
     hline(cx, cx + cw, ry0 - SC(6), P->border);
 
+    // ---- "Interface Scaling" card (featured block, Appearance only) ----
+    // A horizontal slider with a live percentage: every change runs
+    // through the SAME SC() pipeline the whole panel uses, so the entire
+    // interface previews the new size frame by frame - no restart.
+    s_scale_track = (RectI){0};
+    s_scale_rst = (RectI){0};
+    if (g_set_cat == SCAT_APPEARANCE && !g_set_filter[0]) {
+        int ch = SC(84);
+        rrect(cx, ry0, cw, ch, SC(8), mixc(P->panel, P->bg, 0.35f),
+              COLOR_BLACK, 0.0f);
+        text_px("Interface Scaling", cx + SC(14), ry0 + SC(8),
+                L->text_med, P->text);
+        // Reset to Default: always visible, inert while at 100%
+        s_scale_rst = (RectI){cx + cw - SC(12) - SC(58), ry0 + SC(7),
+                              SC(58), SC(24)};
+        set_draw_button(L, &s_scale_rst, "Reset", false,
+                        g_ui_scale != 100, in);
+        char dsc[128];
+        fit_text("Adjust the size of text, icons, buttons, and interface "
+                 "elements.", dsc, sizeof dsc, cw - SC(28));
+        text_px(dsc, cx + SC(14), ry0 + SC(8) + L->text_med + SC(2),
+                L->text_small, P->dim);
+        // ---- slider track: continuous UI_SCALE_MIN..UI_SCALE_MAX ----
+        int sl_y = ry0 + ch - SC(26);
+        int sl_x = cx + SC(14);
+        int pct_w = SC(44), tag_w = SC(84);
+        int track_w = cw - SC(28) - pct_w - tag_w;
+        if (track_w < SC(80)) {              // narrow panel: drop the word
+            tag_w = 0;
+            track_w = cw - SC(28) - pct_w;
+            if (track_w < SC(80)) track_w = SC(80);
+        }
+        s_scale_track = (RectI){sl_x, sl_y, track_w, SC(6)};
+        // Live drag: same self-contained lifecycle as the list scrollbar
+        // above - the drag pass updates every frame, the release saves.
+        if (g_scale_drag) {
+            if (in->left_down) {
+                int t = in->x - (s_scale_track.x + SC(7));
+                int span = s_scale_track.w - SC(14);
+                int pct = (span > 0)
+                    ? UI_SCALE_MIN +
+                          (int)((long long)(UI_SCALE_MAX - UI_SCALE_MIN) *
+                                t / span)
+                    : 100;
+                ui_scale_set(pct);           // clamped + live preview
+            } else {
+                g_scale_drag = false;
+                settings_save();             // ONE write per drag, not per pixel
+            }
+        }
+        bool hov = inside(&s_scale_track, in->x, in->y) || g_scale_drag;
+        rrect(s_scale_track.x, s_scale_track.y, s_scale_track.w,
+              s_scale_track.h, SC(3), P->field, COLOR_BLACK, 0.0f);
+        int fill_w = (int)((long long)(g_ui_scale - UI_SCALE_MIN) *
+                           (s_scale_track.w - SC(14)) /
+                           (UI_SCALE_MAX - UI_SCALE_MIN)) + SC(7);
+        if (fill_w > 0)
+            rrect(s_scale_track.x, s_scale_track.y, fill_w,
+                  s_scale_track.h, SC(3), P->accent, COLOR_BLACK, 0.0f);
+        int thx = s_scale_track.x + fill_w - SC(7);
+        rrect(thx, s_scale_track.y - SC(4), SC(14), SC(14), SC(7),
+              hov ? P->paper : P->accent, COLOR_BLACK, 0.0f);
+        // numeric value + size word, so the setting reads at a glance
+        char pv[16];
+        snprintf(pv, sizeof pv, "%d%%", g_ui_scale);
+        text_right_px(pv, sl_x + track_w + pct_w, sl_y - SC(6),
+                      L->text_small, P->text);
+        if (tag_w > 0) {
+            const char* tag = g_ui_scale <= 75   ? "Extra Small"
+                            : g_ui_scale <= 85   ? "Small"
+                            : g_ui_scale <= 100  ? "Default"
+                            : g_ui_scale <= 115  ? "Large"
+                            : g_ui_scale <= 130  ? "Extra Large"
+                                                 : "Maximum";
+            text_px(tag, sl_x + track_w + pct_w + SC(2), sl_y - SC(6),
+                    L->text_small, P->dim);
+        }
+        ry0 += ch + SC(8);                   // the rows start below the card
+    }
+
     // ---- rows: fixed height, two-column, stacked when the window is narrow ----
     int ctl_w = SC(52) + SC(8) + SC(44) + SC(8) + SC(128); // reset+sw+chip
     int list_h = (sy + body_h) - ry0;
@@ -10723,6 +10887,18 @@ static void draw_settings(const Layout* L, const InputState* in) {
             snprintf(g_set_msg, sizeof(g_set_msg),
                      "This resets every setting - press the button again to confirm.");
         }
+        return;
+    }
+    // ---- Interface Scaling card: Reset first, then grab the track ----
+    if (s_scale_rst.w > 0 && inside(&s_scale_rst, in->x, in->y)) {
+        ui_scale_set(100);
+        settings_save();
+        snprintf(g_set_msg, sizeof(g_set_msg),
+                 "Interface scaling is back to 100%% (Default).");
+        return;
+    }
+    if (s_scale_track.w > 0 && inside(&s_scale_track, in->x, in->y)) {
+        g_scale_drag = true;         // live updates run in the draw pass
         return;
     }
     for (int i = 0; i < SCAT_COUNT; i++) {
@@ -16315,8 +16491,14 @@ static bool app_init(void) {
     }
 
     // DPI scale (1.0 / 1.25 / 1.5 / 2.0 ...) - everything goes through SC().
-    g_dpi = platform_dpi_scale();
-    printf("[OK] Platform ready (DPI scale %.2f)\n", (double)g_dpi);
+    // The user's Interface Scaling rides on top of the platform DPI and
+    // is loaded BEFORE the window is created (SC(WIN_W) below), so a
+    // saved scale is already in effect for the very first frame.
+    g_hw_dpi = platform_dpi_scale();
+    ui_scale_pref_load();
+    ui_scale_refresh();
+    printf("[OK] Platform ready (DPI %.2f, UI scale %d%%)\n",
+           (double)g_hw_dpi, g_ui_scale);
 
     if (!platform_window_create(APP_NAME " - file manager", SC(WIN_W), SC(WIN_H))) {
         printf("ERROR: window creation failed\n");
@@ -22139,6 +22321,27 @@ static void run_selftest(void) {
             S_EXP(g_ents[CMD_VIEW].key == VK_F4 && !g_ents[CMD_REFRESH].on,
                   "settings: save + load round trip keeps the rebind and "
                   "the OFF switch");
+
+            // Interface Scaling: clamps, flows into the SC() pipeline and
+            // survives a save + load through its own settings line.
+            float dpi0 = g_dpi;
+            ui_scale_set(UI_SCALE_MAX + 400);
+            S_EXP(g_ui_scale == UI_SCALE_MAX,
+                  "settings: interface scale clamps to the maximum");
+            ui_scale_set(UI_SCALE_MIN - 40);
+            S_EXP(g_ui_scale == UI_SCALE_MIN,
+                  "settings: interface scale clamps to the minimum");
+            ui_scale_set(130);
+            S_EXP(g_dpi == g_hw_dpi * ((float)130 / 100.0f),
+                  "settings: a scale change flows into the SC() pipeline");
+            settings_save();
+            ui_scale_set(100);                // default again in memory
+            S_EXP(g_ui_scale == 100 && g_dpi == dpi0,
+                  "settings: 100% restores the exact default pipeline");
+            settings_set_path(tmp);           // reload from disk
+            S_EXP(g_ui_scale == 130,
+                  "settings: the interface scale survives a save + load");
+            ui_scale_set(100);                // leave the app at default
 
             S_EXP(!set_rebind(CMD_VIEW, 'N', M_CTRL, err, sizeof err) &&
                       strstr(err, "New tab") != NULL &&

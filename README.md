@@ -123,6 +123,9 @@ is in this repository. Output: `build\NovaFile.exe` (~955 KB).
   function is known) and the folder that was open
 - **4K / high-DPI** - the process is DPI aware and every pixel in the
   UI goes through one scale factor, so it is sharp at 150-200%
+- **Interface Scaling** - Settings -> Appearance: one slider scales the
+  whole interface (text, icons, buttons, spacing) from 75% to 150%,
+  previews live and is remembered across restarts
 - **Address bar** - type any path, press Enter to jump there (**Tab**)
 - **Search / filter box** - top bar row 2, right of the breadcrumb:
   typing filters the current folder instantly (ranking: exact, then

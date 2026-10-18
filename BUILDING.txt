@@ -1,0 +1,152 @@
+NOVA FILE - BUILD INSTRUCTIONS (Windows)
+=========================================
+
+WHAT YOU NEED
+-------------
+A C compiler. This machine already has one, bundled with Dev-Cpp:
+
+    C:\Program Files (x86)\Dev-Cpp\MinGW64\bin\gcc.exe
+
+That path is already written in compile.bat and in the Makefile. If you
+install GCC somewhere else, edit those two files - that is the only change
+needed.
+
+HOW TO BUILD
+------------
+Option 1 (easiest):  double-click  compile.bat
+Option 2:            open a terminal in this folder and run:
+
+                         cmd /c compile.bat
+
+Option 3:            make            (or: make run / make clean)
+
+The result is always:
+
+                         build\NovaFile.exe        (~955 KB)
+
+APP ICON
+--------
+The exe carries the NovaFile wave logo.  The source art is Icon.png at
+the top of this folder (square, with its own transparent background);
+resource.rc + NovaFile.ico are what windres embeds, in both build
+options.  To rebuild the icon from Icon.png, run from a shell:
+
+  powershell -NoProfile -ExecutionPolicy Bypass -File build\icon_from_png.ps1
+
+That re-renders 16/32/48/64/256 onto a transparent canvas (high-quality
+bicubic), packs NovaFile.ico, and refreshes the logo NovaFile_logo.png
+(512 px) and the preview build\icon_preview.png.  After rebuilding the
+exe, confirm the icon landed with:
+
+                         build\make_icon.exe --verify build\NovaFile.exe
+
+(build\make_icon.c is a small standalone tool: --verify as above; --draw
+regenerates an older math-drawn fallback design.)  The window class
+loads resource id 1 (src\platform\window_win.c).
+If windres.exe is missing, the build still succeeds - the exe simply
+keeps the default icon.
+
+IMPORTANT BUILD FLAG
+--------------------
+-mwindows   Makes it a real GUI program: no console window pops up.
+            Always pass it (both compile.bat and the Makefile do).
+
+NOTE: this machine's Smart App Control sometimes blocks a fresh build.
+      See TROUBLESHOOTING below - the fix is simply to rebuild.
+
+LINKED LIBRARIES
+----------------
+-lole32 -loleaut32   COM picture decoder (image thumbnails)
+-lshell32            ShellExecuteA + known folder paths
+-luser32 -lgdi32     window, input, drawing
+-lkernel32           files, time, processes
+
+NO OpenGL, no DirectX, no GUI toolkit. The renderer is plain
+double-buffered GDI (src/renderer/renderer_gl.c).
+
+VERIFY THE BUILD
+----------------
+Run it headless (no window, no desktop interaction needed):
+
+    set NOVA_OFFSCREEN=1
+    build\NovaFile.exe --selftest
+
+Expected last lines:
+
+    [selftest] all features OK
+    SELFTEST OK
+    exit code 0
+
+The selftest never touches your own settings: --selftest points the
+settings store at %TEMP%\NovaFile_selftest_settings.txt through the
+NOVA_SETTINGS_FILE seam and deletes it first, so every run starts
+from the documented defaults.
+
+PERFORMANCE BENCHMARK (optional, also headless)
+-----------------------------------------------
+    set NOVA_OFFSCREEN=1
+    build\NovaFile.exe --bench-nav --bench-runs=3
+    build\NovaFile.exe --bench-nav --bench-runs=3 C:\Windows\System32
+
+Prints medians for open / time-to-first-frame / sharp-convergence /
+scroll / keystroke latency over a 20,000-item fixture in
+%TEMP%\nova_navfix (or over the folder you pass as the last
+argument). --bench-runs=N takes the median of N runs; run the same
+command against two builds back-to-back for a fair before/after -
+absolute numbers move with machine load.
+
+WHAT THE APP CAN AND CANNOT DO
+------------------------------
+Can:    browse, sort, search (in-folder as you type, recursive with
+        Enter, whole This PC from the This PC view), preview, open
+        (through the OS handler), rename, copy, cut/move, paste,
+        delete and create folders - the destructive ones always run
+        through a confirmation dialog first.
+Cannot: edit file contents; there is no built-in editor or viewer
+        beyond handing a file to its associated application.
+
+INSTALLER & RELEASES
+--------------------
+The portable exe is still the core deliverable; for end users there is
+now a proper per-user installer and an in-app updater (details:
+docs\RELEASE.md).
+
+- installer\novafile.iss      - Inno Setup 6 script (per-user, no admin)
+- installer\build_installer.bat - builds dist\NovaFile-Setup-<ver>.exe
+  (reads the version from include\version.h; finds ISCC in
+  %LOCALAPPDATA%\Programs\InnoSetup6 or Program Files)
+- tools\release\make_release.ps1 - one command: build -> selftest ->
+  boot smoke -> installer -> SHA-256 -> optional signing -> latest.json
+  manifest -> verify -> stage/publish. Config lives in
+  tools\release\release.config.json (copy the .sample; not committed).
+- src\app\update.c - auto-update client (Settings > Updates). It reads
+  its server URL from %LOCALAPPDATA%\NovaFile\updates.cfg (url=...);
+  without that file it reports "Not configured" and never goes online.
+- include\version.h - the single version source for exe VERSIONINFO,
+  installer, manifest and updater. Bump it there and nowhere else.
+- Installer build after compile.bat:
+    installer\build_installer.bat
+- Upgrade safety: installs/updates never touch %LOCALAPPDATA%\NovaFile
+  (settings, favorites, thumbnails live there); silent installs back up
+  the old exe as NovaFile.exe.prev and roll back if the new build fails
+  its own --selftest.
+
+TROUBLESHOOTING
+---------------
+"gcc.exe not found"
+    -> edit the GCC= line at the top of compile.bat (and CC= in Makefile)
+
+"build\NovaFile.exe was blocked by ... Device Guard policy"
+    -> your machine runs Smart App Control, which judges EVERY binary by
+       its own hash. Self-compiled exes are sometimes flagged even
+       though the previous build of the same source was allowed.
+       Fix: just build again (a fresh link gets a new hash and almost
+       always passes). Rebuilding the identical file will keep failing.
+       If it keeps failing: Windows Security -> App & browser control ->
+       Smart App Control -> Off (your decision, one-way until reset).
+
+Missing oleauto.h / olectl.h
+    -> your MinGW is too old; the headers live in
+       x86_64-w64-mingw32\include\olectl.h with MinGW-w64.
+
+Warnings: the build is clean with -Wall. Keep it that way.

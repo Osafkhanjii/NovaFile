@@ -1,0 +1,21 @@
+# Build artifacts
+/build/
+/dist/
+*.o
+*.obj
+*.map
+*.res
+
+# Shippable archives are built outside the repo
+*.zip
+
+# The website stays LOCAL-only (not published to this repository)
+/website/
+
+# OS junk
+Thumbs.db
+.DS_Store
+
+# The real release config (signing keys, hosting URLs) stays OUT of the
+# repo - only the committed sample file is versioned.
+tools/release/release.config.json

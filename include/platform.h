@@ -32,6 +32,10 @@ typedef struct {
     bool shift_pressed;
     bool alt_pressed;     // Alt held: arms the corner Back/Forward gesture
     bool win_pressed;     // Windows key held (recorder display + Win+key bindings)
+    // V held as a GESTURE modifier (Interface Scaling: hold V, press + or -).
+    // Not a registry chord - a held letter cannot be one - so it is tracked
+    // like the real modifiers: our queue's edge OR the hardware state.
+    bool v_held;
     int wheel;            // scroll notches this frame (+up / -down), 0 = none
     unsigned int char_pressed; // printable character typed THIS frame (0 = none)
     char key_text[16];

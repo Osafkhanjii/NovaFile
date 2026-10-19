@@ -213,6 +213,21 @@ static void ui_scale_set(int pct) {
     ui_scale_refresh();
 }
 
+// Keyboard step for Interface Scaling: HOLD V and press + or - (main row
+// or numpad). A held letter can never be a registry chord, so - like the
+// radial Quick Access C hold - it is a gesture (see handle_keys). One
+// press = one visible step, persisted like every other setting, with the
+// honest current value in the status bar.
+static void set_status(const char* fmt, ...);      // defined below
+static void settings_save(void);                   // defined below
+static void ui_scale_step(int delta) {
+    int before = g_ui_scale;
+    ui_scale_set(g_ui_scale + delta);              // clamps to MIN..MAX
+    if (g_ui_scale != before) settings_save();
+    set_status("Interface scale: %d%%%s", g_ui_scale,
+               g_ui_scale == 100 ? " (Default)" : "");
+}
+
 // Pane chrome: every tiled pane gets a title strip above its list
 // (folder path + close [x] + drag handle); workspace tabs never shrink
 // below TAB_MIN_W - they scroll instead of vanishing.
@@ -10423,11 +10438,13 @@ static void draw_settings(const Layout* L, const InputState* in) {
     // ---- "Interface Scaling" card (featured block, Appearance only) ----
     // A horizontal slider with a live percentage: every change runs
     // through the SAME SC() pipeline the whole panel uses, so the entire
-    // interface previews the new size frame by frame - no restart.
+    // interface previews the new size frame by frame - no restart. One
+    // line below the description documents the hold-V gesture that does
+    // the same job from the keyboard.
     s_scale_track = (RectI){0};
     s_scale_rst = (RectI){0};
     if (g_set_cat == SCAT_APPEARANCE && !g_set_filter[0]) {
-        int ch = SC(84);
+        int ch = SC(96);
         rrect(cx, ry0, cw, ch, SC(8), mixc(P->panel, P->bg, 0.35f),
               COLOR_BLACK, 0.0f);
         text_px("Interface Scaling", cx + SC(14), ry0 + SC(8),
@@ -10442,6 +10459,13 @@ static void draw_settings(const Layout* L, const InputState* in) {
                  "elements.", dsc, sizeof dsc, cw - SC(28));
         text_px(dsc, cx + SC(14), ry0 + SC(8) + L->text_med + SC(2),
                 L->text_small, P->dim);
+        // The keyboard gesture, stated where it is useful - accent colour
+        // so it reads as a hint, ellipsised (never overflowed) when narrow.
+        char hsc[128];
+        fit_text("Shortcut: hold V and press + or - (numpad works too).",
+                 hsc, sizeof hsc, cw - SC(28));
+        text_px(hsc, cx + SC(14), ry0 + SC(8) + L->text_med + SC(2) +
+                L->text_small + SC(2), L->text_small, P->accent);
         // ---- slider track: continuous UI_SCALE_MIN..UI_SCALE_MAX ----
         int sl_y = ry0 + ch - SC(26);
         int sl_x = cx + SC(14);
@@ -14757,6 +14781,26 @@ static void handle_keys(InputState* in, const Layout* L) {
         }
         set_status("Nothing to cancel - Ctrl+Q or the X button exits");
         return;
+    }
+    // ---- Interface Scaling gesture: HOLD V and press + or - (either row).
+    //      A held letter cannot be recorded as a key+Ctrl/Alt/Shift chord,
+    //      so - exactly like the radial Quick Access C hold above and the
+    //      in-field Ctrl+A/C/X/V block - it lives here as a GESTURE, not
+    //      as a registry binding. It only ever reacts to + / - WHILE V is
+    //      down: a plain + / - key, a V tap on its own, every registered
+    //      shortcut and every focused text field keep their exact old
+    //      behaviour (the field blocks above already own their own keys,
+    //      and the confirm/rename guard above owns its modal keys).
+    if (in->v_held) {
+        int sk = in->key_code;
+        if (sk == VK_OEM_PLUS || sk == VK_ADD) {
+            ui_scale_step(+10);              // clamped at the maximum
+            return;
+        }
+        if (sk == VK_OEM_MINUS || sk == VK_SUBTRACT) {
+            ui_scale_step(-10);              // clamped at the minimum
+            return;
+        }
     }
     // ---- keyboard commands: ONE registry (the Settings panel) owns every
     //      binding - rebind or switch a command off there and this chain
@@ -22342,6 +22386,68 @@ static void run_selftest(void) {
             S_EXP(g_ui_scale == 130,
                   "settings: the interface scale survives a save + load");
             ui_scale_set(100);                // leave the app at default
+
+            // The hold-V keyboard gesture. The negative cases are the
+            // important ones: a plain + / - key, a lone V tap and a
+            // focused text field must all leave the scale untouched, so
+            // the gesture can add itself without changing ANYTHING else.
+            {
+                Layout mk; InputState ks;
+                compute_layout(&mk, 1280, 720);
+                ui_scale_set(100);
+                memset(&ks, 0, sizeof ks);
+                ks.v_held = true; ks.key_code = VK_OEM_PLUS;
+                st_input(&mk, &ks);
+                S_EXP(g_ui_scale == 110,
+                      "settings: hold V + press + steps the scale up");
+                memset(&ks, 0, sizeof ks);
+                ks.key_code = VK_OEM_PLUS;           // + WITHOUT V
+                st_input(&mk, &ks);
+                S_EXP(g_ui_scale == 110,
+                      "settings: a plain + never touches the scale");
+                memset(&ks, 0, sizeof ks);
+                ks.v_held = true; ks.key_code = 'V';  // V tap on its own
+                st_input(&mk, &ks);
+                S_EXP(g_ui_scale == 110,
+                      "settings: a lone V tap never touches the scale");
+                memset(&ks, 0, sizeof ks);
+                ks.v_held = true; ks.key_code = VK_ADD;      // numpad +
+                st_input(&mk, &ks);
+                S_EXP(g_ui_scale == 120,
+                      "settings: the numpad + steps the scale too");
+                memset(&ks, 0, sizeof ks);
+                ks.v_held = true; ks.key_code = VK_OEM_MINUS;
+                st_input(&mk, &ks);
+                S_EXP(g_ui_scale == 110,
+                      "settings: hold V + press - steps the scale down");
+                memset(&ks, 0, sizeof ks);
+                ks.v_held = true; ks.key_code = VK_SUBTRACT; // numpad -
+                st_input(&mk, &ks);
+                S_EXP(g_ui_scale == 100,
+                      "settings: the numpad - steps the scale down too");
+                // typing in a focused search box stays typing: the field
+                // owns its keys and the gesture must never fire through it
+                g_app.search_focused = true;
+                memset(&ks, 0, sizeof ks);
+                ks.v_held = true; ks.key_code = VK_OEM_PLUS;
+                st_input(&mk, &ks);
+                S_EXP(g_ui_scale == 100,
+                      "settings: the V gesture never fires while typing");
+                g_app.search_focused = false;
+                // step to the top through the gesture: the clamp holds
+                memset(&ks, 0, sizeof ks);
+                ks.v_held = true; ks.key_code = VK_OEM_PLUS;
+                for (int s = 0; s < 8; s++) st_input(&mk, &ks);
+                S_EXP(g_ui_scale == UI_SCALE_MAX,
+                      "settings: the V gesture stops at the maximum");
+                memset(&ks, 0, sizeof ks);
+                ks.v_held = true; ks.key_code = VK_OEM_MINUS;
+                for (int s = 0; s < 8; s++) st_input(&mk, &ks);
+                S_EXP(g_ui_scale == UI_SCALE_MIN,
+                      "settings: the V gesture stops at the minimum");
+                ui_scale_set(100);
+                settings_save();   // memory and the scratch store agree
+            }
 
             S_EXP(!set_rebind(CMD_VIEW, 'N', M_CTRL, err, sizeof err) &&
                       strstr(err, "New tab") != NULL &&

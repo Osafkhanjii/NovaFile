@@ -125,7 +125,9 @@ is in this repository. Output: `build\NovaFile.exe` (~955 KB).
   UI goes through one scale factor, so it is sharp at 150-200%
 - **Interface Scaling** - Settings -> Appearance: one slider scales the
   whole interface (text, icons, buttons, spacing) from 75% to 150%,
-  previews live and is remembered across restarts
+  previews live and is remembered across restarts - or hold **V** and
+  press **+** / **-** (numpad too) to step the same setting from
+  anywhere; a status line reports the exact percentage each step
 - **Address bar** - type any path, press Enter to jump there (**Tab**)
 - **Search / filter box** - top bar row 2, right of the breadcrumb:
   typing filters the current folder instantly (ranking: exact, then

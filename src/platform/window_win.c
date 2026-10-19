@@ -43,6 +43,7 @@ static bool g_ctrl = false;
 static bool g_shift = false;
 static bool g_alt = false;
 static bool g_win = false;    // Windows key (LWIN/RWIN) held as our queue sees it
+static bool g_vheld = false;  // V held: the Interface Scaling gesture (V + / -)
 
 // Display scale: 1.0 at 96 DPI, 2.0 at 192 DPI (4K at 200%).
 static float g_dpi_scale = 1.0f;
@@ -245,6 +246,7 @@ static LRESULT CALLBACK fp_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_shift = false;
         g_alt = false;          // Alt+Tab / focus loss must not leave the
         g_win = false;          // corner gesture armed (reset in gesture_tick)
+        g_vheld = false;        // or a V+ / V- scale step armed either
         return 0;               // or a Win+key binding held down either
 
     case WM_MBUTTONUP:
@@ -292,6 +294,7 @@ static LRESULT CALLBACK fp_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == VK_SHIFT) g_shift = true;
         if (wp == VK_MENU) g_alt = true;
         if (wp == VK_LWIN || wp == VK_RWIN) g_win = true;
+        if (wp == 'V') g_vheld = true;   // gesture modifier (scale up/down)
         return 0;
 
     case WM_KEYUP:
@@ -303,6 +306,7 @@ static LRESULT CALLBACK fp_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == VK_SHIFT) g_shift = false;
         if (wp == VK_MENU) g_alt = false;
         if (wp == VK_LWIN || wp == VK_RWIN) g_win = false;
+        if (wp == 'V') g_vheld = false;
         return 0;
 
     case WM_SYSKEYDOWN:
@@ -585,6 +589,11 @@ bool platform_poll_events(void) {
     g_input.win_pressed = g_win ||
                           ((GetAsyncKeyState(VK_LWIN) & 0x8000) != 0) ||
                           ((GetAsyncKeyState(VK_RWIN) & 0x8000) != 0);
+    // The V gesture modifier: same rule as the real modifiers - our
+    // queue's view OR the hardware state - so a POSTED press behaves
+    // like a real one, and the KILLFOCUS reset above keeps a latch from
+    // outliving the focus that armed it.
+    g_input.v_held = g_vheld || ((GetAsyncKeyState('V') & 0x8000) != 0);
 
     return !g_quit_requested;
 }

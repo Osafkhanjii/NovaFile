@@ -449,17 +449,25 @@ void renderer_draw_text(RendererContext* ctx, const char* text, float x, float y
 float renderer_text_width(RendererContext* ctx, const char* text, float font_size) {
     if (!ctx || !text) return 0.0f;
     size_t len = strlen(text);
-    if (g_in_paint && g_mem_dc && len > 0) {
-        HFONT use = font_for((int)(font_size + 0.5f));
-        HFONT old = (HFONT)SelectObject(g_mem_dc, use);
-
-        SIZE sz = {0, 0};
-        GetTextExtentPoint32A(g_mem_dc, text, (int)len, &sz);
-
-        if (old) SelectObject(g_mem_dc, old);
-        return (float)sz.cx;
-    }
-    return (float)(len * 8);   // safe fallback outside a paint block
+    if (len == 0) return 0.0f;
+    // Metrics must be TRUE at ANY moment, not only inside a paint block:
+    // click-to-caret and the per-frame layout measure BEFORE begin_paint,
+    // where g_mem_dc does not exist - the old "len * 8" fallback there
+    // mapped a click to the wrong character, and the higher the UI scale
+    // the wider the real glyphs got while the fallback stayed at 8px
+    // (user report: the search caret "moves away" after zooming in).
+    // A persistent screen-compatible DC measures with the SAME font
+    // objects the paint path uses, so both give identical numbers, and
+    // the frame DC is never touched outside its own paint block.
+    static HDC s_measure_dc = NULL;
+    if (!s_measure_dc) s_measure_dc = CreateCompatibleDC(NULL);
+    if (!s_measure_dc) return (float)(len * 8);   // DC-less last resort
+    HFONT use = font_for((int)(font_size + 0.5f));
+    HFONT old = (HFONT)SelectObject(s_measure_dc, use);
+    SIZE sz = {0, 0};
+    GetTextExtentPoint32A(s_measure_dc, text, (int)len, &sz);
+    if (old) SelectObject(s_measure_dc, old);
+    return (float)sz.cx;
 }
 
 void renderer_set_scissor(RendererContext* ctx, Rect clip) {

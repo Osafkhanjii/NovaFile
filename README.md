@@ -170,7 +170,7 @@ is in this repository. Output: `build\NovaFile.exe` (~955 KB).
 | Ctrl+T                     | Dark <-> Light theme            |
 | Ctrl+B                     | Bookmark the current folder     |
 | Ctrl+H                     | Show / hide hidden + system files |
-| Ctrl+N                     | New tab                         |
+| Ctrl+N (also Ctrl+Shift+N) | New tab                         |
 | Ctrl+Tab / Ctrl+Shift+Tab  | Next / previous tab             |
 | Ctrl+Shift+PgUp / PgDn     | Shift the active tab left/right |
 | Tab                         | Address bar (breadcrumb)        |

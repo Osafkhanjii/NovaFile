@@ -1364,7 +1364,7 @@ static SetEnt g_ents[CMD_COUNT] = {
     // ---- Navigation and Tabs ----
     [CMD_NEW_TAB] = { .id="new_tab", .name="New tab",
         .desc="Open another workspace tab with its own pane and history.",
-        .how="Or the + button in the tab strip.",
+        .how="Or the + button in the tab strip. Ctrl+Shift+N works too.",
         .cat=SCAT_NAV, .kind=EK_ACTION,
         .key='N', .mods=M_CTRL, .dkey='N', .dmods=M_CTRL,
         .rebindable=true, .has_sw=true, .on=true, .don=true },
@@ -17128,14 +17128,20 @@ static void run_selftest(void) {
             if (hf) printf("[selftest] FAIL: highlight every occurrence\n");
         }
 
-        // --- click-to-caret + word select (8 px/char outside a paint) ---
+        // --- click-to-caret + word select (REAL metrics anywhere) ---
+        // The click is placed from a MEASURED prefix, never a fixed
+        // px-per-character: metrics are truthful outside a paint block
+        // too (the old 8px fallback is exactly what planted the caret at
+        // the wrong character once the UI scale grew).
         {
             int cr = 0, cf = 0;
             char b[32]; int car = 0, anc = 0;
             snprintf(b, sizeof b, "search box");
             InputState f; memset(&f, 0, sizeof f);
             RectI r = {100, 50, 200, 24};
-            f.left_click = true; f.x = 100 + 8 * 3 + 2; f.y = 60;
+            f.left_click = true;
+            f.x = 100 + (int)measure_px("sea", 16) + 1;   // inside "search"
+            f.y = 60;
             field_click_caret(&r, &f, b, &car, &anc, 100, 16);
             cr++; if (!(car == 3 && anc == 3)) {
                 cf++; printf("[selftest] FAIL: click caret %d/%d\n", car, anc);
@@ -22447,6 +22453,33 @@ static void run_selftest(void) {
                       "settings: the V gesture stops at the minimum");
                 ui_scale_set(100);
                 settings_save();   // memory and the scratch store agree
+            }
+
+            // Text metrics must be TRUE outside the paint block too:
+            // click-to-caret and the per-frame layout run BEFORE
+            // begin_paint, and the old 8px-per-character fallback there
+            // ignored the zoomed font - planting the caret at the wrong
+            // character the more the UI was scaled up. Both checks fail
+            // against that fallback.
+            S_EXP(measure_px("NovaFile", 19) > measure_px("NovaFile", 10) * 1.4f,
+                  "settings: text metrics follow the zoomed font size");
+            S_EXP(text_caret_from_x("abcdefghijklmno", 0, 19, 110) <= 13,
+                  "settings: click-to-caret maps through real glyph widths");
+
+            // New tab on Ctrl+Shift+N: Shift is OPTIONAL at dispatch (the
+            // recorded binding stays Ctrl+N), so the browser habit works
+            // without a second binding that could clash with anything.
+            {
+                InputState kn; memset(&kn, 0, sizeof kn);
+                kn.key_code = 'N'; kn.ctrl_pressed = true;
+                S_EXP(cmd_hit(&kn, CMD_NEW_TAB),
+                      "settings: Ctrl+N is the new-tab key");
+                kn.shift_pressed = true;
+                S_EXP(cmd_hit(&kn, CMD_NEW_TAB),
+                      "settings: Ctrl+Shift+N opens a new tab too");
+                kn.ctrl_pressed = false; kn.shift_pressed = false;
+                S_EXP(!cmd_hit(&kn, CMD_NEW_TAB),
+                      "settings: a lone N never opens a tab");
             }
 
             S_EXP(!set_rebind(CMD_VIEW, 'N', M_CTRL, err, sizeof err) &&

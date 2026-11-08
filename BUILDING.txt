@@ -60,6 +60,13 @@ LINKED LIBRARIES
 -lshell32            ShellExecuteA + known folder paths
 -luser32 -lgdi32     window, input, drawing
 -lkernel32           files, time, processes
+-luuid               shell / OLE interface ids (native menu, drag-out)
+
+APP MANIFEST
+------------
+NovaFile.manifest is embedded by resource.rc (RT_MANIFEST 1): UTF-8 code
+page (file names in every language) + Common-Controls 6.  Needs windres,
+like the icon.
 
 NO OpenGL, no DirectX, no GUI toolkit. The renderer is plain
 double-buffered GDI (src/renderer/renderer_gl.c).

@@ -87,6 +87,8 @@ void renderer_destroy(RendererContext* ctx);
 void renderer_begin_paint(void* window_handle);
 void renderer_end_paint(void);
 bool renderer_is_painting(void);
+void* renderer_last_frame(int* w, int* h);
+bool renderer_blit_last(void* hdc);             // WM_PRINT support       // HBITMAP of the last frame (test seam)
 void* renderer_paint_dc(RendererContext* ctx);   // current draw DC, NULL outside paint
 
 void renderer_clear(RendererContext* ctx);
@@ -101,6 +103,7 @@ void renderer_draw_round_rect(RendererContext* ctx, Rect rect, float radius,
 void renderer_draw_line(RendererContext* ctx, float x1, float y1, float x2, float y2, Color color, float thickness);
 void renderer_draw_text(RendererContext* ctx, const char* text, float x, float y, float font_size, Color color);
 float renderer_text_width(RendererContext* ctx, const char* text, float font_size);
+int renderer_text_height(RendererContext* ctx, float font_size);
 void renderer_set_scissor(RendererContext* ctx, Rect clip);
 void renderer_reset_scissor(RendererContext* ctx);
 void renderer_begin_batch(RendererContext* ctx);

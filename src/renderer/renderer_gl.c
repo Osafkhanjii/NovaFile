@@ -22,6 +22,11 @@ static HDC g_paint_dc = NULL;
 static HDC g_mem_dc = NULL;
 static HBITMAP g_mem_bmp = NULL;
 static HBITMAP g_old_bmp = NULL;
+// Persistent back buffer (reused every frame, rebuilt on resize).
+static HDC g_bb_dc = NULL;
+static HBITMAP g_bb_bmp = NULL;
+static HBITMAP g_bb_old = NULL;
+static int g_bb_w = 0, g_bb_h = 0;
 static PAINTSTRUCT g_ps;
 static int g_paint_w = 0;
 static int g_paint_h = 0;
@@ -166,8 +171,22 @@ RendererContext* renderer_init(void* window_handle, int width, int height) {
     return ctx;
 }
 
+static HDC g_text_dc = NULL;    // text MEASUREMENT DC (created in text_dc)
+
 void renderer_destroy(RendererContext* ctx) {
     if (g_in_paint) renderer_end_paint();
+    if (g_bb_dc) {                      // the cached back buffer
+        if (g_bb_old) SelectObject(g_bb_dc, g_bb_old);
+        DeleteDC(g_bb_dc);
+        g_bb_dc = NULL;
+    }
+    if (g_bb_bmp) { DeleteObject(g_bb_bmp); g_bb_bmp = NULL; }
+    g_bb_old = NULL;
+    g_bb_w = g_bb_h = 0;
+    if (g_text_dc) {                    // measurement DC: a real GDI handle
+        DeleteDC(g_text_dc);            // (HDCs are a limited resource)
+        g_text_dc = NULL;
+    }
     free_font_cache();
     if (g_font) {
         HFONT stock = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
@@ -189,6 +208,21 @@ void renderer_destroy(RendererContext* ctx) {
 }
 
 bool renderer_is_painting(void) { return g_in_paint; }
+
+// Copy the last finished frame into another DC (WM_PRINT / WM_PRINTCLIENT:
+// PrintWindow, screenshot tools, the Alt+Tab / taskbar thumbnails).
+bool renderer_blit_last(void* hdc) {
+    if (!hdc || !g_bb_dc || !g_bb_bmp || g_in_paint) return false;
+    return BitBlt((HDC)hdc, 0, 0, g_bb_w, g_bb_h, g_bb_dc, 0, 0, SRCCOPY) != 0;
+}
+
+// TEST SEAM: the persistent back buffer holds the LAST frame after
+// renderer_end_paint() - a selftest can save it as a screenshot.
+void* renderer_last_frame(int* w, int* h) {
+    if (w) *w = g_bb_w;
+    if (h) *h = g_bb_h;
+    return (void*)g_bb_bmp;
+}
 
 void* renderer_paint_dc(RendererContext* ctx) {
     if (!ctx || !g_in_paint || !g_mem_dc) return NULL;
@@ -221,11 +255,29 @@ void renderer_begin_paint(void* window_handle) {
     HDC paint_dc = BeginPaint(hwnd, &g_ps);
     if (!paint_dc) return;
 
-    HDC mem_dc = CreateCompatibleDC(paint_dc);
-    HBITMAP bmp = CreateCompatibleBitmap(paint_dc, w, h);
+    // The back buffer is KEPT between frames and only rebuilt when the
+    // window size changes: allocating (and freeing) a full-window bitmap
+    // every frame cost ~8 MB per frame at 1080p and ~33 MB at 4K of
+    // churn through the GDI allocator.  Every frame still clears it
+    // completely below, so reuse can never show stale pixels.
+    if (g_bb_bmp && (g_bb_w != w || g_bb_h != h)) {
+        if (g_bb_dc && g_bb_old) SelectObject(g_bb_dc, g_bb_old);
+        DeleteObject(g_bb_bmp);
+        g_bb_bmp = NULL;
+        g_bb_old = NULL;
+    }
+    if (!g_bb_dc) g_bb_dc = CreateCompatibleDC(paint_dc);
+    if (g_bb_dc && !g_bb_bmp) {
+        g_bb_bmp = CreateCompatibleBitmap(paint_dc, w, h);
+        if (g_bb_bmp) {
+            g_bb_old = (HBITMAP)SelectObject(g_bb_dc, g_bb_bmp);
+            g_bb_w = w;
+            g_bb_h = h;
+        }
+    }
+    HDC mem_dc = g_bb_dc;
+    HBITMAP bmp = g_bb_bmp;
     if (!mem_dc || !bmp) {
-        if (bmp) DeleteObject(bmp);
-        if (mem_dc) DeleteDC(mem_dc);
         EndPaint(hwnd, &g_ps);
         return;
     }
@@ -236,10 +288,11 @@ void renderer_begin_paint(void* window_handle) {
     g_mem_bmp = bmp;
     g_paint_w = w;
     g_paint_h = h;
-    g_old_bmp = (HBITMAP)SelectObject(g_mem_dc, g_mem_bmp);
+    g_old_bmp = NULL;              // the cached buffer stays selected
     g_old_font = (HFONT)SelectObject(g_mem_dc, g_font ? g_font : GetStockObject(DEFAULT_GUI_FONT));
 
     SetBkMode(g_mem_dc, TRANSPARENT);
+    SelectClipRgn(g_mem_dc, NULL);   // reused DC: no clip left from last frame
 
     // Fill the whole surface with the theme background.
     RECT full = {0, 0, w, h};
@@ -259,11 +312,10 @@ void renderer_end_paint(void) {
     }
 
     if (g_mem_dc) {
-        if (g_old_bmp) SelectObject(g_mem_dc, g_old_bmp);
+        // The DC and its bitmap are the cached back buffer: only the
+        // font goes back, nothing is destroyed (see begin_paint).
         if (g_old_font) SelectObject(g_mem_dc, g_old_font);
-        DeleteDC(g_mem_dc);
     }
-    if (g_mem_bmp) DeleteObject(g_mem_bmp);
     if (g_paint_hwnd && g_paint_dc) EndPaint(g_paint_hwnd, &g_ps);
 
     g_mem_dc = NULL;
@@ -397,6 +449,11 @@ void renderer_draw_round_rect(RendererContext* ctx, Rect rect, float radius,
     HBRUSH brush = acquire_brush(to_colorref(fill), &cached);
 
     int pw = (int)(stroke_width + 0.5f);
+    // A FULLY TRANSPARENT stroke means NO stroke.  GDI pens carry no alpha
+    // (to_colorref drops it), so honouring the request literally paints a
+    // solid BLACK ring - which is what the dock chooser chips got when they
+    // asked for a fill-only rounded rect.
+    if (stroke.a <= 0.001f) pw = 0;
     HPEN pen = NULL;
     if (pw >= 1) pen = CreatePen(PS_SOLID, pw, to_colorref(stroke));
     HGDIOBJ old_pen = SelectObject(g_mem_dc, pen ? (HGDIOBJ)pen
@@ -446,6 +503,16 @@ void renderer_draw_text(RendererContext* ctx, const char* text, float x, float y
     if (old) SelectObject(g_mem_dc, old);
 }
 
+// Persistent screen-compatible DC for text MEASUREMENT. Metrics are asked
+// for OUTSIDE paint blocks too (click-to-caret, layout, line height), where
+// g_mem_dc does not exist; this DC is created once, holds a font only for
+// the duration of a single call (invariant: fonts are never live in a DC
+// when font_for recycles them), and is never the frame's drawing surface.
+static HDC text_dc(void) {
+    if (!g_text_dc) g_text_dc = CreateCompatibleDC(NULL);
+    return g_text_dc;
+}
+
 float renderer_text_width(RendererContext* ctx, const char* text, float font_size) {
     if (!ctx || !text) return 0.0f;
     size_t len = strlen(text);
@@ -456,18 +523,38 @@ float renderer_text_width(RendererContext* ctx, const char* text, float font_siz
     // mapped a click to the wrong character, and the higher the UI scale
     // the wider the real glyphs got while the fallback stayed at 8px
     // (user report: the search caret "moves away" after zooming in).
-    // A persistent screen-compatible DC measures with the SAME font
-    // objects the paint path uses, so both give identical numbers, and
-    // the frame DC is never touched outside its own paint block.
-    static HDC s_measure_dc = NULL;
-    if (!s_measure_dc) s_measure_dc = CreateCompatibleDC(NULL);
-    if (!s_measure_dc) return (float)(len * 8);   // DC-less last resort
+    // The shared measurement DC uses the SAME font objects the paint path
+    // uses, so both give identical numbers, and the frame DC is never
+    // touched outside its own paint block.
+    HDC dc = text_dc();
+    if (!dc) return (float)(len * 8);   // DC-less last resort
     HFONT use = font_for((int)(font_size + 0.5f));
-    HFONT old = (HFONT)SelectObject(s_measure_dc, use);
+    HFONT old = (HFONT)SelectObject(dc, use);
     SIZE sz = {0, 0};
-    GetTextExtentPoint32A(s_measure_dc, text, (int)len, &sz);
-    if (old) SelectObject(s_measure_dc, old);
+    GetTextExtentPoint32A(dc, text, (int)len, &sz);
+    if (old) SelectObject(dc, old);
     return (float)sz.cx;
+}
+
+// The font's REAL line height (ascent + descent, tmHeight) for the exact
+// HFONT the text is drawn with - the number a box needs to center text
+// vertically at ANY UI scale. The nominal TEXT_H and the rounded font cell
+// drift apart as the scale grows (19px vs 16px at 100%, 30px vs 24px at
+// 150% for the search box), which used to sink text below its field's
+// middle. Measured on the shared measurement DC, identical to paint.
+int renderer_text_height(RendererContext* ctx, float font_size) {
+    // ~1.33em is the Segoe UI cell ratio, only for a missing DC.
+    int fb = (int)(font_size * 1.33f + 0.5f);
+    if (!ctx) return fb < 1 ? 1 : fb;
+    HDC dc = text_dc();
+    if (!dc) return fb < 1 ? 1 : fb;
+    HFONT use = font_for((int)(font_size + 0.5f));
+    HFONT old = (HFONT)SelectObject(dc, use);
+    TEXTMETRICA tm;
+    int h = GetTextMetricsA(dc, &tm) ? tm.tmHeight : 0;
+    if (old) SelectObject(dc, old);
+    if (h < 1) h = fb;
+    return h;
 }
 
 void renderer_set_scissor(RendererContext* ctx, Rect clip) {

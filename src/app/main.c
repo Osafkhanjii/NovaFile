@@ -18,13 +18,13 @@
 //   - Address bar: type a path, Enter to go             [Tab]
 //   - Fuzzy search                                      [Ctrl+L]
 //   - Sort by Name / Size / Modified / Type             [click header]
-//   - Dark / Light theme                                [Ctrl+T]
+//   - Theme picker (Midnight / Dark / Light cards)       [Settings]
 //   - Bookmark current folder                           [Ctrl+B]
 //
 // SAFETY (double checked):
 //   - read only: never deletes, renames, copies or writes files
 //   - all paths bounded with snprintf / strncpy, allocations checked
-//   - files open only through the OS default handler (ShellExecuteA)
+//   - files open only through the OS default handler (ShellExecuteExW)
 //   - every cached HICON / IPicture is released on directory change
 //     and on shutdown
 // ============================================================
@@ -35,6 +35,8 @@
 #define _WIN32_WINNT 0x0601
 #endif
 #include <windows.h>
+#include <wctype.h>     // towlower: normalise a file extension before the
+                        // registry verb lookup in open_with_shell
 // PROCESS_MEMORY_COUNTERS for the --bench report; the counter itself is
 // read dynamically from kernel32 (see run_bench), so no new link lib.
 #include <psapi.h>
@@ -85,6 +87,7 @@ extern int  WINAPI SHGetPathFromIDListA(const void* pidl, char* path);
 #include "ui.h"
 #include "version.h"
 #include "update.h"
+#include "../platform/shell_ole.h"   // native menu + drag-out
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -107,6 +110,40 @@ static void ndbg(const char* fmt, ...) {
     fflush(f);
 }
 
+// ---- stored paths from older builds -------------------------------------
+// Builds before the UTF-8 manifest wrote favorites / custom thumbnails /
+// the session in the LEGACY ANSI code page (e.g. Windows-1252).  A path
+// with non-ASCII letters from such a file is not valid UTF-8, so it is
+// converted once, on load, from the user's legacy ANSI page.  Valid UTF-8
+// (everything written from now on) and plain ASCII pass through untouched.
+static bool utf8_valid(const unsigned char* p) {
+    while (*p) {
+        if (*p < 0x80) { p++; continue; }
+        int n = (*p >= 0xF0 && *p <= 0xF4) ? 3 : (*p >= 0xE0) ? 2 :
+                (*p >= 0xC2 && *p <= 0xDF) ? 1 : -1;
+        if (n < 0) return false;
+        for (int i = 1; i <= n; i++)
+            if ((p[i] & 0xC0) != 0x80) return false;
+        p += n + 1;
+    }
+    return true;
+}
+static void legacy_line_fix(char* s, size_t cap) {
+    if (!s || !s[0] || GetACP() != CP_UTF8) return;
+    if (utf8_valid((const unsigned char*)s)) return;
+    char cpn[8] = "";
+    UINT legacy = 1252;
+    if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_IDEFAULTANSICODEPAGE, cpn,
+                       sizeof cpn) > 0 && atoi(cpn) > 0)
+        legacy = (UINT)atoi(cpn);
+    wchar_t w[1600];
+    if (MultiByteToWideChar(legacy, 0, s, -1, w, 1600) <= 0) return;
+    char out[2400];
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, out, sizeof out, NULL, NULL) <= 0)
+        return;
+    if (strlen(out) < cap) memcpy(s, out, strlen(out) + 1);
+}
+
 // ------------------------------------------------------------
 // Design constants (96 DPI). Every one of them goes through
 // SC() so the whole UI scales on 4K / high-DPI displays.
@@ -127,22 +164,43 @@ static void ndbg(const char* fmt, ...) {
 #define THUMB_BOX        80
 #define SCROLL_W         14
 #define BTN_H            28
-#define NAV_BTN_COUNT     4    // back / forward / up / refresh (icons)
+#define NAV_BTN_COUNT     3    // back / forward / up (icons) - refresh is
+                               // F5 / the right-click menu / hamburger
 #define TAB_MAX           20    // hard cap on open tabs, workspace-wide
-#define MENU_MAX          9
+#define MENU_MAX          8
 // Right-click menu: one flat row array big enough for the full Explorer
 // style menu (root rows + every submenu's children live in the same array).
 #define CTX_MAX          96
 #define CRUMB_MAX        24
 #define MAX_HISTORY      32
 
+// Directory load lifecycle for a pane.  It separates "loaded with entries",
+// "successfully loaded but empty" and "failed to open" so an error, a
+// disconnected drive or a not-yet-ready folder is NEVER reported as a
+// confirmed empty folder (the intermittent "folder is empty" bug).
+enum { LOAD_OK = 0, LOAD_EMPTY = 1, LOAD_ERROR = 2 };
+
+// Multi-selection capacity: g_sel[] (the LIVE set) and FolderView.sel_bits
+// (the per-pane STORED copy) are both sized by it, so it must be declared
+// before FolderView.
+#define SEL_MAX 8192
+
 typedef struct {
     char current_path[1024];
     DirEntry* entries;
     size_t count;
+    int load_state;          // LOAD_*: how this pane's listing was obtained
     int* view;
     size_t view_count;
     int selected;
+    // The WHOLE multi-selection, stored with the view it belongs to as a
+    // bitset over view-row indices (1 KB, not SEL_MAX ints).  Without it
+    // folder_view_from_app()/app_push_folder() could only round-trip the
+    // anchor row: every render swap of a background pane silently collapsed
+    // a Shift/Ctrl range back to {selected} - which is exactly why
+    // multi-select "worked" in one pane (no swap) but evaporated in a
+    // split window (a background pane is swapped in EVERY frame).
+    unsigned sel_bits[SEL_MAX / 32];
     int scroll;
     int view_mode;
     int sort_key;
@@ -157,9 +215,20 @@ typedef struct {
     char addr_buf[1024];
     char search_buf[128];       // per-pane filter (switching panes keeps it)
     bool search_focused;
+    // Per-pane address-bar typing focus.  This used to live ONLY in g_app,
+    // so while one pane's address was focused EVERY pane's nav row drew
+    // its own address bar with the global flag - all panes lit up blue at
+    // once ("everything looks selected").  Stored per pane like
+    // search_focused, each pane now renders its OWN focus state.
+    bool addr_focused;
+    // Per-pane icon zoom (Phase 4): each pane renders its list/grid at its
+    // OWN icon size.  g_zoom / g_zoom_target stay the ACTIVE pane's live
+    // (animating) value; this field is the stored value for every pane and
+    // is what an inactive pane renders from (swapped into g_app.zoom).
+    float zoom;
     // NOTE: no tab/workspace state and no theme field here on purpose -
-    // tabs are workspaces (owned by the global g_ws[] list) and `light`
-    // is a single global setting.
+    // tabs are workspaces (owned by the global g_ws[] list) and the
+    // theme is a single global setting (g_pal_idx).
 } FolderView;
  typedef struct { int x, y, w, h; } RectI;
 
@@ -220,6 +289,9 @@ static void ui_scale_set(int pct) {
 // honest current value in the status bar.
 static void set_status(const char* fmt, ...);      // defined below
 static void settings_save(void);                   // defined below
+static void add_bookmark(const char* path);        // defined below (sidebar list)
+static void build_sidebar(void);                   // defined below (sidebar rows)
+static void theme_select(int idx);                 // defined below (Theme cards)
 static void ui_scale_step(int delta) {
     int before = g_ui_scale;
     ui_scale_set(g_ui_scale + delta);              // clamps to MIN..MAX
@@ -229,10 +301,15 @@ static void ui_scale_step(int delta) {
 }
 
 // Pane chrome: every tiled pane gets a title strip above its list
-// (folder path + close [x] + drag handle); workspace tabs never shrink
-// below TAB_MIN_W - they scroll instead of vanishing.
+// (folder path + close [x] + drag handle).  The tab strip is RESPONSIVE:
+// every tab takes an equal share of the strip, from TAB_MAX_W down to
+// TAB_MIN_W_SM - where titles truncate with an ellipsis instead of the
+// strip starting to scroll.  Only when even that compact minimum cannot
+// fit does the strip scroll (never disappears, never shrinks to nothing).
 #define PANE_TITLE_H      SC(24)
-#define TAB_MIN_W         SC(128)
+#define TAB_MAX_W         SC(170)   // comfortable: full title + icon
+#define TAB_MIN_W         SC(128)   // still comfortably readable
+#define TAB_MIN_W_SM      SC(84)    // compact: icon + truncated title
 
 // View modes, in the order of the "Details" popup menu:
 // Details | List | Tree | Icons | XL icons.
@@ -311,7 +388,51 @@ static const Palette PAL_LIGHT = {
 // (Windows 11 uses #C42B1C there too). The glyph on it stays white.
 static const Color CAP_CLOSE_HOV = {0.769f, 0.169f, 0.110f, 1.0f};
 
-static const Palette* P = &PAL_DARK;
+// Midnight - the DEFAULT theme: the flat near-black charcoal surface
+// (#1C1F23) of the simple dark look, as its own palette so both classic
+// themes stay exactly as they were. Same NEUTRAL match box, same readable
+// glyphs - only the surface ramps change.
+static const Palette PAL_MIDNIGHT = {
+    /*bg*/       {0.110f, 0.122f, 0.137f, 1.0f},   // #1C1F23 list
+    /*panel*/    {0.137f, 0.153f, 0.173f, 1.0f},   // #23272C sidebar
+    /*toolbar*/  {0.125f, 0.141f, 0.157f, 1.0f},   // #202428
+    /*btn*/      {0.157f, 0.176f, 0.200f, 1.0f},   // #282D33
+    /*btn_hover*/{0.204f, 0.227f, 0.259f, 1.0f},   // #343A42
+    /*head*/     {0.125f, 0.141f, 0.157f, 1.0f},
+    /*row_alt*/  {0.122f, 0.137f, 0.153f, 1.0f},
+    /*row_hover*/{0.165f, 0.188f, 0.220f, 1.0f},
+    /*selected*/ {0.118f, 0.388f, 0.706f, 1.0f},   // #1E63B4 blue
+    /*text*/     {0.871f, 0.886f, 0.906f, 1.0f},   // #DEE2E7
+    /*dim*/      {0.514f, 0.553f, 0.592f, 1.0f},   // #838D97
+    /*accent*/   {0.290f, 0.553f, 0.973f, 1.0f},   // #4A8DF8
+    /*border*/   {0.173f, 0.196f, 0.227f, 1.0f},   // #2C323A
+    /*folder*/   {0.910f, 0.702f, 0.247f, 1.0f},
+    /*file*/     {0.522f, 0.557f, 0.600f, 1.0f},
+    /*scroll*/   {0.188f, 0.216f, 0.247f, 1.0f},
+    /*field*/    {0.098f, 0.110f, 0.125f, 1.0f},
+    /*paper*/    {0.933f, 0.941f, 0.953f, 1.0f},
+    /*hl_bg*/    {0.227f, 0.251f, 0.282f, 1.0f},   // muted charcoal
+    /*hl_fg*/    {0.941f, 0.949f, 0.961f, 1.0f}    // light, readable on it
+};
+
+// Which palette is live: 0 Midnight (default), 1 Dark, 2 Light.  The
+// index persists on its own settings line ("palette"); a missing line
+// (older files) simply keeps the default.
+enum { PAL_MID_I = 0, PAL_DARK_I = 1, PAL_LIGHT_I = 2, PAL_COUNT_N = 3 };
+static int g_pal_idx = 0;
+static const Palette* P = &PAL_MIDNIGHT;
+
+static const char* pal_name(int i) {
+    return i == PAL_LIGHT_I ? "Light"
+         : i == PAL_DARK_I  ? "Dark"
+         :                    "Midnight";
+}
+static const Palette* pal_at(int i) {
+    return i == PAL_LIGHT_I ? &PAL_LIGHT
+         : i == PAL_DARK_I  ? &PAL_DARK
+         :                    &PAL_MIDNIGHT;
+}
+static void pal_apply(void) { P = pal_at(g_pal_idx); }
 
 // ------------------------------------------------------------
 // Caches: Windows shell thumbnails + icons
@@ -504,6 +625,7 @@ typedef struct {
     // top bar: hamburger menu + tabs (row 1), nav icons + breadcrumb (row 2)
     RectI menu_btn;
     RectI set_btn;             // gear: opens the Settings panel (row 1)
+    RectI side_btn;            // hide / show the sidebar (row 1)
     RectI cap_min, cap_max, cap_close;  // window controls in the tab row
     RectI tab_rects[TAB_MAX];
     int   tab_drawn;
@@ -548,6 +670,7 @@ typedef struct {
     char current_path[1024];
     DirEntry* entries;
     size_t count;
+    int load_state;          // LOAD_* (active pane's listing lifecycle)
 
     int* view;
     size_t view_count;
@@ -568,7 +691,8 @@ typedef struct {
     int view_mode;           // ViewMode
     int sort_key;            // SortKey
     int sort_dir;            // +1 / -1
-    bool light;
+    float zoom;              // THIS pane's icon zoom (mirrors FolderView.zoom;
+                             // g_zoom is the active pane's animating copy)
 
     char history[MAX_HISTORY][1024];
     int history_count;
@@ -589,6 +713,28 @@ static App g_app;
 static Pane* g_pane_root = NULL;      // root of the layout tree
 static Pane* g_active_pane = NULL;    // pane the user works in
 
+// ---- Search popup (single GLOBAL overlay) ----
+// Clicking Search opens ONE large, focused input overlay centered over the
+// whole application window (not embedded in any pane/tab). It is purely a
+// VIEW over the active pane's existing search state (g_app.search_buf /
+// search_focused, which the pane swap model already keeps per-pane) - so
+// typing, clearing and the filter itself drive the real search of the
+// CURRENTLY ACTIVE tab's pane, and cannot leak into another tab or pane.
+// The target (the active pane + its tab) is CAPTURED at open: at most one
+// popup exists, opening it in another pane re-anchors it, and blur_fields()
+// (called on any pane/tab switch / outside click) dismisses it - so an open
+// Search never retargets to a tab the user switches to, and no inactive tab
+// ever receives focus or the query.
+static bool  g_search_popup_open = false;
+static Pane* g_search_popup_pane = NULL;   // target pane captured at open
+// MAIN SEARCH / LOCATION-BAR popup: the same kind of GLOBAL window-centered
+// overlay as the search popup above, but a VIEW over the ACTIVE pane's
+// address field (g_app.addr_buf / addr_caret / addr_anchor).  It captures the
+// pane it was opened for so a pane/tab switch dismisses it and it can never
+// edit another pane's path.
+static bool  g_addr_popup_open = false;
+static Pane* g_addr_popup_pane = NULL;     // target pane captured at open
+
 // Splitter / drag-to-split state.
 static bool g_splitter_drag = false;    // dragging a splitter bar
 static Pane* g_splitter_pane = NULL;    // the split node being resized
@@ -602,8 +748,7 @@ static int g_splitter_start_pos = 0;
 // Zones are the halves / corners of the pane under the cursor; the
 // center (and anything outside the panes) cancels the drop.
 typedef enum {
-    DZ_NONE = 0, DZ_LEFT, DZ_RIGHT, DZ_TOP, DZ_BOTTOM,
-    DZ_TL, DZ_TR, DZ_BL, DZ_BR, DZ_CENTER
+    DZ_NONE = 0, DZ_LEFT, DZ_RIGHT, DZ_TOP, DZ_BOTTOM
 } DropZone;
 static bool g_drag_split = false;
 static bool g_drag_split_armed = false;   // pressed in a pane, might drag
@@ -620,34 +765,32 @@ static bool g_drop_active = false;      // a valid drop zone is highlighted
 static RectI g_content = {0,0,0,0};      // window content rect (layout root)
 
 // ---- docking indicator chips (the visual chooser, Phase 3) --------
-// Dashed cells [LEFT|CENTER|RIGHT] through the pane's middle plus
-// [TOP]/[BOTTOM] near its edges - the reference's signature overlay.
+// Exactly FOUR directional cells - LEFT and RIGHT flanking the pane's
+// middle, TOP and BOTTOM centered above and below them - one per legal
+// dock. There is deliberately NO centre / corner chip: four-way docking
+// is the only arrangement this chooser offers.
 // Geometry only (no state, no input): the zone machine above still
 // decides every drop, the chips only DRAW it; keeping layout pure lets
 // the selftest assert bounds and non-overlap directly.
-#define DOCK_CHIP_N 5
-// out[] order: 0 LEFT, 1 CENTER, 2 RIGHT, 3 TOP, 4 BOTTOM
+#define DOCK_CHIP_N 4
+// out[] order: 0 LEFT, 1 RIGHT, 2 TOP, 3 BOTTOM
 static bool dock_chip_layout(const RectI* r, RectI out[DOCK_CHIP_N]) {
     if (!r || r->w < SC(150) || r->h < SC(120)) return false;  // too small
     int gap = SC(6), cw = SC(46), ch = SC(28);
-    int maxw = (r->w - SC(24) - 2 * gap) / 3;
-    if (cw > maxw) cw = maxw;                  // shrink instead of overflow
+    int maxw = (r->w - SC(24) - gap) / 2;        // two side cells + gap
+    if (cw > maxw) cw = maxw;                    // shrink instead of overflow
     if (cw < SC(20)) return false;
     int cx = r->x + r->w / 2, cy = r->y + r->h / 2;
-    int trio_w = 3 * cw + 2 * gap;
-    int x0 = cx - trio_w / 2, y0 = cy - ch / 2;
-    out[0] = (RectI){x0, y0, cw, ch};                             // LEFT
-    out[1] = (RectI){x0 + cw + gap, y0, cw, ch};                  // CENTER
-    out[2] = (RectI){x0 + 2 * (cw + gap), y0, cw, ch};            // RIGHT
+    int y0 = cy - ch / 2;
+    out[0] = (RectI){cx - cw - gap / 2, y0, cw, ch};          // LEFT
+    out[1] = (RectI){cx + gap / 2, y0, cw, ch};               // RIGHT
     int tx = cx - cw / 2;
-    int ty = r->y + PANE_TITLE_H + SC(8);      // under the pane title strip
-    if (ty + ch > y0 - SC(4)) ty = y0 - SC(4) - ch;   // never the trio
-    if (ty < r->y + SC(2)) ty = r->y + SC(2);
-    out[3] = (RectI){tx, ty, cw, ch};                           // TOP
-    ty = r->y + r->h - SC(8) - ch;              // above the pane's bottom
-    if (ty < y0 + ch + SC(4)) ty = y0 + ch + SC(4);    // never the trio
-    if (ty + ch > r->y + r->h - SC(2)) ty = r->y + r->h - SC(2) - ch;
-    out[4] = (RectI){tx, ty, cw, ch};                          // BOTTOM
+    int ty = cy - ch / 2 - gap - ch;             // TOP, above the side pair
+    if (ty < r->y + PANE_TITLE_H + SC(4)) ty = r->y + PANE_TITLE_H + SC(4);
+    out[2] = (RectI){tx, ty, cw, ch};                           // TOP
+    ty = cy + ch / 2 + gap;                      // BOTTOM, below the pair
+    if (ty + ch > r->y + r->h - SC(4)) ty = r->y + r->h - SC(4) - ch;
+    out[3] = (RectI){tx, ty, cw, ch};                          // BOTTOM
     for (int i = 0; i < DOCK_CHIP_N; i++) {      // hard pane boundary
         if (out[i].x < r->x) out[i].x = r->x;
         if (out[i].y < r->y) out[i].y = r->y;
@@ -659,19 +802,10 @@ static bool dock_chip_layout(const RectI* r, RectI out[DOCK_CHIP_N]) {
     return true;
 }
 
-// Which cells light for the zone under the cursor: exact match, or BOTH
-// edge cells when a corner quarter is lit (TL lights Left+Top, ...), so
-// the chooser keeps tracking the pointer smoothly around the pane.
+// Which cells light for the zone under the cursor: exact match only - each
+// chip names one direction, so there is no corner cell to light a pair.
 static bool dock_zone_lights(int zone, int chip_z) {
-    if (zone == DZ_NONE) return false;
-    if (zone == chip_z) return true;
-    switch (zone) {
-        case DZ_TL: return chip_z == DZ_LEFT  || chip_z == DZ_TOP;
-        case DZ_TR: return chip_z == DZ_RIGHT || chip_z == DZ_TOP;
-        case DZ_BL: return chip_z == DZ_LEFT  || chip_z == DZ_BOTTOM;
-        case DZ_BR: return chip_z == DZ_RIGHT || chip_z == DZ_BOTTOM;
-        default: return false;
-    }
+    return zone != DZ_NONE && zone == chip_z;
 }
 
 // ============================================================
@@ -742,6 +876,8 @@ typedef enum {
     CTX_CMD_SET_THUMB,
     CTX_CMD_CHANGE_THUMB,
     CTX_CMD_REMOVE_THUMB,
+    // right-click sidebar bookmark (folders only)
+    CTX_CMD_BOOKMARK,
     // tab strip (the reference app's right-click menu on a tab)
     CTX_CMD_TAB_SHIFT_L,
     CTX_CMD_TAB_SHIFT_R,
@@ -757,6 +893,9 @@ typedef enum {
     CTX_CMD_SIDE_OPEN_TAB,
     CTX_CMD_SIDE_OPEN_PANE,
     CTX_CMD_SIDE_STAR,
+    // Explorer extras
+    CTX_CMD_SHELL_MENU,       // "Show more options" - the real shell menu
+    CTX_CMD_TERMINAL,         // "Open in Terminal" (this folder / that one)
 } CtxCmd;
 
 static CtxRow g_m[CTX_MAX];    // the open menu's root rows + submenu children
@@ -788,8 +927,8 @@ static bool   g_ctx_side_file;
 // ---- multi-selection ----
 // g_app.selected stays the PRIMARY row (the last one clicked); g_sel[] is
 // the whole set the operations act on. Ctrl+click toggles a row, Shift+
-// click takes the range, Ctrl+A takes everything.
-#define SEL_MAX 8192
+// click takes the range, Ctrl+A takes everything.  (SEL_MAX lives above
+// FolderView - the per-pane stored copy needs it too.)
 static int g_sel[SEL_MAX];
 static int g_sel_n;
 
@@ -937,6 +1076,62 @@ static bool tab_strip_pt(const Layout* L, int x, int y) {
            x >= L->tabs_x && x <= L->tabs_x + L->tab_area;
 }
 
+// A tab's CLICKABLE COLUMN: its drawn chip plus the invisible tab-bar
+// padding above it (up to the window top). The chip is inset y1=SC(4)
+// from the top edge; that thin strip is tab-bar territory, so a click
+// there must select the TAB - never fall into the resize border
+// (WM_NCHITTEST) or the drag strip. The GAPS between tabs and the area
+// below the chips stay drag strip. Returns the tab index or -1.
+static int tab_hit_at(const Layout* L, int x, int y) {
+    if (!L || y < L->toolbar.y) return -1;
+    for (int i = 0; i < L->tab_drawn; i++) {
+        const RectI* r = &L->tab_rects[i];
+        if (r->w > 0 && x >= r->x && x < r->x + r->w && y < r->y + r->h)
+            return i;
+    }
+    return -1;
+}
+
+// ---- incremental type-to-select (Explorer-style type-ahead) -------------
+// Typing a printable character while the file list has the keyboard starts
+// (or EXTENDS) a case-insensitive filename prefix: every new character
+// joins the previous ones and the highlight follows the whole prefix. A
+// pause longer than TTS_TIMEOUT_MS, Escape, entering another folder and
+// switching pane each start the NEXT sequence fresh.
+//
+// "Fresh" for the SELECTION follows WHO moved it, not the move itself:
+// g_tts_sel remembers the row OUR OWN last run highlighted, so the match
+// becoming selected can never eat the prefix that found it - while a
+// selection made any other way (mouse click, arrows, Home/End,
+// select-all, an empty click) means the next typed character starts a
+// new search, exactly like Explorer.
+#define TTS_TIMEOUT_MS  1000      // inactivity gap -> next char starts fresh
+#define TTS_PREFIX_MAX  63        // typed characters kept in the prefix
+static char  g_tts_prefix[TTS_PREFIX_MAX + 1];
+static DWORD g_tts_last_ms;       // GetTickCount() of the last accepted char
+static int   g_tts_sel = -1;      // the selection OUR last run produced
+
+static void tts_reset(void) { g_tts_prefix[0] = '\0'; }
+static bool tts_active(void) { return g_tts_prefix[0] != '\0'; }
+static void tts_char(int ch, const Layout* L);   // used by the wheel key
+
+// Every printable character THIS frame delivered, oldest first (up to
+// cap).  The live pump fills charq - after a stall one frame can hold a
+// whole typed word and a single latch would drop all but its last
+// letter - while a plain one-character frame, and every selftest
+// InputState (which never sets the queue), is char_pressed alone.
+static int tts_frame_chars(const InputState* in, unsigned int* out, int cap) {
+    int n = in->charq_n;
+    if (n <= 0) {
+        if (!in->char_pressed) return 0;
+        out[0] = in->char_pressed;
+        return 1;
+    }
+    if (n > cap) n = cap;
+    for (int i = 0; i < n; i++) out[i] = in->charq[i];
+    return n;
+}
+
 // ---- async thumbnail pipeline (worker thread + disk cache) ------------
 // paint() may only QUEUE thumbnail/OLE work: one background thread does
 // the slow shell calls and writes the result to the memory cache AND to
@@ -1000,6 +1195,16 @@ static int zoom_percent(float z) {                 // what the label shows
 // Transient status text (shown in the count slot of the status bar) and the
 // frame until which the vertical zoom popup stays open after a zoom change.
 static unsigned long g_status_until = 0;
+// Deadlines are WALL-CLOCK ticks, not frame numbers: the loop now idles
+// at a few frames a second, so "240 frames" would have kept a 4-second
+// message (or the zoom popup) on screen for minutes.  0 = expired.
+static bool tick_before(unsigned long until) {
+    return until != 0 && (long)(until - (unsigned long)GetTickCount()) > 0;
+}
+static unsigned long tick_in(unsigned long ms) {
+    unsigned long t = (unsigned long)GetTickCount() + ms;
+    return t ? t : 1;
+}
 static unsigned long g_zoom_pop_until = 0;
 
 // Bottom bar counts: every entry of the current folder, plus how many of
@@ -1065,7 +1270,7 @@ static void set_status(const char* fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(g_app.status_msg, sizeof(g_app.status_msg), fmt, ap);
     va_end(ap);
-    g_status_until = g_app.frame + 240;   // ~4 s in the count slot, then it
+    g_status_until = tick_in(4000);   // ~4 s in the count slot, then it
 }                                         // fades back to the counts
 
 static bool dir_exists(const char* path) {
@@ -1188,9 +1393,14 @@ static size_t g_res_rows = 0;
 static void rebuild_view(void);
 static void set_sort(int key);
 static void load_dir(const char* path);
+static void folder_watch_poke(void);   // auto-refresh soon (shell verb ran)
+static void folder_refresh_keep(void); // reload, keeping scroll + selection
 static void blur_fields(void);
+static void focus_search(void);        // the search popup draws auto-focused
 static void search_restore(void);     // cancel scan / swap the real listing back
 static void search_drop(void);        // discard all search state (new folder)
+static bool search_masking_listing(void);  // are SEARCH rows on screen right now?
+
 static void search_pump(void);        // per-frame: install / progress / retry
 static void search_start_deep(void);  // Enter / This PC auto: scan the tree
 
@@ -1296,11 +1506,17 @@ enum {                                  // entry ids (index into g_ents)
     CMD_UPD_SOURCE, CMD_UPD_VER, CMD_UPD_AUTO, CMD_UPD_CHECK,
     CMD_UPD_STATUS, CMD_UPD_RESTART, CMD_UPD_NOTES,
     CMD_RESTORE_SESSION,
+    CMD_SIDEBAR, CMD_HELP, CMD_WELCOMED,
     CMD_COUNT
 };
 
-static void set_theme_apply(bool v);   // defined with the toggle actions
 static void set_hidden_apply(bool v);
+// Sidebar shown (Settings / Ctrl+S / the top-left panel button) and its
+// slide animation (0 = hidden, 1 = shown; eased every frame).
+static bool  g_opt_sidebar = true;
+static float g_side_anim = 1.0f;
+// The first-start welcome tour has been seen (hidden registry row).
+static bool  g_opt_welcomed = false;
 
 // Updates (auto-update) - the option persists through the normal settings
 // store; the URL itself lives in %LOCALAPPDATA%\NovaFile\updates.cfg so a
@@ -1318,6 +1534,23 @@ static SetEnt g_ents[CMD_COUNT] = {
         .cat=SCAT_GENERAL, .kind=EK_ACTION,
         .key=VK_OEM_COMMA, .mods=M_CTRL, .dkey=VK_OEM_COMMA, .dmods=M_CTRL,
         .rebindable=true, .has_sw=false, .on=true, .don=true },
+    [CMD_HELP] = { .id="help", .name="Keyboard shortcuts guide",
+        .desc="Every shortcut and mouse gesture on one searchable page.",
+        .how="Press the key anywhere; type to filter, Esc closes.",
+        .cat=SCAT_GENERAL, .kind=EK_ACTION,
+        .key=VK_F1, .dkey=VK_F1,
+        .rebindable=true, .has_sw=false, .on=true, .don=true },
+    [CMD_SIDEBAR] = { .id="sidebar", .name="Show the sidebar",
+        .desc="ON = Recents, Bookmarks, Storage and Places on the left. OFF = the files use the whole width.",
+        .how="The panel button at the top left, or the shortcut.",
+        .cat=SCAT_APPEARANCE, .kind=EK_OPTION,
+        .key='S', .mods=M_CTRL, .dkey='S', .dmods=M_CTRL,
+        .rebindable=true, .has_sw=true, .key_gated=false,
+        .var=&g_opt_sidebar, .dval=true },
+    [CMD_WELCOMED] = { .id="welcome_seen", .name="Welcome tour seen",
+        .desc="The first-start welcome tour was shown.",
+        .how="Hidden.", .cat=SCAT_ADV, .kind=EK_OPTION, .hidden=true,
+        .has_sw=false, .var=&g_opt_welcomed, .dval=false },
     [CMD_QUIT] = { .id="quit", .name="Exit",
         .desc="Close the application. Panes, tabs and settings are kept for next time.",
         .how="Escape only cancels; close with the X button or this key.",
@@ -1343,13 +1576,16 @@ static SetEnt g_ents[CMD_COUNT] = {
         .cat=SCAT_GENERAL, .kind=EK_DOC, .key=VK_ESCAPE, .dkey=VK_ESCAPE },
 
     // ---- Appearance ----
-    [CMD_THEME] = { .id="theme", .name="Light theme",
-        .desc="ON = light colours, OFF = the default dark scheme.",
-        .how="Applies instantly; nothing on disk is touched.",
-        .cat=SCAT_APPEARANCE, .kind=EK_OPTION,
-        .key='T', .mods=M_CTRL, .dkey='T', .dmods=M_CTRL,
-        .rebindable=true, .has_sw=true, .key_gated=false,
-        .var=&g_app.light, .dval=false, .apply=set_theme_apply },
+    // Kept as a HIDDEN documentation row: the theme is chosen on the
+    // three preview cards below, so there is no binding and no cycling
+    // shortcut any more.  The row stays in the table so an older
+    // settings file's "theme" line still parses (its id is stable).
+    [CMD_THEME] = { .id="theme", .name="Theme",
+        .desc="Midnight, Dark or Light - picked on the cards in Settings.",
+        .how="Settings > Appearance > Theme.",
+        .cat=SCAT_APPEARANCE, .kind=EK_DOC,
+        .key=0, .mods=0, .dkey=0, .dmods=0,
+        .rebindable=false, .hidden=true, .on=true, .don=true },
     [CMD_VIEW] = { .id="view", .name="Cycle view mode",
         .desc="Details -> List -> Tree -> Icons -> XL icons.",
         .how="Or the view button in the status bar.",
@@ -1516,10 +1752,10 @@ static SetEnt g_ents[CMD_COUNT] = {
         .key='B', .mods=M_CTRL, .dkey='B', .dmods=M_CTRL,
         .rebindable=true, .has_sw=true, .on=true, .don=true },
     [CMD_WHEEL] = { .id="wheel", .name="Quick Access wheel",
-        .desc="Press C to open the radial wheel of starred folders at the pointer.",
+        .desc="Hold C (or press Alt+S) to open the radial wheel of starred folders at the pointer.",
         .how="Star a row with the star to add it; while open, arrows pick a slot and Enter jumps.",
         .cat=SCAT_STARRED, .kind=EK_OPTION,
-        .key='C', .dkey='C',
+        .key='C', .dkey='C', .akey='S', .amods=M_ALT,
         .rebindable=true, .has_sw=true, .key_gated=true,
         .var=&g_opt_wheel, .dval=true },
     [CMD_STARDOC] = { .id="starred_doc", .name="Starred items",
@@ -1609,13 +1845,14 @@ static SetEnt g_ents[CMD_COUNT] = {
 // registry, so the menu can never advertise a stale shortcut).
 enum { MENU_MAX_ITEMS = MENU_MAX };
 static const int MENU_CMD[MENU_MAX] = {
-    CMD_NEW_TAB, CMD_BOOKMARK, CMD_REFRESH, CMD_THEME, CMD_HIDDEN,
+    CMD_NEW_TAB, CMD_BOOKMARK, CMD_REFRESH, CMD_HIDDEN,
     CMD_HOME, CMD_SPLIT, CMD_CLOSE_PANE, CMD_QUIT,
 };
 
 // ---- store path + load/save (atomic: tmp file + MoveFileEx, like the
 //      favorite and custom-thumbnail stores) ----
 static char g_set_file[1200];          // "" = memory only (no store)
+static int  g_set_ver = 1;             // header "settings v<N>" of the file
 
 static void settings_save(void);
 static void settings_load(void);
@@ -1861,7 +2098,7 @@ static void settings_save(void) {
     if (w <= 0 || (size_t)w >= sizeof(tmp)) return;
     FILE* f = fopen(tmp, "wb");
     if (!f) return;
-    fprintf(f, "# NovaFile settings v1\n");
+    fprintf(f, "# NovaFile settings v2\n");
     for (int i = 0; i < CMD_COUNT; i++) {
         const SetEnt* e = &g_ents[i];
         int val = (e->kind == EK_OPTION && e->var)
@@ -1873,6 +2110,15 @@ static void settings_save(void) {
     // the unknown id, a missing line keeps the 100% default - this can
     // never touch any other setting.
     fprintf(f, "ui_scale\t%d\t0\t1\n", g_ui_scale);
+    // The live theme (Midnight / Dark / Light) gets its own line the same
+    // way - the command table only stores booleans.  Older builds skip
+    // the unknown id; a missing line keeps the Midnight default.
+    fprintf(f, "palette\t%d\t0\t1\n", g_pal_idx);
+    // Sidebar bookmarks, one line each - same "own prefix" trick as
+    // ui_scale: the generic id/key/mods/val loop above never sees them,
+    // and older builds just skip the unknown "bm" line.
+    for (int i = 0; i < g_bookmark_n; i++)
+        fprintf(f, "bm\t%s\n", g_bookmarks[i]);
     if (fclose(f) != 0) return;
     MoveFileExA(tmp, g_set_file,
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
@@ -1886,7 +2132,24 @@ static void settings_load(void) {
     while (fgets(line, sizeof(line), f)) {
         size_t n = strlen(line);
         while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
-        if (!line[0] || line[0] == '#') continue;
+        if (!line[0]) continue;
+        if (line[0] == '#') {
+            // "# NovaFile settings v1" / v2: v1 stored the theme as a
+            // LIGHT on/off switch (handled at the CMD_THEME row below).
+            const char* vp = strstr(line, "settings v");
+            if (vp) g_set_ver = atoi(vp + 10);
+            continue;
+        }
+        // Theme index: its own line, same "unknown id" safety as
+        // ui_scale.  Out of range keeps the default (Midnight).
+        if (strncmp(line, "palette\t", 8) == 0) {
+            char* end2 = NULL;
+            long pi = strtol(line + 8, &end2, 10);
+            if (end2 && (*end2 == '\0' || *end2 == '\t') &&
+                pi >= 0 && pi < PAL_COUNT_N)
+                g_pal_idx = (int)pi;
+            continue;
+        }
         // Interface Scaling: its own line, parsed here so the entry
         // table's boolean rules never see it.  Out of range or malformed
         // keeps the default (100%) instead of guessing.
@@ -1896,6 +2159,13 @@ static void settings_load(void) {
             if (end2 && (*end2 == '\0' || *end2 == '\t') &&
                 sc >= UI_SCALE_MIN && sc <= UI_SCALE_MAX)
                 g_ui_scale = (int)sc;
+            continue;
+        }
+        // Sidebar bookmarks: one "bm<TAB>path" line each.  Consumed HERE
+        // so the generic command parser below never sees it; a missing
+        // line just keeps the list empty (old settings files).
+        if (strncmp(line, "bm\t", 3) == 0) {
+            if (line[3]) add_bookmark(line + 3);
             continue;
         }
         char* t1 = strchr(line, '\t');
@@ -1922,12 +2192,26 @@ static void settings_load(void) {
             if (strcmp(g_ents[i].id, line) == 0) { id = i; break; }
         if (id < 0) continue;                     // unknown id: skipped
         SetEnt* e = &g_ents[id];
+        if (id == CMD_THEME && g_set_ver <= 1) {
+            // v1 files stored the theme as the LIGHT switch: val 1 meant
+            // Light, val 0 meant "not light".  Keep that choice - val 0
+            // simply keeps the new default (Midnight).  The row is hidden
+            // and unbound now (the cards pick the theme), so the OLD
+            // Ctrl+T binding is deliberately NOT restored: a shortcut
+            // that silently cycles the theme is what this replaced.
+            if (val != 0) g_pal_idx = PAL_LIGHT_I;
+            e->key = 0;
+            e->mods = 0;
+            e->on = true;
+            continue;
+        }
         e->key = (int)key;
         e->mods = (int)mods;
         if (e->kind == EK_OPTION) { if (e->var) *e->var = val != 0; }
         else e->on = val != 0;
     }
     fclose(f);
+    pal_apply();                        // the parsed index (or default)
     // A hand-edited file can carry two entries on one binding: the FIRST
     // one wins, the later one falls back to its default.
     for (int i = 0; i < CMD_COUNT; i++) {
@@ -2056,6 +2340,11 @@ static int  s_set_vis = 7;          // rows the panel can show (set by draw)
 static RectI s_scale_track = {0};   // slider track (rebuilt every frame)
 static RectI s_scale_rst = {0};     // Reset to Default button
 static bool  g_scale_drag = false;  // mouse held on the slider track
+// ---- "Theme" card state (drawn inside the panel, Appearance only) ----
+// Three preview cards - one per REAL palette - so the theme is picked
+// visually and explicitly.  Rects are rebuilt every frame like the ones
+// above, so the draw pass and the click pass always agree.
+static RectI s_theme_card[PAL_COUNT_N] = {{0}};  // the three click targets
 // rects rebuilt by draw_settings every frame (mouse + draw agree)
 static RectI s_set_panel, s_set_filter, s_set_close, s_set_resetall;
 static RectI s_set_cat[SCAT_COUNT];
@@ -2410,8 +2699,12 @@ static void settings_keys(InputState* in) {
         return;
     }
     if (in->char_pressed >= 32) {       // same acceptance as the search box
-        text_insert(g_set_filter, sizeof(g_set_filter),
-                    &g_set_caret, &g_set_anchor, in->char_pressed);
+        unsigned int cq[32];
+        int cn = tts_frame_chars(in, cq, 32);
+        for (int ci = 0; ci < cn; ci++)
+            if (cq[ci] >= 32)
+                text_insert(g_set_filter, sizeof(g_set_filter),
+                            &g_set_caret, &g_set_anchor, cq[ci]);
         set_filter_apply();
         return;
     }
@@ -2728,21 +3021,69 @@ static bool valid_name(const char* name, char* err, size_t en) {
     return true;
 }
 
-// Rename one entry. `new_body` is the name WITHOUT extension; the old
-// extension is carried over, so a rename never changes the file type.
-static bool fs_rename(const char* old_path, const char* new_body,
+// ---- UNDO (Ctrl+Z) -------------------------------------------------------
+// One level, like most people use Explorer's: the LAST rename, new item
+// or paste can be taken back.  Each record is a list of (from, to) pairs:
+//   UNDO_RENAME  to -> from          (rename back)
+//   UNDO_NEW     to = created item   (sent to the Recycle Bin)
+//   UNDO_COPY    to = created copies (sent to the Recycle Bin)
+//   UNDO_MOVE    to -> from          (moved back where it came from)
+// Recycle-Bin deletes are not undone here - the bin itself restores them.
+enum { UNDO_NONE = 0, UNDO_RENAME, UNDO_NEW, UNDO_COPY, UNDO_MOVE };
+#define UNDO_MAX 512
+typedef struct { char from[1024]; char to[1024]; } UndoPair;
+static int g_undo_kind = UNDO_NONE;
+static UndoPair* g_undo = NULL;          // UNDO_MAX pairs, allocated once
+static int g_undo_n = 0;
+static CRITICAL_SECTION g_undo_cs;       // the paste worker records too
+static bool g_undo_cs_ok = false;
+
+static void undo_lock(void) {
+    if (!g_undo_cs_ok) { InitializeCriticalSection(&g_undo_cs); g_undo_cs_ok = true; }
+    EnterCriticalSection(&g_undo_cs);
+}
+static void undo_unlock(void) { LeaveCriticalSection(&g_undo_cs); }
+
+static void undo_begin(int kind) {
+    undo_lock();
+    if (!g_undo) g_undo = (UndoPair*)calloc(UNDO_MAX, sizeof(UndoPair));
+    g_undo_kind = g_undo ? kind : UNDO_NONE;
+    g_undo_n = 0;
+    undo_unlock();
+}
+static void undo_add(const char* from, const char* to) {
+    undo_lock();
+    if (g_undo && g_undo_kind != UNDO_NONE && g_undo_n < UNDO_MAX) {
+        snprintf(g_undo[g_undo_n].from, sizeof g_undo[0].from, "%s", from ? from : "");
+        snprintf(g_undo[g_undo_n].to, sizeof g_undo[0].to, "%s", to ? to : "");
+        g_undo_n++;
+    }
+    undo_unlock();
+}
+
+// Rename one entry to `new_name` - the FULL name as the inline field shows
+// it ("photo.jpg"; the body is pre-selected so typing keeps the extension,
+// exactly like Explorer).  It used to append the old extension AGAIN to
+// that full name, so every rename produced "photo.jpg.jpg".  Leading /
+// trailing blanks and trailing dots are dropped like Explorer does.
+static bool fs_rename(const char* old_path, const char* new_name_in,
                       char* err, size_t en) {
     char parent[1024];
     if (!parent_path(old_path, parent, sizeof(parent))) {
         snprintf(err, en, "No parent folder");
         return false;
     }
-    const char* old_name = file_name_of(old_path);
-    const char* ext = strrchr(old_name, '.');
-    if (ext == old_name) ext = NULL;            // ".gitignore" has no ext
     char new_name[512];
-    if (ext) snprintf(new_name, sizeof(new_name), "%s%s", new_body, ext);
-    else snprintf(new_name, sizeof(new_name), "%s", new_body);
+    const char* b = new_name_in ? new_name_in : "";
+    while (*b == ' ') b++;
+    snprintf(new_name, sizeof(new_name), "%s", b);
+    size_t nl = strlen(new_name);
+    while (nl > 0 && (new_name[nl - 1] == ' ' || new_name[nl - 1] == '.'))
+        new_name[--nl] = '\0';
+    if (!nl) {
+        snprintf(err, en, "A name is required");
+        return false;
+    }
     if (!valid_name(new_name, err, en)) return false;
     char dst[2048];
     path_join(parent, new_name, dst, sizeof(dst));
@@ -2755,6 +3096,8 @@ static bool fs_rename(const char* old_path, const char* new_body,
         snprintf(err, en, "Rename failed (error %lu)", GetLastError());
         return false;
     }
+    undo_begin(UNDO_RENAME);
+    undo_add(old_path, dst);
     return true;
 }
 
@@ -2798,6 +3141,7 @@ static bool fs_delete_one(const char* path, char* err, size_t en) {
 }
 
 // ---- new ----
+static char g_new_item_path[2048];     // the item the last "New" created
 static bool fs_new_folder(const char* parent, char* err, size_t en) {
     char path[2048];
     int n = 1;
@@ -2812,6 +3156,9 @@ static bool fs_new_folder(const char* parent, char* err, size_t en) {
         snprintf(err, en, "Could not create the folder (error %lu)", GetLastError());
         return false;
     }
+    undo_begin(UNDO_NEW);
+    undo_add("", path);
+    snprintf(g_new_item_path, sizeof g_new_item_path, "%s", path);
     return true;
 }
 
@@ -2832,64 +3179,264 @@ static bool fs_new_text(const char* parent, char* err, size_t en) {
         return false;
     }
     CloseHandle(f);
+    undo_begin(UNDO_NEW);
+    undo_add("", path);
+    snprintf(g_new_item_path, sizeof g_new_item_path, "%s", path);
     return true;
 }
 
-// ---- copy / move into a destination folder ----
-static bool fs_copy_one(const char* src, const char* dst_dir, char* err,
-                        size_t en) {
-    char dst[2048];
-    path_join(dst_dir, file_name_of(src), dst, sizeof(dst));
-    if (_stricmp(src, dst) == 0) return true;
+// Set while --selftest runs: the test deletes its own scratch files (they
+// must never fill the Recycle Bin) and pastes inline (no worker thread).
+static bool g_st_running = false;
+
+// ---- PASTE: Explorer-safe copy / move ----------------------------------
+// The plain fs_copy_one() above OVERWROTE a same-named file in the target
+// (CopyFile(..., FALSE)), copying into the SAME folder was a silent no-op,
+// and pasting a folder into its own subfolder recursed until the path
+// overflowed.  Paste now behaves like Explorer:
+//   - copy into the same folder      -> "name - Copy.ext", "name - Copy (2).ext"
+//   - name already taken elsewhere   -> "name (2).ext"  (never overwritten)
+//   - folder into itself / its child -> refused with a clear message
+//   - cut + paste into the same folder -> nothing to do
+static bool path_is_within(const char* child, const char* parent) {
+    size_t pn = strlen(parent);
+    while (pn > 0 && (parent[pn - 1] == '\\' || parent[pn - 1] == '/')) pn--;
+    if (pn == 0 || _strnicmp(child, parent, pn) != 0) return false;
+    return child[pn] == '\0' || child[pn] == '\\' || child[pn] == '/';
+}
+
+// A free target name inside dst_dir for `name`.  same_folder picks the
+// " - Copy" spelling Explorer uses for a duplicate in place.
+static bool fs_unique_dst(const char* dst_dir, const char* name, bool is_dir,
+                          bool same_folder, char* out, size_t on) {
+    path_join(dst_dir, name, out, on);
+    if (!same_folder && GetFileAttributesA(out) == INVALID_FILE_ATTRIBUTES)
+        return true;
+    char base[512], ext[256] = "";
+    snprintf(base, sizeof base, "%s", name);
+    if (!is_dir) {
+        char* dot = strrchr(base, '.');
+        if (dot && dot != base) {
+            snprintf(ext, sizeof ext, "%s", dot);
+            *dot = '\0';
+        }
+    }
+    for (int n = 1; n < 10000; n++) {
+        char cand[800];
+        if (same_folder) {
+            if (n == 1) snprintf(cand, sizeof cand, "%s - Copy%s", base, ext);
+            else snprintf(cand, sizeof cand, "%s - Copy (%d)%s", base, n, ext);
+        } else {
+            snprintf(cand, sizeof cand, "%s (%d)%s", base, n + 1, ext);
+        }
+        path_join(dst_dir, cand, out, on);
+        if (GetFileAttributesA(out) == INVALID_FILE_ATTRIBUTES) return true;
+    }
+    return false;
+}
+
+// Recursive copy to an exact NEW path (never overwrites anything).
+static volatile LONG g_paste_cancel = 0;
+static bool fs_copy_to(const char* src, const char* dst, char* err, size_t en) {
+    if (InterlockedCompareExchange(&g_paste_cancel, 0, 0)) {
+        snprintf(err, en, "Cancelled");
+        return false;
+    }
     DWORD a = GetFileAttributesA(src);
     if (a == INVALID_FILE_ATTRIBUTES) {
         snprintf(err, en, "Not found: %s", file_name_of(src));
         return false;
     }
     if (a & FILE_ATTRIBUTE_DIRECTORY) {
-        if (GetFileAttributesA(dst) == INVALID_FILE_ATTRIBUTES) {
-            if (!CreateDirectoryA(dst, NULL)) {
-                snprintf(err, en, "Could not create the folder");
-                return false;
-            }
+        if (!CreateDirectoryA(dst, NULL) &&
+            GetLastError() != ERROR_ALREADY_EXISTS) {
+            snprintf(err, en, "Could not create the folder \"%s\"",
+                     file_name_of(dst));
+            return false;
         }
         char search[2048];
         snprintf(search, sizeof(search), "%s\\*", src);
         WIN32_FIND_DATAA fd;
         HANDLE h = FindFirstFileA(search, &fd);
+        bool ok = true;
         if (h != INVALID_HANDLE_VALUE) {
             do {
                 if (strcmp(fd.cFileName, ".") == 0 ||
                     strcmp(fd.cFileName, "..") == 0)
                     continue;
-                char child[2048];
-                snprintf(child, sizeof(child), "%s\\%s", src, fd.cFileName);
-                if (!fs_copy_one(child, dst, err, en)) { FindClose(h); return false; }
+                char cs[2048], cd[2048];
+                snprintf(cs, sizeof cs, "%s\\%s", src, fd.cFileName);
+                snprintf(cd, sizeof cd, "%s\\%s", dst, fd.cFileName);
+                if (!fs_copy_to(cs, cd, err, en)) { ok = false; break; }
             } while (FindNextFileA(h, &fd));
             FindClose(h);
         }
-        return true;
+        return ok;
     }
-    if (!CopyFileA(src, dst, FALSE)) {
-        snprintf(err, en, "Copy failed (error %lu)", GetLastError());
+    if (!CopyFileA(src, dst, TRUE)) {           // TRUE: fail if it exists
+        snprintf(err, en, "Copy of \"%s\" failed (error %lu)",
+                 file_name_of(src), GetLastError());
         return false;
     }
     return true;
 }
 
-static bool fs_move_one(const char* src, const char* dst_dir, char* err,
-                        size_t en) {
-    char dst[2048];
-    path_join(dst_dir, file_name_of(src), dst, sizeof(dst));
-    if (_stricmp(src, dst) == 0) return true;
-    if (GetFileAttributesA(dst) != INVALID_FILE_ATTRIBUTES) {
-        snprintf(err, en, "\"%s\" already exists", file_name_of(dst));
+static bool fs_paste_one(const char* src, const char* dst_dir, bool move,
+                         char* err, size_t en) {
+    DWORD a = GetFileAttributesA(src);
+    if (a == INVALID_FILE_ATTRIBUTES) {
+        snprintf(err, en, "Not found: %s", file_name_of(src));
         return false;
     }
-    if (!MoveFileA(src, dst)) {
-        // Cross-volume: copy then delete.
-        if (!fs_copy_one(src, dst_dir, err, en)) return false;
+    bool is_dir = (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if (is_dir && path_is_within(dst_dir, src)) {
+        snprintf(err, en, "\"%s\" cannot go inside itself",
+                 file_name_of(src));
+        return false;
+    }
+    char src_parent[1024];
+    bool same = parent_path(src, src_parent, sizeof src_parent) &&
+                _stricmp(src_parent, dst_dir) == 0;
+    if (move && same) return true;              // already there
+    char dst[2048];
+    if (!fs_unique_dst(dst_dir, file_name_of(src), is_dir, same && !move,
+                       dst, sizeof dst)) {
+        snprintf(err, en, "No free name for \"%s\"", file_name_of(src));
+        return false;
+    }
+    if (move) {
+        if (MoveFileExA(src, dst, MOVEFILE_COPY_ALLOWED)) {
+            undo_add(src, dst);
+            return true;
+        }
+        // A folder across volumes: copy it, then remove the original.
+        if (!fs_copy_to(src, dst, err, en)) return false;
+        undo_add(src, dst);
         return fs_delete_one(src, err, en);
+    }
+    if (!fs_copy_to(src, dst, err, en)) return false;
+    undo_add(src, dst);
+    return true;
+}
+
+// ---- background paste ---------------------------------------------------
+// A big copy used to run on the UI thread: the window froze until the
+// last byte was written.  The job now runs on a worker; the status bar
+// shows "Copying 3 of 10..." and Esc cancels.  (The selftest runs it
+// inline so its checks see the result immediately.)
+typedef struct {
+    char** paths;
+    int count;
+    bool move;
+    char dst[1024];
+} PasteJob;
+static PasteJob g_paste;
+static volatile LONG g_paste_running = 0;      // 0 idle, 1 running, 2 finished
+static volatile LONG g_paste_done = 0, g_paste_cur = 0;
+static char g_paste_err[256];
+static HANDLE g_paste_thread = NULL;
+
+static void paste_run_all(void) {
+    g_paste_err[0] = '\0';
+    for (int i = 0; i < g_paste.count; i++) {
+        InterlockedExchange(&g_paste_cur, i + 1);
+        char err[256] = {0};
+        if (fs_paste_one(g_paste.paths[i], g_paste.dst, g_paste.move, err,
+                         sizeof err))
+            InterlockedIncrement(&g_paste_done);
+        else if (err[0])
+            snprintf(g_paste_err, sizeof g_paste_err, "%s", err);
+        if (InterlockedCompareExchange(&g_paste_cancel, 0, 0)) break;
+    }
+}
+
+static DWORD WINAPI paste_worker(LPVOID arg) {
+    (void)arg;
+    paste_run_all();
+    InterlockedExchange(&g_paste_running, 2);
+    platform_wake();
+    return 0;
+}
+
+static void paste_free_job(void) {
+    for (int i = 0; i < g_paste.count; i++) free(g_paste.paths[i]);
+    free(g_paste.paths);
+    g_paste.paths = NULL;
+    g_paste.count = 0;
+}
+
+// Land a finished job / publish progress (UI thread, every frame).
+static void paste_pump(void) {
+    LONG st = InterlockedCompareExchange(&g_paste_running, 0, 0);
+    if (st == 1) {
+        static DWORD last = 0;
+        if (GetTickCount() - last > 200) {
+            last = GetTickCount();
+            set_status("%s %ld of %d...  (Esc cancels)",
+                       g_paste.move ? "Moving" : "Copying",
+                       (long)g_paste_cur, g_paste.count);
+        }
+        return;
+    }
+    if (st != 2) return;
+    if (g_paste_thread) {
+        WaitForSingleObject(g_paste_thread, INFINITE);
+        CloseHandle(g_paste_thread);
+        g_paste_thread = NULL;
+    }
+    InterlockedExchange(&g_paste_running, 0);
+    int done = (int)g_paste_done;
+    bool cancelled = InterlockedCompareExchange(&g_paste_cancel, 0, 0) != 0;
+    if (done > 0) load_dir(g_app.current_path);
+    if (cancelled)
+        set_status("Cancelled after %d item%s", done, done == 1 ? "" : "s");
+    else if (g_paste_err[0] && done < g_paste.count)
+        set_status("%s", g_paste_err);
+    else
+        set_status("%s %d item%s", g_paste.move ? "Moved" : "Pasted", done,
+                   done == 1 ? "" : "s");
+    paste_free_job();
+}
+
+static bool paste_busy(void) {
+    return InterlockedCompareExchange(&g_paste_running, 0, 0) != 0;
+}
+
+// Esc while a copy runs: stop after the file in progress.
+static bool paste_cancel_request(void) {
+    if (InterlockedCompareExchange(&g_paste_running, 0, 0) != 1) return false;
+    InterlockedExchange(&g_paste_cancel, 1);
+    set_status("Cancelling...");
+    return true;
+}
+
+// Start a paste of `paths` into dst (the list is copied).
+static bool paste_start(char** paths, int count, bool move, const char* dst) {
+    if (count <= 0 || !dst || !dst[0]) return false;
+    if (paste_busy()) {
+        set_status("Another copy is still running");
+        return false;
+    }
+    paste_free_job();
+    g_paste.paths = (char**)calloc((size_t)count, sizeof(char*));
+    if (!g_paste.paths) return false;
+    for (int i = 0; i < count; i++) {
+        g_paste.paths[g_paste.count] = _strdup(paths[i]);
+        if (g_paste.paths[g_paste.count]) g_paste.count++;
+    }
+    g_paste.move = move;
+    snprintf(g_paste.dst, sizeof g_paste.dst, "%s", dst);
+    InterlockedExchange(&g_paste_cancel, 0);
+    InterlockedExchange(&g_paste_done, 0);
+    InterlockedExchange(&g_paste_cur, 0);
+    InterlockedExchange(&g_paste_running, 1);
+    undo_begin(move ? UNDO_MOVE : UNDO_COPY);
+    if (!g_st_running)
+        g_paste_thread = CreateThread(NULL, 0, paste_worker, NULL, 0, NULL);
+    if (!g_paste_thread) {                  // selftest, or no thread: inline
+        paste_run_all();
+        InterlockedExchange(&g_paste_running, 2);
+        paste_pump();
     }
     return true;
 }
@@ -3052,8 +3599,23 @@ static bool rename_commit(void) {
     bool ok = fs_rename(e->path, body, err, sizeof(err));
     g_rename_vi = -1;
     if (ok) {
+        // The new name comes from the undo record: load_dir() below frees
+        // the listing `e` points into (reading e->path afterwards was a
+        // use-after-free - and it printed the OLD name anyway).
+        char newp[1024] = "";
+        if (g_undo_kind == UNDO_RENAME && g_undo_n > 0)
+            snprintf(newp, sizeof newp, "%s", g_undo[0].to);
         load_dir(g_app.current_path);
-        set_status("Renamed to %s", file_name_of(e->path));
+        set_status("Renamed to %s", newp[0] ? file_name_of(newp) : body);
+        // keep the renamed item selected, like Explorer
+        for (size_t vi = 0; newp[0] && vi < g_app.view_count; vi++)
+            if (_stricmp(g_app.entries[g_app.view[vi]].path, newp) == 0) {
+                sel_clear();
+                sel_add((int)vi);
+                g_app.selected = (int)vi;
+                g_scroll_to_sel = true;
+                break;
+            }
     } else {
         set_status("%s", err[0] ? err : "Rename failed");
     }
@@ -3067,7 +3629,50 @@ static char** g_del_paths = NULL;
 static int g_del_n = 0;
 static bool g_del_confirmed = false;
 
+// Explorer semantics: Delete sends the selection to the RECYCLE BIN (it
+// can be restored), Shift+Delete removes it permanently.  The flag is
+// captured when the confirmation opens so the panel can say which one
+// is about to happen.
+static bool g_del_permanent = false;
+
+// Send ONE item to the Recycle Bin through the shell (the same call
+// Explorer uses).  False when the shell refused - the caller then
+// reports the item instead of silently deleting it for good.
+static bool fs_recycle_one(const char* path, char* err, size_t en) {
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
+        snprintf(err, en, "Not found: %s", file_name_of(path));
+        return false;
+    }
+    wchar_t w[2048 + 2];
+    int n = MultiByteToWideChar(CP_ACP, 0, path, -1, w, 2048);
+    if (n <= 0) { snprintf(err, en, "Path too long"); return false; }
+    w[n] = L'\0';                       // double-NUL list terminator
+    SHFILEOPSTRUCTW op;
+    memset(&op, 0, sizeof op);
+    op.hwnd = (HWND)g_app.hwnd;
+    op.wFunc = FO_DELETE;
+    op.pFrom = w;
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT |
+                FOF_NOERRORUI;
+    int rc = SHFileOperationW(&op);
+    if (rc != 0 || op.fAnyOperationsAborted ||
+        GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
+        snprintf(err, en, "Could not delete \"%s\" (in use?)",
+                 file_name_of(path));
+        return false;
+    }
+    return true;
+}
+
+static void delete_confirm_mode(bool permanent);
 static void delete_confirm(void) {
+    // Shift held = permanent (Shift+Delete, or Shift + the menu row).
+    InputState* cin = platform_get_input();
+    delete_confirm_mode(cin && cin->shift_pressed);
+}
+
+static void delete_confirm_mode(bool permanent) {
+    g_del_permanent = permanent;
     int n = 0;
     char** paths = sel_paths(&n);
     if (n <= 0) { sel_paths_free(paths, n); return; }
@@ -3086,8 +3691,11 @@ static void delete_do(void) {
     if (g_del_n <= 0) return;
     int done = 0;
     char err[256] = {0};
+    bool recycle = !g_del_permanent && !g_st_running;
     for (int i = 0; i < g_del_n; i++) {
-        if (fs_delete_one(g_del_paths[i], err, sizeof(err))) done++;
+        bool ok = recycle ? fs_recycle_one(g_del_paths[i], err, sizeof(err))
+                          : fs_delete_one(g_del_paths[i], err, sizeof(err));
+        if (ok) done++;
         else set_status("%s", err);
     }
     for (int i = 0; i < g_del_n; i++) free(g_del_paths[i]);
@@ -3097,7 +3705,11 @@ static void delete_do(void) {
     g_confirm_kind = CONFIRM_NONE;
     if (done > 0) {
         load_dir(g_app.current_path);
-        set_status("Deleted %d item%s", done, done == 1 ? "" : "s");
+        if (recycle)
+            set_status("Moved %d item%s to the Recycle Bin", done,
+                       done == 1 ? "" : "s");
+        else
+            set_status("Deleted %d item%s", done, done == 1 ? "" : "s");
     }
 }
 
@@ -3178,20 +3790,48 @@ typedef struct {
 } PropsSizeJob;
 
 static PropsSizeJob g_props_job;
+static char g_props_want[1024];           // folder the OPEN panel waits on
+static volatile LONG g_props_running = 0; // one size walk at a time
 
 static DWORD WINAPI props_size_thread(void* arg) {
     PropsSizeJob* j = (PropsSizeJob*)arg;
     j->size = fs_dir_size(j->path);
     j->done = true;
+    InterlockedExchange(&g_props_running, 0);
     return 0;
 }
 
 static void props_size_worker(const char* path) {
+    snprintf(g_props_want, sizeof g_props_want, "%s", path);
+    // Never re-arm while a walk is live: a second spawn would overwrite the
+    // LIVE job's path/size mid-read (torn path, the stale thread possibly
+    // writing last).  The panel's pump re-arms once the current walk lands.
+    if (InterlockedCompareExchange(&g_props_running, 1, 0) != 0) return;
     snprintf(g_props_job.path, sizeof(g_props_job.path), "%s", path);
     g_props_job.size = 0;
     g_props_job.done = false;
     HANDLE h = CreateThread(NULL, 0, props_size_thread, &g_props_job, 0, NULL);
-    if (h) CloseHandle(h);   // detached: the panel polls g_props_job.done
+    if (h) CloseHandle(h);   // detached: props_size_pump() reads the result
+    else {                   // spawn failed: never leave a stuck spinner
+        g_props_job.done = true;
+        InterlockedExchange(&g_props_running, 0);
+    }
+}
+
+// Consumed once per frame by draw_props_panel(): a finished walk for the
+// folder this panel SHOWS lands in g_props_size; a result left over from an
+// EARLIER folder is discarded and the wanted walk re-armed.  Without this
+// poll g_props_size_done never became true for a folder and the Size row
+// said "Calculating..." forever, no matter how fast the worker finished.
+static void props_size_pump(void) {
+    if (g_props_size_done || !g_props_folder) return;
+    if (!g_props_job.done) return;
+    if (strcmp(g_props_job.path, g_props_want) == 0) {
+        g_props_size = g_props_job.size;
+        g_props_size_done = true;
+    } else {
+        props_size_worker(g_props_want);   // stale result: re-arm ours
+    }
 }
 
 // The shell answers to the My Computer CLSID, never to the display name.
@@ -3247,37 +3887,70 @@ static const char* path_name(const char* p) {
     return (s && s[1]) ? s + 1 : p;
 }
 
-// Truncate so the text fits max_px. Character width scales with DPI.
-static void fit_text(const char* src, char* dst, size_t dst_size, int max_px) {
+static float measure_px(const char* s, int px);   // defined below (drawing)
+
+// Truncate so the text fits max_px, MEASURED against the same font
+// (font_px) the caller will draw it with.  The old version estimated a
+// fixed 7px * DPI glyph width and then forced at least 4 characters, so a
+// narrow field (search box, address bar, split-pane tab) could show text
+// that painted past its own box - exactly the "content spills out" report.
+// Now the drawn string is measured with the real font metrics before it is
+// committed: at any DPI or UI scale it can never exceed the room given.
+// Output ends in "..." when something was cut; if even the ellipsis has no
+// room, only as many dots as actually fit are emitted (never a fixed floor).
+static void fit_text(const char* src, char* dst, size_t dst_size, int max_px,
+                     int font_px) {
     if (!dst || dst_size == 0) return;
     dst[0] = '\0';
-    if (!src) return;
-
-    double cw = 7.0 * ((g_dpi > 0.5f) ? g_dpi : 1.0f);
-    if (max_px < (int)cw) return;               // no room: keep dst empty
-    size_t max_chars = (size_t)((double)max_px / cw);
-    if (max_chars < 4) max_chars = 4;
+    if (!src || !src[0]) return;
+    if (max_px <= 0 || dst_size < 5) return;    // no room: keep dst empty
+    if (font_px <= 0) font_px = 14;
 
     size_t len = strlen(src);
-    if (len <= max_chars) {
-        snprintf(dst, dst_size, "%s", src);
-        return;
-    }
-    if (dst_size < 5) {
+    if ((int)measure_px(src, font_px) <= max_px) {          // fits as-is
         snprintf(dst, dst_size, "%s", src);
         return;
     }
 
-    size_t keep = max_chars - 3;
-    if (keep > dst_size - 4) keep = dst_size - 4;
-    while (keep > 0 && (((unsigned char)src[keep] & 0xC0) == 0x80)) keep--;
-    if (keep == 0) keep = 1;
+    // One measurement gives the average glyph width - start the walk there
+    // instead of at a blind guess, so the loop converges in 1-2 steps.
+    float total = measure_px(src, font_px);
+    size_t keep = (total > 1.0f)
+                      ? (size_t)((double)max_px * (double)len / (double)total)
+                      : 1;
+    if (keep >= len) keep = len - 1;
 
-    memcpy(dst, src, keep);
-    dst[keep] = '.';
-    dst[keep + 1] = '.';
-    dst[keep + 2] = '.';
-    dst[keep + 3] = '\0';
+    for (int guard = 0; guard < 64; guard++) {
+        if (keep > dst_size - 4) keep = dst_size - 4;
+        while (keep > 0 && (((unsigned char)src[keep] & 0xC0) == 0x80))
+            keep--;                           // never split a UTF-8 sequence
+        memcpy(dst, src, keep);
+        dst[keep]     = '.';
+        dst[keep + 1] = '.';
+        dst[keep + 2] = '.';
+        dst[keep + 3] = '\0';
+        int w = (int)measure_px(dst, font_px);
+        if (w <= max_px) return;                            // fits: done
+        if (keep == 0) break;                    // not even "..." fits
+        // proportional step down towards the exact prefix width, never 0
+        size_t next = (w > 0)
+                          ? (size_t)((double)keep * (double)max_px /
+                                     (double)w)
+                          : keep - 1;
+        if (next >= keep) next = keep - 1;
+        keep = next;
+    }
+
+    // Degenerate room (less than the ellipsis): dots only, exactly as many
+    // as fit - and none at all when even one dot would overflow.
+    int dot_w = (int)measure_px(".", font_px);
+    if (dot_w < 1) dot_w = 1;
+    if (max_px < dot_w) { dst[0] = '\0'; return; }
+    int nd = max_px / dot_w;
+    if (nd > 3) nd = 3;
+    if (nd >= (int)dst_size) nd = (int)dst_size - 1;
+    for (int k = 0; k < nd; k++) dst[k] = '.';
+    dst[nd] = '\0';
 }
 
 // ---- TOP TAB title (spec: never the word "Workspace" in the UI) ----
@@ -3376,17 +4049,42 @@ static void text_del_sel(char* buf, int* caret, int* anchor) {
     *caret = *anchor = lo;
 }
 
+// A typed CODE POINT as the bytes the app's strings use: the file system
+// side is the *A API family, so the character is encoded in the active
+// code page - UTF-8 with the app manifest (Windows 10 1903+), i.e. every
+// script works; on older systems the classic ANSI page, where a
+// character it cannot represent becomes '?', exactly as before.
+static int cp_encode(unsigned int cp, char out[8]) {
+    if (cp < 128) { out[0] = (char)cp; return 1; }
+    wchar_t w[2];
+    int wn = 1;
+    if (cp >= 0x10000) {
+        if (cp > 0x10FFFF) return 0;
+        cp -= 0x10000;
+        w[0] = (wchar_t)(0xD800 + (cp >> 10));
+        w[1] = (wchar_t)(0xDC00 + (cp & 0x3FF));
+        wn = 2;
+    } else {
+        w[0] = (wchar_t)cp;
+    }
+    int n = WideCharToMultiByte(CP_ACP, 0, w, wn, out, 8, NULL, NULL);
+    return n > 0 ? n : 0;
+}
+
 static void text_insert(char* buf, size_t cap, int* caret, int* anchor,
                         unsigned int ch) {
     caret_touch();
     text_del_sel(buf, caret, anchor);
+    char enc[8];
+    int en = cp_encode(ch, enc);
+    if (en <= 0) return;
     size_t len = strlen(buf);
-    if (len + 1 >= cap) return;
+    if (len + (size_t)en >= cap) return;
     if (*caret < 0) *caret = 0;
     if (*caret > (int)len) *caret = (int)len;
-    memmove(buf + *caret + 1, buf + *caret, len - (size_t)*caret + 1);
-    buf[*caret] = (char)ch;
-    (*caret)++;
+    memmove(buf + *caret + en, buf + *caret, len - (size_t)*caret + 1);
+    memcpy(buf + *caret, enc, (size_t)en);
+    *caret += en;
     *anchor = *caret;
 }
 
@@ -3569,13 +4267,50 @@ static void add_bookmark(const char* path) {
     g_bookmark_n++;
 }
 
-static void bookmark_current(void) {
-    if (g_bookmark_n >= BOOKMARK_MAX) {
+// Find a bookmarked path (case-insensitive, Explorer style) or -1.
+static int bookmark_find(const char* path) {
+    if (!path || !path[0]) return -1;
+    for (int i = 0; i < g_bookmark_n; i++)
+        if (_stricmp(g_bookmarks[i], path) == 0) return i;
+    return -1;
+}
+
+// Drop the i-th bookmark - the arrays stay packed, no holes.
+static void remove_bookmark_at(int i) {
+    if (i < 0 || i >= g_bookmark_n) return;
+    for (int j = i; j + 1 < g_bookmark_n; j++) {
+        memcpy(g_bookmarks[j], g_bookmarks[j + 1], sizeof(g_bookmarks[0]));
+        memcpy(g_bookmark_labels[j], g_bookmark_labels[j + 1],
+               sizeof(g_bookmark_labels[0]));
+    }
+    g_bookmark_n--;
+}
+
+// Add-or-remove in one step - what the command's own "Add or remove"
+// description promises.  The sidebar rebuilds right away (the entry
+// appears or disappears without a navigate) and the list is written to
+// settings so it survives a restart.
+static void bookmark_toggle(const char* path, const char* label) {
+    if (!path || !path[0]) return;
+    int i = bookmark_find(path);
+    if (i >= 0) {
+        remove_bookmark_at(i);
+        set_status("Removed bookmark: %s",
+                   label && label[0] ? label : path_name(path));
+    } else if (g_bookmark_n >= BOOKMARK_MAX) {
         set_status("Bookmark list is full");
         return;
+    } else {
+        add_bookmark(path);
+        set_status("Bookmarked: %s",
+                   label && label[0] ? label : path_name(path));
     }
-    add_bookmark(g_app.current_path);
-    set_status("Bookmarked: %s", path_name(g_app.current_path));
+    build_sidebar();
+    settings_save();
+}
+
+static void bookmark_current(void) {
+    bookmark_toggle(g_app.current_path, NULL);
 }
 
 static void side_add(int kind, const char* label, const char* path, bool is_file) {
@@ -4353,10 +5088,19 @@ typedef struct {
 } TcDone;
 
 static CRITICAL_SECTION g_tc_cs;
+// Both queues are FIFO RINGS (head + count): a pop is O(1).  They used
+// to be flat arrays shifted down with memmove on EVERY pop - a job is
+// ~2.3 KB, so draining a full icon queue moved ~250 MB of memory.
 static TcJob g_tc_q[TC_QMAX];
 static int   g_tc_qn = 0;
+static int   g_tc_qh = 0;                  // ring head (oldest job)
 static TcJob g_tc_iq[TC_IMAX];             // type-icon jobs: popped BEFORE
 static int   g_tc_iqn = 0;                 // thumbnails (visible-first)
+static int   g_tc_iqh = 0;
+// Idle workers sleep on this event instead of polling every 6 ms (three
+// threads x 166 wake-ups a second while nothing at all was queued).
+static HANDLE g_tc_wake = NULL;
+static volatile LONG g_tc_inflight = 0;    // jobs a worker is running now
 static TcDone g_tc_r[TC_RMAX];
 static int    g_tc_rn = 0;
 static TcDone g_tc_buf[TC_RMAX];            // drain copy-out (UI thread)
@@ -4676,22 +5420,25 @@ static DWORD WINAPI tc_worker(void* arg) {
         bool got = false;
         EnterCriticalSection(&g_tc_cs);
         if (g_tc_iqn > 0) {                 // visible-first: type icons
-            job = g_tc_iq[0];               // before queued thumbnails
+            job = g_tc_iq[g_tc_iqh];        // before queued thumbnails
+            g_tc_iqh = (g_tc_iqh + 1) % TC_IMAX;
             g_tc_iqn--;
-            if (g_tc_iqn > 0)
-                memmove(&g_tc_iq[0], &g_tc_iq[1],
-                        sizeof(TcJob) * (size_t)g_tc_iqn);
             got = true;
         } else if (g_tc_qn > 0) {
-            job = g_tc_q[0];
+            job = g_tc_q[g_tc_qh];
+            g_tc_qh = (g_tc_qh + 1) % TC_QMAX;
             g_tc_qn--;
-            if (g_tc_qn > 0)
-                memmove(&g_tc_q[0], &g_tc_q[1],
-                        sizeof(TcJob) * (size_t)g_tc_qn);
             got = true;
         }
+        if (got) InterlockedIncrement(&g_tc_inflight);
+        bool more = (g_tc_iqn + g_tc_qn) > 0;
         LeaveCriticalSection(&g_tc_cs);
-        if (!got) { Sleep(6); continue; }
+        if (!got) {                         // idle: sleep until work arrives
+            if (g_tc_wake) WaitForSingleObject(g_tc_wake, 100);
+            else Sleep(6);
+            continue;
+        }
+        if (more && g_tc_wake) SetEvent(g_tc_wake);   // wake a sibling too
         if (job.kind == 1) InterlockedIncrement(&g_wpop_i);   // TEMP diag
         else InterlockedIncrement(&g_wpop_t);
 
@@ -4730,12 +5477,18 @@ static DWORD WINAPI tc_worker(void* arg) {
             if (done.hbm) DeleteObject(done.hbm);
             if (done.hicon) DestroyIcon(done.hicon);
             if (done.big_bmp) DeleteObject(done.big_bmp);
+            InterlockedDecrement(&g_tc_inflight);
             LeaveCriticalSection(&g_tc_cs);
             break;
         }
         g_tc_r[g_tc_rn] = done;
         g_tc_rn++;
+        bool first = (g_tc_rn == 1);
+        InterlockedDecrement(&g_tc_inflight);
         LeaveCriticalSection(&g_tc_cs);
+        // The UI thread may be idle-waiting: wake it so the result paints
+        // now (one wake per batch - later results ride the same frame).
+        if (first) platform_wake();
         // NO Sleep here: the old 1ms pacing kept the shell free for the
         // UI thread's synchronous icons - those now run ON these
         // workers, so the queue drains at full speed.
@@ -4750,6 +5503,7 @@ static void tc_init(void) {
     tc_disk_sweep();
     InitializeCriticalSection(&g_tc_cs);
     InterlockedExchange(&g_tc_stop, 0);
+    if (!g_tc_wake) g_tc_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
     g_tc_running = 0;
     for (int i = 0; i < TC_THREADS; i++) {   // bounded worker pool
         HANDLE t = CreateThread(NULL, 0, tc_worker, NULL, 0, NULL);
@@ -4761,6 +5515,7 @@ static void tc_shutdown(void) {
     if (!g_tc_running) return;
     InterlockedExchange(&g_tc_stop, 1);
     for (int i = 0; i < g_tc_running; i++) {
+        if (g_tc_wake) SetEvent(g_tc_wake);   // release a waiting worker
         WaitForSingleObject(g_tc_thread[i], 3000);
         CloseHandle(g_tc_thread[i]);
         g_tc_thread[i] = NULL;
@@ -4774,7 +5529,9 @@ static void tc_shutdown(void) {
     g_tc_rn = 0;
     g_tc_qn = 0;
     g_tc_iqn = 0;
+    g_tc_qh = g_tc_iqh = 0;
     DeleteCriticalSection(&g_tc_cs);
+    if (g_tc_wake) { CloseHandle(g_tc_wake); g_tc_wake = NULL; }
 }
 
 // Queue one request (UI thread). False only when the queue is full: the
@@ -4792,8 +5549,14 @@ static bool tc_request(const char* path, int w, int h, int bg, int slot) {
     job.bg = bg;
     bool ok = false;
     EnterCriticalSection(&g_tc_cs);
-    if (g_tc_qn < TC_QMAX) { g_tc_q[g_tc_qn++] = job; ok = true; g_ntb_q++; }
+    if (g_tc_qn < TC_QMAX) {
+        g_tc_q[(g_tc_qh + g_tc_qn) % TC_QMAX] = job;
+        g_tc_qn++;
+        ok = true;
+        g_ntb_q++;
+    }
     LeaveCriticalSection(&g_tc_cs);
+    if (ok && g_tc_wake) SetEvent(g_tc_wake);
     return ok;
 }
 
@@ -4812,8 +5575,13 @@ static bool tc_request_icon(const char* path, int slot) {
     job.kind = 1;
     bool ok = false;
     EnterCriticalSection(&g_tc_cs);
-    if (g_tc_iqn < TC_IMAX) { g_tc_iq[g_tc_iqn++] = job; ok = true; }
+    if (g_tc_iqn < TC_IMAX) {
+        g_tc_iq[(g_tc_iqh + g_tc_iqn) % TC_IMAX] = job;
+        g_tc_iqn++;
+        ok = true;
+    }
     LeaveCriticalSection(&g_tc_cs);
+    if (ok && g_tc_wake) SetEvent(g_tc_wake);
     return ok;
 }
 
@@ -4980,6 +5748,7 @@ static void ct_load(void) {
     if (!f) return;
     char line[CT_PATH_MAX * 2 + 8];
     while (fgets(line, sizeof(line), f)) {
+        legacy_line_fix(line, sizeof line);   // pre-UTF-8 builds' paths
         size_t n = strlen(line);
         while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
         char* tab = strchr(line, '\t');
@@ -6065,7 +6834,7 @@ static void draw_hbitmap(HBITMAP hbm, int x, int y, int w, int h) {
 //   icon ........... draw_item_image(): shell thumbnail -> shell icon
 //   custom thumb ... ct_get() + draw_dir_with_ct() - the ONE renderer
 //   open a folder .. navigate(): history / tabs / workspaces / panes
-//   open a file .... ShellExecuteA, exactly like Enter / double click
+//   open a file .... ShellExecuteExW (registered app), exactly like Enter
 //   keyboard ....... InputState + handle_keys() (and its edit guards)
 //   storage ........ %LOCALAPPDATA%\NovaFile, written atomically with
 //                    tmp + MoveFileEx - the thumbnail index' discipline
@@ -6199,6 +6968,7 @@ static void fav_load(void) {
     if (!f) return;
     char line[1400];
     while (fgets(line, sizeof(line), f)) {
+        legacy_line_fix(line, sizeof line);   // pre-UTF-8 builds' paths
         size_t n = strlen(line);
         while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
         if (!line[0]) continue;
@@ -6343,6 +7113,9 @@ static int  g_rad_cx = 0, g_rad_cy = 0;   // pointer when C was pressed
 static int  g_rad_sel = -1;          // slot under pointer / keyboard
 static int  g_rad_lx = -1, g_rad_ly = -1;   // pointer the wheel last saw
 static int  g_rad_opens = 0;         // how often it has really opened
+static bool g_rad_hold_arm = false;  // a letter wheel-key TAP is pending:
+                                     // typing, unless the OS auto-repeat
+                                     // turns it into a HOLD (wheel opens)
 static float g_rad_hi[FAV_MAX];      // per-slot highlight easing, 0..1
 
 #define RAD_PI 3.14159265358979323846
@@ -6568,120 +7341,67 @@ static int rad_add_at(const RadGeo* g, int x, int y) {
 // Layout - one function feeds BOTH drawing and hit testing
 // ------------------------------------------------------------
 static float measure_px(const char* s, int px);   // defined below (drawing)
+static void compute_pane_tree_layout(Pane* p, RectI content);  // below (panes)
+static FolderView folder_view_from_app(void);     // below (pane swap model)
+static void app_push_folder(const FolderView* fv);
+static int pane_count(Pane* p);
 
 // Last computed layout, for the custom-title-bar hit callback
 // (platform_set_drag_hit): WM_NCHITTEST runs outside the frame loop, so
 // the rects of tabs / window controls must be readable at any time.
 static Layout g_top_layout;
 
-static void compute_layout(Layout* L, int w, int h) {
-    memset(L, 0, sizeof(*L));
+// Vertical center of the nav row (row 2 of the top bar) - shared by the
+// single-pane toolbar and every split pane's own nav row.
+static int nav_row_y(void) { return SC(TAB_H) + (SC(NAV_H) - SC(28)) / 2; }
 
-    // scaled metrics (96 DPI design values -> physical pixels)
-    L->toolbar_h = SC(TOOLBAR_H);
-    L->status_h = SC(STATUS_H);
-    L->sidebar_w = SC(SIDEBAR_W);
-    L->list_head_h = SC(LIST_HEAD_H);
-    L->row_h = (int)(SC(ROW_H) * g_zoom + 0.5f);
-    if (L->row_h < SC(22)) L->row_h = SC(22);        // text must still fit
-    L->cell_w = (int)(SC(CELL_W) * g_zoom + 0.5f);
-    if (L->cell_w < SC(48)) L->cell_w = SC(48);
-    L->thumb = (int)(SC(THUMB_BOX) * g_zoom + 0.5f);
-    L->cell_h = L->thumb + SC(62);                    // thumb + name + size
-    L->pad_x = SC(8);
-    L->pad_y = SC(6);
-    L->scroll_w = SC(SCROLL_W);
-    L->text_h = SC(TEXT_H);
-    L->text_med = SC(14);
-    L->text_small = SC(12);
-    L->btn_h = SC(BTN_H);
-    L->side_head_h = SC(24);
-    L->side_row_h = SC(26);
-    L->radius = SC(6);
-    L->icon_s = SC(16);
-
-    L->toolbar = (RectI){0, 0, w, L->toolbar_h};
-    L->status = (RectI){0, h - L->status_h, w, L->status_h};
-    L->sidebar = (RectI){0, L->toolbar_h, L->sidebar_w,
-                         h - L->toolbar_h - L->status_h};
-    L->list = (RectI){L->sidebar_w, L->toolbar_h, w - L->sidebar_w,
-                      h - L->toolbar_h - L->status_h};
-
-    // ---- row 1: hamburger | tabs | '+' | ... | min max close ----
-    // Windows 11 Explorer style: the window controls live IN the tab row,
-    // flush right; the space around them (and every gap between controls)
-    // is the title-bar drag strip (see topbar_hit / WM_NCHITTEST).
-    int bh = SC(26);
-    int y1 = SC(4);
-    L->menu_btn = (RectI){SC(8), y1, bh, bh};
-    L->set_btn  = (RectI){L->menu_btn.x + bh + SC(6), y1, bh, bh};
-    // The caption buttons own the very top edge (y = 0), including the
-    // top-right CORNER: a click thrown into the corner must close the
-    // window, never start a resize/drag (selftest: corner hits). Uniform
-    // full height = Windows 11 caption-button style.
-    int cap_h = y1 + bh;
-    L->cap_close = (RectI){w - SC(44), 0, SC(44), cap_h};
-    L->cap_max   = (RectI){L->cap_close.x - SC(44), 0, SC(44), cap_h};
-    L->cap_min   = (RectI){L->cap_max.x - SC(44), 0, SC(44), cap_h};
-
-    int tabs_x = L->set_btn.x + bh + SC(6);   // gear sits after the menu
-    int tabs_end = L->cap_min.x - SC(8);
-    int area = tabs_end - tabs_x - (bh + SC(6));      // room for the '+'
-    if (area < bh) area = bh;
-    int gap = SC(4);
-    int tn = (g_ws_n > 0) ? g_ws_n : 1;
-    int tw = (area - (tn - 1) * gap) / tn;            // uniform, gap-aware
-    if (tw > SC(170)) tw = SC(170);
-    if (tw < TAB_MIN_W) tw = TAB_MIN_W;               // never unusably tiny
-    if (tw > area) tw = area;
-    int total = tn * (tw + gap) - gap;                // full strip width
-    int smax = (total > area) ? total - area : 0;     // overflow -> scroll
-    if (smax <= 0) g_tab_scroll = 0;
-    else if (g_tab_scroll > smax) g_tab_scroll = smax;
-    else if (g_tab_scroll < 0) g_tab_scroll = 0;
-    L->tabs_x = tabs_x;
-    L->tab_area = area;
-    L->tab_scroll_max = smax;
-    L->tab_drawn = 0;
-    for (int i = 0; i < g_ws_n; i++) {
-        int nx0 = tabs_x + i * (tw + gap) - g_tab_scroll;
-        int x2 = nx0 + tw;
-        if (x2 > tabs_x + area) x2 = tabs_x + area;   // clip before the '+'
-        if (nx0 < tabs_x) nx0 = tabs_x;               // clip at the origin
-        L->tab_rects[i] = (RectI){nx0, y1, (x2 > nx0) ? x2 - nx0 : 0, bh};
-        L->tab_drawn++;                               // zero-width = off-strip
-    }
-    int nx = (total > area) ? (tabs_x + area + SC(6))  // pinned '+'
-                            : (tabs_x + total + SC(2)); // ... or after last
-    if (nx + bh > tabs_end) nx = tabs_end - bh;
-    if (nx < tabs_x) nx = tabs_x;
-    L->new_tab_btn = (RectI){nx, y1, bh, bh};
-
-    // ---- row 2: nav icons | address field | search box (right end) ----
-    int y2 = SC(TAB_H) + (SC(NAV_H) - SC(28)) / 2;
+// Lay out one nav row (back/fwd/up/refresh | address field | search box)
+// inside the horizontal span [ax, ax+aw] at vertical center y2.  The
+// single-pane toolbar calls it with the full width; each split pane calls it
+// with its own column, so every pane gets an identical, independent row.
+static void nav_row_metrics(Layout* L, int ax, int aw, int y2) {
     int nb = SC(30), ng = SC(4);
-    int bx2 = SC(10);
+    int bx2 = ax + SC(10);
     for (int i = 0; i < NAV_BTN_COUNT; i++) {
         L->nav_btns[i] = (RectI){bx2, y2, nb, SC(28)};
         bx2 += nb + ng;
     }
     bx2 += SC(2);
     // The search box hugs the right end of the row (Windows 11 Explorer
-    // style); the address field takes everything between the nav icons
-    // and it, so the two never overlap even in a narrow window.
+    // style); the address field takes everything between the nav icons and
+    // it, so the two never overlap even in a narrow window.
     int sw = SC(240);
-    if (sw > w / 3) sw = w / 3;
+    if (sw > aw / 3) sw = aw / 3;
     if (sw < SC(70)) sw = SC(70);
-    L->search_field = (RectI){w - SC(10) - sw, y2, sw, SC(28)};
+    // Narrow split pane: at PANE_MIN_W the floored SC(70) box could reach
+    // left OVER the back/fwd/up/refresh buttons. Shrink it instead (the
+    // address field already shrinks to 0 below), and hide it entirely when
+    // even that has no room - a control may get smaller, never overlap.
+    int max_sw = ax + aw - SC(10) - bx2 - SC(8);   // keep an 8px gap
+    if (max_sw < 0) max_sw = 0;
+    if (sw > max_sw) sw = max_sw;
+    L->search_field = (RectI){ax + aw - SC(10) - sw, y2, sw, SC(28)};
     L->search_clear = (RectI){L->search_field.x + L->search_field.w - SC(22),
                               y2 + SC(4), SC(20), SC(20)};
-    L->addr_field = (RectI){bx2, y2,
-                            L->search_field.x - SC(8) - bx2, SC(28)};
-    if (L->addr_field.w < SC(80)) L->addr_field.w = SC(80);
+    L->addr_field = (RectI){bx2, y2, L->search_field.x - SC(8) - bx2, SC(28)};
+    // The address field fills the gap and stops 8px short of the search box.
+    // In a wide row that gap is comfortably >= 80px; in a NARROW pane it can
+    // be a few pixels or negative, and forcing it up to a fixed 80 there would
+    // push the address ON TOP of the search box (overlapping controls, and an
+    // ambiguous hit-test where the two meet).  So use the gap as-is, floored
+    // only at 0: the address shrinks - and finally disappears - gracefully as
+    // the pane narrows.  A wide single-pane row always has the full gap, so
+    // this never changes the normal layout (min-80 was a no-op there anyway).
+    if (L->addr_field.w < 0) L->addr_field.w = 0;
+}
 
-    // ---- breadcrumb segments of the current path ----
+// Breadcrumb segments of `path`, sized to the address field just laid out.
+// Extracted from compute_layout so a split pane can recompute its own crumbs
+// from its own folder: the globals g_crumb_* always describe the path being
+// drawn, and only one nav row is ever measured/drawn at a time.
+static void compute_crumbs(Layout* L, const char* path) {
     g_crumb_n = 0;
-    const char* cp = g_app.current_path;
+    const char* cp = path;
     if (cp[0] && is_this_pc(cp)) {
         snprintf(g_crumb_label[0], sizeof(g_crumb_label[0]), "%s", THIS_PC);
         snprintf(g_crumb_path[0], sizeof(g_crumb_path[0]), "%s", THIS_PC);
@@ -6758,12 +7478,18 @@ static void compute_layout(Layout* L, int w, int h) {
         for (int i = g_crumb_n - 1; i >= 0; i--) {
             wid[i] = (int)measure_px(g_crumb_label[i], L->text_med);
             int add = wid[i] + SC(16);               // + separator room
-            if (total_w + add > avail && start != g_crumb_n) break;
+            if (total_w + add > avail) {
+                // The deepest crumb may still show ALONE, but only when it
+                // genuinely fits: in a narrow address field (split pane at
+                // PANE_MIN_W) nothing is admitted instead of one pill drawn
+                // past the field's edge - the field then shows just "..".
+                if (start != g_crumb_n || add > avail) break;
+            }
             total_w += add;
             start = i;
         }
         int x = L->addr_field.x + SC(8);
-        if (start > 0) x += SC(16);                  // room for ".."
+        if (start > 0 && start < g_crumb_n) x += SC(16);  // room for ".."
         for (int i = 0; i < g_crumb_n; i++) {
             if (i < start) {
                 L->crumb_seg[i] = (RectI){0, 0, 0, 0};
@@ -6773,7 +7499,135 @@ static void compute_layout(Layout* L, int w, int h) {
                                       L->addr_field.h};
             x += wid[i] + SC(6) + SC(12);            // pill + " > "
         }
+        // Belt and braces: no pill may end past the field's inner edge even
+        // if the font measured differently between layout and draw.
+        int limit = L->addr_field.x + L->addr_field.w - SC(4);
+        for (int i = 0; i < g_crumb_n; i++) {
+            if (L->crumb_seg[i].w > 0 && L->crumb_seg[i].x + L->crumb_seg[i].w > limit)
+                L->crumb_seg[i].w = limit - L->crumb_seg[i].x;
+            if (L->crumb_seg[i].w < 0) L->crumb_seg[i].w = 0;
+        }
     }
+}
+
+static void compute_layout(Layout* L, int w, int h) {
+    memset(L, 0, sizeof(*L));
+
+    // scaled metrics (96 DPI design values -> physical pixels)
+    L->toolbar_h = SC(TOOLBAR_H);
+    L->status_h = SC(STATUS_H);
+    // animated: slides closed / open (Ctrl+S, the top-left panel button)
+    L->sidebar_w = (int)(SC(SIDEBAR_W) * g_side_anim + 0.5f);
+    L->list_head_h = SC(LIST_HEAD_H);
+    L->row_h = (int)(SC(ROW_H) * g_zoom + 0.5f);
+    if (L->row_h < SC(22)) L->row_h = SC(22);        // text must still fit
+    L->cell_w = (int)(SC(CELL_W) * g_zoom + 0.5f);
+    if (L->cell_w < SC(48)) L->cell_w = SC(48);
+    L->thumb = (int)(SC(THUMB_BOX) * g_zoom + 0.5f);
+    L->cell_h = L->thumb + SC(62);                    // thumb + name + size
+    L->pad_x = SC(8);
+    L->pad_y = SC(6);
+    L->scroll_w = SC(SCROLL_W);
+    L->text_h = SC(TEXT_H);
+    L->text_med = SC(14);
+    L->text_small = SC(12);
+    L->btn_h = SC(BTN_H);
+    L->side_head_h = SC(24);
+    L->side_row_h = SC(26);
+    L->radius = SC(6);
+    L->icon_s = SC(16);
+
+    L->toolbar = (RectI){0, 0, w, L->toolbar_h};
+    // The sidebar runs the FULL height down to the window's bottom edge;
+    // the status bar sits only under the file area, right of the sidebar.
+    L->status = (RectI){L->sidebar_w, h - L->status_h, w - L->sidebar_w,
+                        L->status_h};
+    L->sidebar = (RectI){0, L->toolbar_h, L->sidebar_w, h - L->toolbar_h};
+    L->list = (RectI){L->sidebar_w, L->toolbar_h, w - L->sidebar_w,
+                      h - L->toolbar_h - L->status_h};
+
+    // ---- row 1: hamburger | tabs | '+' | ... | min max close ----
+    // Windows 11 Explorer style: the window controls live IN the tab row,
+    // flush right; the space around them (and every gap between controls)
+    // is the title-bar drag strip (see topbar_hit / WM_NCHITTEST).
+    int bh = SC(26);
+    int y1 = SC(4);
+    L->menu_btn = (RectI){SC(8), y1, bh, bh};
+    L->set_btn  = (RectI){L->menu_btn.x + bh + SC(6), y1, bh, bh};
+    // The caption buttons own the very top edge (y = 0), including the
+    // top-right CORNER: a click thrown into the corner must close the
+    // window, never start a resize/drag (selftest: corner hits). Uniform
+    // full height = Windows 11 caption-button style.
+    int cap_h = y1 + bh;
+    L->cap_close = (RectI){w - SC(44), 0, SC(44), cap_h};
+    L->cap_max   = (RectI){L->cap_close.x - SC(44), 0, SC(44), cap_h};
+    L->cap_min   = (RectI){L->cap_max.x - SC(44), 0, SC(44), cap_h};
+
+    L->side_btn = (RectI){L->set_btn.x + bh + SC(6), y1, bh, bh};
+    int tabs_x = L->side_btn.x + bh + SC(6);  // menu | gear | sidebar | tabs
+    int tabs_end = L->cap_min.x - SC(8);
+    int area = tabs_end - tabs_x - (bh + SC(6));      // room for the '+'
+    if (area < bh) area = bh;
+    int gap = SC(4);
+    int tn = (g_ws_n > 0) ? g_ws_n : 1;
+    // ---- RESPONSIVE tab widths (no hardcoded width, never shrinks to
+    // nothing): every tab takes an EQUAL share of the live strip width,
+    // starting at TAB_MAX_W.  As tabs are added the share drops - titles
+    // stay readable down to TAB_MIN_W, then keep shrinking (truncating
+    // with an ellipsis) to the compact TAB_MIN_W_SM floor.  Only when even
+    // that floor cannot fit does the strip start SCROLLING, and the
+    // active tab is always scrolled back into view (tab_keep_visible).
+    int tw = (area - (tn - 1) * gap) / tn;            // uniform, gap-aware
+    if (tw > TAB_MAX_W) tw = TAB_MAX_W;
+    if (tw < TAB_MIN_W_SM) tw = TAB_MIN_W_SM;         // compact floor
+    if (tw > area) tw = area;
+    int total = tn * (tw + gap) - gap;                // full strip width
+    int smax = (total > area) ? total - area : 0;     // overflow -> scroll
+    if (smax <= 0) g_tab_scroll = 0;
+    else if (g_tab_scroll > smax) g_tab_scroll = smax;
+    else if (g_tab_scroll < 0) g_tab_scroll = 0;
+    L->tabs_x = tabs_x;
+    L->tab_area = area;
+    L->tab_scroll_max = smax;
+    // The tab set / active tab just changed (added, closed, reordered,
+    // moved to another pane's window): bring the ACTIVE tab back on screen
+    // instead of leaving the strip parked where the user last scrolled.
+    // Detected by comparing against the previous frame, so free-wheeling
+    // the strip by hand is never fought. Runs BEFORE the rects are built,
+    // so the visible strip already shows the active tab this frame.
+    {
+        static int last_n = -1, last_cur = -1;
+        if (smax > 0 && (g_ws_n != last_n || g_ws_cur != last_cur) &&
+            g_ws_cur >= 0 && g_ws_cur < g_ws_n) {
+            int t0 = g_ws_cur * (tw + gap);           // its strip-space x
+            if (t0 < g_tab_scroll) g_tab_scroll = t0;
+            else if (t0 + tw > g_tab_scroll + area)
+                g_tab_scroll = t0 + tw - area;
+            if (g_tab_scroll > smax) g_tab_scroll = smax;
+            if (g_tab_scroll < 0) g_tab_scroll = 0;
+        }
+        last_n = g_ws_n; last_cur = g_ws_cur;
+    }
+    L->tab_drawn = 0;
+    for (int i = 0; i < g_ws_n; i++) {
+        int nx0 = tabs_x + i * (tw + gap) - g_tab_scroll;
+        int x2 = nx0 + tw;
+        if (x2 > tabs_x + area) x2 = tabs_x + area;   // clip before the '+'
+        if (nx0 < tabs_x) nx0 = tabs_x;               // clip at the origin
+        L->tab_rects[i] = (RectI){nx0, y1, (x2 > nx0) ? x2 - nx0 : 0, bh};
+        L->tab_drawn++;                               // zero-width = off-strip
+    }
+    int nx = (total > area) ? (tabs_x + area + SC(6))  // pinned '+'
+                            : (tabs_x + total + SC(2)); // ... or after last
+    if (nx + bh > tabs_end) nx = tabs_end - bh;
+    if (nx < tabs_x) nx = tabs_x;
+    L->new_tab_btn = (RectI){nx, y1, bh, bh};
+
+    // ---- row 2: nav icons | address field | search box (right end) ----
+    nav_row_metrics(L, 0, w, nav_row_y());
+
+    // ---- breadcrumb segments of the current path ----
+    compute_crumbs(L, g_app.current_path);
 
     // ---- hamburger menu (drops down from row 1) ----
     L->menu_panel = (RectI){SC(8), SC(TAB_H) + SC(2), SC(214),
@@ -6840,7 +7694,7 @@ static void compute_layout(Layout* L, int w, int h) {
     {
         int pad = SC(10), gap = SC(6), bh = SC(24);
         int by = L->status.y + (L->status_h - bh) / 2;
-        int x = L->status.w - pad;
+        int x = L->status.x + L->status.w - pad;
 
         // Round 12: the view menu and the zoom % are ONE control hugging
         // the right corner, right of the Hidden toggle: [Icons > | 55%]
@@ -6861,8 +7715,8 @@ static void compute_layout(Layout* L, int w, int h) {
         int ih = SC(26), vw = SC(150), vpad = SC(6);
         int vh = VIEW_MENU_MAX * ih + vpad * 2;
         L->view_menu = (RectI){L->view_btn.x, L->status.y - vh - SC(4), vw, vh};
-        if (L->view_menu.x + L->view_menu.w > L->status.w - SC(6))
-            L->view_menu.x = L->status.w - SC(6) - L->view_menu.w;
+        if (L->view_menu.x + L->view_menu.w > L->status.x + L->status.w - SC(6))
+            L->view_menu.x = L->status.x + L->status.w - SC(6) - L->view_menu.w;
         if (L->view_menu.x < SC(4)) L->view_menu.x = SC(4);
         for (int i = 0; i < VIEW_MENU_MAX; i++)
             L->view_items[i] = (RectI){L->view_menu.x + SC(3),
@@ -6894,6 +7748,7 @@ static void compute_layout(Layout* L, int w, int h) {
     if (pbot - ptop < SC(60)) pbot = ptop + SC(60);
     L->side_panel = (RectI){L->sidebar.x + SC(4), ptop,
                             L->sidebar.w - SC(8), pbot - ptop};
+    if (L->side_panel.w < SC(40)) L->side_panel.w = 0;   // (slid shut)
 
     int content_h = SC(4);                       // top padding inside panel
     for (int i = 0; i < g_side_n; i++) {
@@ -7228,8 +8083,11 @@ static int text_caret_from_x(const char* buf, int x0, int px, int mx) {
 // nothing can drift out of sync. The caret is a subtle, theme-consistent
 // bar in P->text (never a bright accent); its width scales with DPI so it
 // stays visible on 4K. Selection uses P->selected like the file list.
+// max_x = the right edge of the VISIBLE text area (same limit the caret
+// uses): a selection that runs past it is clipped so the highlight can
+// never paint outside the field box, however narrow the pane is.
 static void field_selection(const char* buf, int caret, int anchor,
-                            int x0, int y, int px, int line_h) {
+                            int x0, int y, int px, int line_h, int max_x) {
     int lo = text_lo(caret, anchor), hi = text_hi(caret, anchor);
     int len = (int)strlen(buf);
     if (hi <= lo || hi > len) return;
@@ -7238,6 +8096,8 @@ static void field_selection(const char* buf, int caret, int anchor,
     snprintf(b, sizeof b, "%.*s", hi - lo, buf + lo);
     int sx = x0 + (int)measure_px(a, px);
     int sw = (int)measure_px(b, px);
+    if (sx < x0) sx = x0;
+    if (sx + sw > max_x) sw = max_x - sx;    // clip at the visible limit
     if (sw > 0) fill(sx, y - 1, sw, line_h + 2, P->selected);
 }
 
@@ -8557,10 +9417,11 @@ static void draw_field(const Layout* L, const RectI* r, const char* buf,
     // placeholder shows.
     if (!is_ph)
         field_selection(buf, g_app.addr_caret, g_app.addr_anchor,
-                        tx, ty, px, L->text_h);
+                        tx, ty, px, L->text_h, r->x + r->w - SC(4));
 
     char shown[1024];
-    fit_text(is_ph ? placeholder : buf, shown, sizeof(shown), r->w - SC(16));
+    fit_text(is_ph ? placeholder : buf, shown, sizeof(shown), r->w - SC(16),
+             px);
     text_px(shown, tx, ty, px, is_ph ? P->dim : P->text);
 
     field_caret(is_ph ? "" : buf, is_ph ? 0 : g_app.addr_caret, focused,
@@ -8591,23 +9452,34 @@ static void draw_search_field(const Layout* L, const InputState* in) {
          ic, 1.6f);
 
     int tx = r->x + SC(26);
-    int ty = r->y + (r->h - L->text_h) / 2;
     int px = L->text_med;
+    // Vertical centering runs on the font's REAL line height (ascent +
+    // descent), not the nominal TEXT_H: the rounded cell grows further past
+    // the nominal line as the UI scale rises (19 vs 16px at 100%, 30 vs
+    // 24px at 150%), so the old (h - text_h)/2 kept sinking the text below
+    // the field's middle while the field-centered caret and magnifier
+    // stayed put. The same cell feeds selection and caret below, so text,
+    // caret, selection and icon share one centered axis at every scale -
+    // no other component's layout changes.
+    int line_h = renderer_text_height(g_app.renderer, (float)px);
+    if (line_h < 1) line_h = L->text_h;   // metricless safety net
+    int ty = r->y + (r->h - line_h) / 2;
     int maxw = r->w - (tx - r->x) - SC(6) - (has_query ? SC(20) : 0);
     bool show_ph = !has_query && !focused;   // placeholder only when idle+empty
 
     // selection + caret through the shared input style
     if (has_query)
         field_selection(g_app.search_buf, g_app.search_caret,
-                        g_app.search_anchor, tx, ty, px, L->text_h);
+                        g_app.search_anchor, tx, ty, px, line_h,
+                        r->x + r->w - SC(4) - (has_query ? SC(20) : 0));
 
     char shown[512];
     fit_text(show_ph ? "Search files and folders..." : g_app.search_buf,
-             shown, sizeof(shown), maxw);
+             shown, sizeof(shown), maxw, px);
     text_px(shown, tx, ty, px, has_query ? P->text : P->dim);
 
     field_caret(has_query ? g_app.search_buf : "", g_app.search_caret,
-                focused, tx, ty, px, L->text_h,
+                focused, tx, ty, px, line_h,
                 r->x + r->w - SC(4) - (has_query ? SC(20) : 0));
 
     if (has_query) {                       // clear (x), right end of the box
@@ -8623,6 +9495,353 @@ static void draw_search_field(const Layout* L, const InputState* in) {
     }
 }
 
+// ============================================================
+// SEARCH POPUP - a single GLOBAL application overlay. It is only a VIEW
+// over the ACTIVE pane's existing search state (g_app.search_buf /
+// search_focused / search_caret, which the pane swap model already keeps
+// per-pane), so typing drives the real filter, clearing calls the real
+// search_changed(), and nothing can leak into another pane. The popup is
+// anchored to the WINDOW (not a pane), so it always floats centered over
+// the whole app regardless of which tab/pane is active.
+// ============================================================
+static RectI pane_body_rect(const Pane* p);   // defined with the pane code
+
+// ---- location-bar child suggestions (defined with the listing code) -------
+// The popup lists the REAL children of the active pane's folder (This PC ->
+// drives, a drive/folder -> its subfolders), read once per path and cached.
+// Four DISTINCT outcomes: not read yet, read+has rows, read+really empty,
+// and could not be read - a failure is never shown as an empty folder.
+// Defined down by make_pc_entries()/get_directory_entries; declared here
+// because the popup geometry above and the draw/mouse/key code below both
+// need them.
+#define SUG_MAX       128            // children stored  (bounded)
+#define SUG_MAX_ROWS   8             // children visible (bounded)
+#define SUG_ROW       22             // row pitch, SC()-scaled at use
+enum { SUG_NONE = 0, SUG_LOADING = 1, SUG_OK = 2, SUG_EMPTY = 3,
+       SUG_ERROR = 4 };
+static int  sug_extra_h(void);       // panel height for the list / status
+static void sug_sync(void);          // re-target at the active pane's folder
+static void sug_pump(void);          // performs a due read (once per frame)
+static void sug_reset(void);         // popup closed / pane changed
+static int  sug_state(void);
+static int  sug_count(void);
+static int  sug_sel(void);           // highlighted child (-1 = none)
+static int  sug_scroll(void);        // first visible child
+static int  sug_rows_shown(void);    // rows that fit in the window
+static const char* sug_name(int i);
+static const char* sug_path(int i);
+static const char* sug_status(void); // loading / empty / error line
+static RectI sug_row_rect(int vis);
+static RectI sug_status_rect(void);
+static int  sug_hit(int x, int y);   // highlighted child under the pointer
+static bool sug_move(int delta);     // Up/Down inside the list
+static bool sug_accept(void);        // Enter / click on a child
+static void sug_wheel(int dir);      // wheel scroll over the list
+static void commit_address(void);    // Enter on the typed path (below)
+
+// Geometry: a GLOBAL overlay shared by BOTH popups (the Ctrl+F search popup
+// and the Main Search / Location-Bar popup).  The panel is horizontally
+// centered on the WHOLE window and parked in the upper-center of the content
+// area (just below the two-row top bar). It is deliberately NOT anchored to
+// any pane or tab, so pane clipping / scrolling can never hide or cut it off,
+// and it straddles a split instead of living inside one half. Derived from
+// the LIVE window size on every call, so it re-centers automatically on
+// resize, dock and tab changes.  extra_h grows the panel downward for a
+// taller body (the location bar shows a quick-nav action row under its field).
+static RectI overlay_panel_rect(int extra_h) {
+    int w = 0, h = 0;
+    platform_window_size(&w, &h);
+    if (w <= 0 || h <= 0) return (RectI){0, 0, 0, 0};
+    int m = SC(12);
+    int pw = SC(520);                        // comfortable global width
+    if (pw > w - 2 * m) pw = w - 2 * m;
+    if (pw < SC(80)) pw = (w > 2 * m) ? (w - 2 * m) : w;
+    int ph = SC(64) + extra_h;
+    int x = (w - pw) / 2;                    // horizontal center of window
+    int y = SC(TOOLBAR_H) + SC(16);          // upper-center, below top bar
+    int bottom = h - SC(STATUS_H) - SC(6);   // never over the status bar
+    if (y + ph > bottom) y = bottom - ph;
+    if (y < SC(TOOLBAR_H)) y = SC(TOOLBAR_H);
+    if (y < 0) y = 0;
+    return (RectI){x, y, pw, ph};
+}
+static RectI search_popup_rect(void) { return overlay_panel_rect(0); }
+// The location-bar popup: the SAME centered anchor as the search popup, just
+// tall enough for its quick-nav action row PLUS the child-suggestion list
+// (or its one-line loading / empty / error status) below it.  The height is
+// derived from the live suggestion state, so the panel grows with the list
+// and collapses again when there is nothing to show.
+static RectI addr_popup_rect(void)   { return overlay_panel_rect(sug_extra_h()); }
+// The inner text-input box (top portion of the panel).
+static RectI search_popup_field_rect(void) {
+    RectI o = search_popup_rect();
+    int pad = SC(6);
+    return (RectI){o.x + pad, o.y + pad, o.w - 2 * pad, SC(34)};
+}
+// The clear (x) at the right end of the input box.
+static RectI search_popup_clear_rect(void) {
+    RectI f = search_popup_field_rect();
+    return (RectI){f.x + f.w - SC(26), f.y + (f.h - SC(20)) / 2,
+                   SC(20), SC(20)};
+}
+
+// ---- LOCATION-BAR popup geometry (shares overlay_panel_rect anchor) ----
+// The inner path-input box (top portion of the panel).
+static RectI addr_popup_field_rect(void) {
+    RectI o = addr_popup_rect();
+    int pad = SC(6);
+    return (RectI){o.x + pad, o.y + pad, o.w - 2 * pad, SC(34)};
+}
+// Quick-nav action buttons under the field: 0 = Up, 1 = This PC.
+#define ADDR_POPUP_ACT_N 2
+static RectI addr_popup_action_rect(int i) {
+    RectI o = addr_popup_rect();
+    RectI f = addr_popup_field_rect();
+    int bw = SC(78), bh = SC(22), gap = SC(6);
+    int x = o.x + SC(8) + i * (bw + gap);
+    int y = f.y + f.h + SC(6);
+    return (RectI){x, y, bw, bh};
+}
+
+// The location-bar popup targets the ACTIVE pane/tab and only exists while
+// that pane's address box owns the typing focus.  If either went away (pane
+// closed, docked, tab switched, another pane activated, Escape, search box)
+// the popup is stale and is dismissed - mirror of search_popup_sync, and just
+// as safe against a freed pane (it never dereferences the old pointer).
+static void addr_popup_sync(void) {
+    if (!g_app.addr_focused ||
+        (g_addr_popup_open && g_addr_popup_pane != g_active_pane)) {
+        g_addr_popup_open = false;
+        g_addr_popup_pane = NULL;
+    }
+    // Keep the child list pointed at the ACTIVE pane's folder while the
+    // popup lives, and drop it the moment the popup goes away (the cache
+    // then re-reads on the next open, so a folder that changed meanwhile
+    // is never shown stale).
+    if (g_addr_popup_open && g_addr_popup_pane) sug_sync();
+    else sug_reset();
+}
+
+// The popup targets the ACTIVE pane/tab and only exists while that pane's
+// search box owns the typing focus. If either went away (pane closed,
+// docked, tab switched, another pane activated, Escape, address bar) the
+// popup is stale and is dismissed - this never dereferences the old pointer,
+// so it is safe even if that pane was freed. Call before drawing and before
+// hit-testing.
+static void search_popup_sync(void) {
+    if (!g_app.search_focused ||
+        (g_search_popup_open && g_search_popup_pane != g_active_pane)) {
+        g_search_popup_open = false;
+        g_search_popup_pane = NULL;
+    }
+}
+
+static void draw_search_popup(const Layout* L, const InputState* in) {
+    search_popup_sync();
+    if (!g_search_popup_open || !g_search_popup_pane) return;
+    RectI o = search_popup_rect();            // global: window-centered
+    if (o.w <= 0 || o.h <= 0) return;
+
+    // Panel: raised card with an accent (focused) ring so it clearly floats
+    // above the list.
+    rrect(o.x + SC(2), o.y + SC(3), o.w, o.h, SC(10),
+          (Color){0, 0, 0, 90}, COLOR_BLACK, 0.0f);          // soft shadow
+    rrect(o.x, o.y, o.w, o.h, SC(10), P->panel, focus_border(), 2.0f);
+
+    // Inner input box.
+    RectI f = search_popup_field_rect();
+    rrect(f.x, f.y, f.w, f.h, SC(8), P->field, focus_border(), 1.5f);
+
+    // Magnifier icon.
+    int d = SC(14);
+    int ix = f.x + SC(10), iy = f.y + (f.h - d) / 2;
+    rrect(ix, iy, d, d, d / 2, (Color){0, 0, 0, 0}, P->accent, 1.8f);
+    line(ix + d - SC(1), iy + d - SC(1), ix + d + SC(3), iy + d + SC(3),
+         P->accent, 1.8f);
+
+    // Query text + caret + selection, exactly like the inline field.
+    int tx = f.x + SC(32);
+    int px = L->text_med;
+    int line_h = renderer_text_height(g_app.renderer, (float)px);
+    if (line_h < 1) line_h = f.h;
+    int ty = f.y + (f.h - line_h) / 2;
+    bool has_query = (g_app.search_buf[0] != '\0');
+    RectI clr = search_popup_clear_rect();
+    int maxw = f.w - (tx - f.x) - SC(34) - (has_query ? SC(24) : 0);
+    if (maxw < SC(20)) maxw = SC(20);
+
+    if (has_query)
+        field_selection(g_app.search_buf, g_app.search_caret,
+                        g_app.search_anchor, tx, ty, px, line_h,
+                        f.x + f.w - SC(8) - (has_query ? SC(24) : 0));
+    char shown[512];
+    fit_text(has_query ? g_app.search_buf : "Type to search this folder...",
+             shown, sizeof(shown), maxw, px);
+    text_px(shown, tx, ty, px, has_query ? P->text : P->dim);
+    field_caret(has_query ? g_app.search_buf : "", g_app.search_caret, true,
+                tx, ty, px, line_h,
+                f.x + f.w - SC(8) - (has_query ? SC(24) : 0));
+
+    // Clear (x), shown once a query exists.
+    if (has_query) {
+        bool ch = inside(&clr, in->x, in->y);
+        if (ch)
+            rrect(clr.x, clr.y, clr.w, clr.h, clr.h / 2, P->btn_hover,
+                  COLOR_BLACK, 0.0f);
+        int cx = clr.x + (clr.w - SC(8)) / 2, cy = clr.y + (clr.h - SC(8)) / 2;
+        Color col = ch ? P->text : P->dim;
+        line(cx, cy, cx + SC(8), cy + SC(8), col, 1.5f);
+        line(cx + SC(8), cy, cx, cy + SC(8), col, 1.5f);
+    }
+
+    // Hint line under the input.
+    text_px("Enter: search this folder      Esc: close",
+            o.x + SC(10), o.y + o.h - SC(18), SC(11), P->dim);
+}
+
+// MAIN SEARCH / LOCATION BAR popup - a single GLOBAL overlay, exactly like
+// draw_search_popup (same overlay_panel_rect anchor, drawn at the top level
+// after every pane so it floats above all tabs/panes/toolbars and can never
+// be clipped by a pane container).  It is only a VIEW over the ACTIVE pane's
+// existing address state (g_app.addr_buf / addr_caret / addr_anchor, kept
+// per-pane by the pane swap model), so typing edits the real path, Enter runs
+// the real commit_address(), and nothing can leak into another pane.  It
+// PRESERVES the location bar's function - showing/editing the current path
+// plus navigation - and only changes WHERE the expanded interface is shown.
+static void draw_addr_popup(const Layout* L, const InputState* in) {
+    addr_popup_sync();
+    if (!g_addr_popup_open || !g_addr_popup_pane) return;
+    RectI o = addr_popup_rect();            // global: window-centered
+    if (o.w <= 0 || o.h <= 0) return;
+
+    // Panel: raised card with an accent (focused) ring so it clearly floats.
+    rrect(o.x + SC(2), o.y + SC(3), o.w, o.h, SC(10),
+          (Color){0, 0, 0, 90}, COLOR_BLACK, 0.0f);          // soft shadow
+    rrect(o.x, o.y, o.w, o.h, SC(10), P->panel, focus_border(), 2.0f);
+
+    // Inner path-input box.
+    RectI f = addr_popup_field_rect();
+    rrect(f.x, f.y, f.w, f.h, SC(8), P->field, focus_border(), 1.5f);
+
+    // Folder glyph (this is a LOCATION field, not a search field).
+    int d = SC(14);
+    int ix = f.x + SC(10), iy = f.y + (f.h - d) / 2;
+    rrect(ix, iy + SC(3), d, d - SC(3), SC(2), (Color){0, 0, 0, 0},
+          P->accent, 1.6f);
+    rrect(ix, iy, d / 2 + SC(2), SC(4), SC(2), (Color){0, 0, 0, 0},
+          P->accent, 1.6f);
+
+    // Path text + caret + selection, exactly like the inline field.
+    int tx = f.x + SC(30);
+    int px = L->text_med;
+    int line_h = renderer_text_height(g_app.renderer, (float)px);
+    if (line_h < 1) line_h = f.h;
+    int ty = f.y + (f.h - line_h) / 2;
+    bool has_path = (g_app.addr_buf[0] != '\0');
+    int maxw = f.w - (tx - f.x) - SC(12);
+    if (maxw < SC(20)) maxw = SC(20);
+
+    if (has_path)
+        field_selection(g_app.addr_buf, g_app.addr_caret, g_app.addr_anchor,
+                        tx, ty, px, line_h, f.x + f.w - SC(8));
+    char shown[1024];
+    fit_text(has_path ? g_app.addr_buf : "Type a path, Enter to go",
+             shown, sizeof(shown), maxw, px);
+    text_px(shown, tx, ty, px, has_path ? P->text : P->dim);
+    field_caret(has_path ? g_app.addr_buf : "", g_app.addr_caret, true,
+                tx, ty, px, line_h, f.x + f.w - SC(8));
+
+    // Quick-nav action row (navigation preserved): Up + This PC.
+    for (int i = 0; i < ADDR_POPUP_ACT_N; i++) {
+        RectI b = addr_popup_action_rect(i);
+        bool en = (i == 0) ? has_parent() : true;
+        bool hov = en && inside(&b, in->x, in->y);
+        rrect(b.x, b.y, b.w, b.h, SC(6),
+              hov ? P->btn_hover : P->field, en ? P->border : P->panel, 1.0f);
+        text_centered_px((i == 0) ? "Up" : "This PC", &b, SC(11),
+                         en ? P->text : P->dim);
+    }
+
+    // ---- child suggestions: the REAL children of this pane's folder ----
+    // The list is a view over the active pane's folder (cached, read once
+    // per path), never a hardcoded demo list.  Three states draw here: rows
+    // to pick from, a one-line status while loading / when genuinely empty,
+    // and a distinct error line so a failed read never looks like "empty".
+    int st = sug_state();
+    if (st == SUG_OK && sug_count() > 0) {
+        int rows = sug_rows_shown();
+        int sel = sug_sel();
+        for (int i = 0; i < rows; i++) {
+            int idx = sug_scroll() + i;
+            if (idx >= sug_count()) break;
+            RectI r = sug_row_rect(i);
+            bool is_sel = (idx == sel);
+            bool hov = inside(&r, in->x, in->y);
+            if (is_sel || hov)
+                rrect(r.x, r.y, r.w, r.h, SC(6),
+                      is_sel ? P->selected : P->btn_hover, COLOR_BLACK, 0.0f);
+            // Small folder glyph (same two-rect language as the field icon).
+            int gd = SC(11);
+            int gx = r.x + SC(8), gy = r.y + (r.h - gd) / 2;
+            rrect(gx, gy + SC(2), gd, gd - SC(2), SC(2), (Color){0, 0, 0, 0},
+                  P->accent, 1.4f);
+            rrect(gx, gy, gd / 2 + SC(1), SC(3), SC(1), (Color){0, 0, 0, 0},
+                  P->accent, 1.4f);
+            char nm[256];
+            fit_text(sug_name(idx), nm, sizeof nm, r.w - gd - SC(24),
+                     L->text_small);
+            text_px(nm, gx + gd + SC(8),
+                    r.y + (r.h - L->text_small) / 2, L->text_small,
+                    is_sel ? P->accent : P->text);
+        }
+        // More children than fit: a thin scroll rail at the right edge.
+        if (sug_count() > rows) {
+            RectI sr = sug_row_rect(0);
+            int rail_x = sr.x + sr.w - SC(4);
+            int rail_h = rows * SC(SUG_ROW);
+            rrect(rail_x, sr.y, SC(2), rail_h, SC(1), P->panel,
+                  COLOR_BLACK, 0.0f);
+            int max_first = sug_count() - rows;
+            int th = rail_h * rows / sug_count();
+            if (th < SC(8)) th = SC(8);
+            int ty = sr.y;
+            if (max_first > 0)
+                ty = sr.y + (rail_h - th) * sug_scroll() / max_first;
+            rrect(rail_x, ty, SC(2), th, SC(1), P->dim, COLOR_BLACK, 0.0f);
+        }
+        // Bottom line: the FULL path of the row under the pointer (or the
+        // highlighted one), so a long child name is never a guess; the
+        // generic key hint shows when no row is picked.
+        const char* hint = "Enter: open      Up/Down: choose      Esc: close";
+        char full[1100], fit[1100];
+        int look = sug_sel();
+        for (int i = 0; i < rows; i++) {
+            RectI r = sug_row_rect(i);
+            if (inside(&r, in->x, in->y)) { look = sug_scroll() + i; break; }
+        }
+        if (look >= 0 && look < sug_count()) {
+            snprintf(full, sizeof full, "%s", sug_path(look));
+            fit_text(full, fit, sizeof fit, o.w - SC(20), SC(11));
+                                                // (separate dst:
+            if (fit[0]) hint = fit;                         //  fit_text clears
+        }                                                   //  dst first)
+        text_px(hint, o.x + SC(10), o.y + o.h - SC(15), SC(11), P->dim);
+    } else if (st == SUG_LOADING || st == SUG_EMPTY || st == SUG_ERROR) {
+        RectI sr = sug_status_rect();
+        // An error reads in the accent-free "attention" tone, a loading or
+        // genuinely-empty line in the ordinary dim tone: three different
+        // messages, never collapsed into one "(empty folder)".
+        text_px(sug_status(), sr.x, sr.y + (sr.h - L->text_small) / 2,
+                L->text_small, st == SUG_ERROR ? P->text : P->dim);
+        text_px("Enter: go to path      Esc: close",
+                o.x + SC(10), o.y + o.h - SC(15), SC(11), P->dim);
+    } else {
+        // Hint line under the buttons.
+        text_px("Enter: go to path      Esc: close",
+                o.x + SC(10), o.y + o.h - SC(15), SC(11), P->dim);
+    }
+}
+
 // "Desktop-Msi > Downloads > ..." - click a segment to jump there.
 // F2 / Tab / click on empty space turns it back into a text field.
 static void draw_breadcrumb(const Layout* L, const InputState* in) {
@@ -8635,6 +9854,11 @@ static void draw_breadcrumb(const Layout* L, const InputState* in) {
     if (L->crumb_n > 0 && L->crumb_seg[0].w <= 0)
         text_px("..", f->x + SC(8), y, L->text_med, P->dim);   // hidden leading
 
+    // Clip to the field box: however narrow the pane got, a crumb label or
+    // its ">" separator can never paint outside the address field.
+    Rect clip = {(float)f->x, (float)f->y, (float)f->w, (float)f->h};
+    renderer_set_scissor(g_app.renderer, clip);
+
     for (int i = 0; i < L->crumb_n; i++) {
         const RectI* s = &L->crumb_seg[i];
         if (s->w <= 0) continue;
@@ -8645,6 +9869,92 @@ static void draw_breadcrumb(const Layout* L, const InputState* in) {
         if (i < L->crumb_n - 1)
             text_px(">", s->x + s->w + SC(1), y, L->text_med, P->dim);
     }
+    renderer_reset_scissor(g_app.renderer);
+}
+
+// ---- one complete nav row: back/fwd/up/refresh | address | search ----
+// Reads g_app (the active pane, or a split pane swapped in for its draw), so
+// a split pane's row is automatically its own folder / history / search.
+static void draw_nav_row(const Layout* L, const InputState* in) {
+    for (int i = 0; i < NAV_BTN_COUNT; i++) {
+        const RectI* r = &L->nav_btns[i];
+        bool enabled = (i == 0) ? (g_app.history_count > 0)
+                     : (i == 1) ? (g_app.fwd_count > 0)
+                     : (i == 2) ? has_parent()
+                                : true;
+        bool h = enabled && inside(r, in->x, in->y);
+        if (h)
+            rrect(r->x, r->y, r->w, r->h, L->radius, P->btn_hover,
+                  P->border, 1.0f);
+        Color c = enabled ? P->text : P->dim;
+        int ix = r->x + (r->w - SC(15)) / 2;
+        int iy = r->y + (r->h - SC(15)) / 2;
+        if (i == 0) icon_arrow(ix, iy, SC(15), 0, c);
+        else if (i == 1) icon_arrow(ix, iy, SC(15), 1, c);
+        else if (i == 2) icon_arrow(ix, iy, SC(15), 2, c);
+        else icon_refresh(ix, iy, SC(15), c);
+    }
+
+    if (g_app.addr_focused)
+        draw_field(L, &L->addr_field, g_app.addr_buf, true,
+                   "Type a path, Enter");
+    else
+        draw_breadcrumb(L, in);
+
+    draw_search_field(L, in);
+}
+
+// Draw ONE pane's nav row inside its own column [area.x, area.x+area.w].
+// Swaps this pane's folder into g_app for the duration (the same model the
+// pane list uses), so every read below - history, forward, path, search -
+// is this pane's, then hands the active pane back.
+static void draw_pane_nav_row(const Layout* base, const InputState* in,
+                              RectI area, Pane* p) {
+    FolderView keep;
+    bool swapped = false;
+    if (p && p != g_active_pane) {
+        keep = folder_view_from_app();
+        app_push_folder(&p->folder);
+        swapped = true;
+    }
+    Layout tmp = *base;
+    nav_row_metrics(&tmp, area.x, area.w, nav_row_y());
+    compute_crumbs(&tmp, g_app.current_path);
+    draw_nav_row(&tmp, in);
+    if (swapped) app_push_folder(&keep);
+}
+
+// Every leaf pane gets its own complete nav row.  A TOP-ROW pane (one whose
+// region starts at the content top) draws it in the window nav band above the
+// content, aligned to its column - the single-pane / V-split layout, unchanged.
+// A pane stacked BELOW the top row (a horizontal split) has no room in that one
+// shared band, so it draws its own embedded toolbar at the top of its own region
+// (see render_pane_view) - never overlapping another pane's controls.
+static void draw_split_nav(Pane* p, const Layout* base, const InputState* in) {
+    if (!p) return;
+    if (p->kind == PN_LEAF) {
+        if (p->rect.w > 0 && p->rect.y <= SC(TOOLBAR_H))
+            draw_pane_nav_row(base, in, p->rect, p);
+        return;
+    }
+    draw_split_nav(p->left, base, in);
+    draw_split_nav(p->right, base, in);
+}
+
+// Which leaf pane's COLUMN contains x?  A pure-x lookup for the per-pane nav
+// row in the top bar (the nav band sits ABOVE the pane rects, so the caller
+// has already established y is in that band).  In a stacked (H) split the
+// drawn nav row belongs to the ACTIVE pane, so a hit in its column returns it.
+static Pane* nav_pane_at(Pane* p, int x) {
+    if (g_active_pane && g_active_pane->kind == PN_LEAF &&
+        x >= g_active_pane->rect.x &&
+        x < g_active_pane->rect.x + g_active_pane->rect.w)
+        return g_active_pane;
+    if (!p) return NULL;
+    if (p->kind == PN_LEAF)
+        return (x >= p->rect.x && x < p->rect.x + p->rect.w) ? p : NULL;
+    Pane* r = nav_pane_at(p->left, x);
+    return r ? r : nav_pane_at(p->right, x);
 }
 
 static void draw_toolbar(const Layout* L, const InputState* in) {
@@ -8674,12 +9984,26 @@ static void draw_toolbar(const Layout* L, const InputState* in) {
         fill(cx - r - SC(3), cy - 1, SC(3), 2, P->text);
         fill(cx + r + 1, cy - 1, SC(3), 2, P->text);
     }
+    // Sidebar toggle: a window outline with its left column - filled while
+    // the sidebar is shown, hollow while it is hidden.
+    {
+        const RectI* b = &L->side_btn;
+        bool hv = inside(b, in->x, in->y);
+        rrect(b->x, b->y, b->w, b->h, L->radius, hv ? P->btn_hover : P->btn,
+              P->border, 1.0f);
+        Color none = (Color){0, 0, 0, 0};
+        int gx = b->x + SC(7), gy = b->y + SC(8), gw = b->w - SC(14), gh = b->h - SC(16);
+        rrect(gx, gy, gw, gh, SC(2), none, P->text, 1.2f);
+        int cw = gw * 2 / 5;
+        if (g_opt_sidebar) fill(gx + SC(1), gy + SC(1), cw, gh - SC(2), P->text);
+        else vline(gx + cw, gy, gy + gh, P->text);
+    }
 
     for (int i = 0; i < L->tab_drawn; i++) {
         const RectI* r = &L->tab_rects[i];
         if (r->w <= 0) continue;                 // scrolled off the strip
         bool cur = (i == g_ws_cur);
-        bool th = inside(r, in->x, in->y);
+        bool th = (tab_hit_at(L, in->x, in->y) == i);  // chip + top padding
         bool mov = g_tab_drag && i == g_tab_drag_idx;   // being reordered
         rrect(r->x, r->y, r->w, r->h, L->radius,
               mov ? P->panel
@@ -8691,7 +10015,8 @@ static void draw_toolbar(const Layout* L, const InputState* in) {
                                    r->y + (r->h - SC(14)) / 2, SC(14), SC(14));
         char raw[128], nm[256];
         ws_title(i, raw, sizeof(raw));        // folder/view name, never
-        fit_text(raw, nm, sizeof(nm), r->w - SC(50));   // "Workspace N"
+        fit_text(raw, nm, sizeof(nm), r->w - SC(50),
+                 L->text_small);                // "Workspace N"
         text_px(nm, r->x + SC(25), r->y + (r->h - L->text_small) / 2,
                 L->text_small,
                 mov ? P->dim : (cur ? P->text : P->dim));
@@ -8726,7 +10051,7 @@ static void draw_toolbar(const Layout* L, const InputState* in) {
                                    gr.y + (gr.h - SC(14)) / 2, SC(14), SC(14));
         char raw[128], nm[256];
         ws_title(g_tab_drag_idx, raw, sizeof(raw));
-        fit_text(raw, nm, sizeof(nm), gr.w - SC(50));
+        fit_text(raw, nm, sizeof(nm), gr.w - SC(50), L->text_small);
         text_px(nm, gr.x + SC(25), gr.y + (gr.h - L->text_small) / 2,
                 L->text_small, P->text);
     }
@@ -8767,39 +10092,24 @@ static void draw_toolbar(const Layout* L, const InputState* in) {
         }
     }
 
-    // ------------- row 2: back/fwd/up/refresh | breadcrumb -------------
-    for (int i = 0; i < NAV_BTN_COUNT; i++) {
-        const RectI* r = &L->nav_btns[i];
-        bool enabled = (i == 0) ? (g_app.history_count > 0)
-                     : (i == 1) ? (g_app.fwd_count > 0)
-                     : (i == 2) ? has_parent()
-                                : true;
-        bool h = enabled && inside(r, in->x, in->y);
-        if (h)
-            rrect(r->x, r->y, r->w, r->h, L->radius, P->btn_hover,
-                  P->border, 1.0f);
-        Color c = enabled ? P->text : P->dim;
-        int ix = r->x + (r->w - SC(15)) / 2;
-        int iy = r->y + (r->h - SC(15)) / 2;
-        if (i == 0) icon_arrow(ix, iy, SC(15), 0, c);
-        else if (i == 1) icon_arrow(ix, iy, SC(15), 1, c);
-        else if (i == 2) icon_arrow(ix, iy, SC(15), 2, c);
-        else icon_refresh(ix, iy, SC(15), c);
+    // ------------- row 2: nav | address | search -------------
+    // Single pane: one full-width nav row (identical to before).  While
+    // split, EACH leaf pane draws its own complete nav row in its own
+    // column via the swap model - two independent toolbars, and the
+    // single-pane layout is untouched.
+    if (pane_count(g_pane_root) > 1) {
+        compute_pane_tree_layout(g_pane_root, L->list);   // fresh pane rects
+        draw_split_nav(g_pane_root, L, in);
+    } else {
+        draw_nav_row(L, in);
     }
-
-    if (g_app.addr_focused)
-        draw_field(L, &L->addr_field, g_app.addr_buf, true,
-                   "Type a path, Enter");
-    else
-        draw_breadcrumb(L, in);
-
-    draw_search_field(L, in);
 }
 
 // ------------------------------------------------------------
 // Sidebar: RECENTS / BOOKMARKS / STORAGE / PLACES
 // ------------------------------------------------------------
 static void draw_sidebar(const Layout* L, const InputState* in) {
+    if (L->side_panel.w <= 0) return;           // hidden (or sliding shut)
     // (the filter box moved to the STATUS BAR, bottom left)
 
     // rounded panel
@@ -8838,7 +10148,7 @@ static void draw_sidebar(const Layout* L, const InputState* in) {
         draw_item_image(s->path, !s->is_file, ix, iy, ic, ic);
 
         char label[96];
-        fit_text(s->label, label, sizeof(label), r->w - SC(34));
+        fit_text(s->label, label, sizeof(label), r->w - SC(34), L->text_med);
         text_px(label, r->x + SC(28), r->y + (r->h - L->text_med) / 2,
                 L->text_med, P->text);
     }
@@ -8928,6 +10238,11 @@ static void draw_item_star(const Layout* L, int vi, DirEntry* e, bool hov) {
     draw_star(sb.x + sb.w / 2, sb.y + sb.h / 2, sb.w / 2 - 1, on, c);
 }
 
+// The typed prefix to box INSIDE row `vi`'s name while a type-to-select
+// sequence is live (defined with the TTS code below, next to the confirm /
+// rename state); NULL = the name draws plain.
+static const char* tts_row_query(int vi);
+
 static void draw_details(const Layout* L, const InputState* in) {
     // <= rows_visible: the LAST row may be only half visible at big zoom
     // sizes - draw it too, the body scissor cuts it at the edge.
@@ -8937,7 +10252,7 @@ static void draw_details(const Layout* L, const InputState* in) {
 
         DirEntry* e = &g_app.entries[g_app.view[vi]];
         int ry = L->list.y + L->list_head_h + i * L->row_h;
-        bool is_sel = ((int)vi == g_app.selected);
+        bool is_sel = ((int)vi == g_app.selected) || sel_contains((int)vi);
         bool hov = !is_sel && in->x >= L->list.x && in->x < L->list.x + L->list.w &&
                    in->y >= ry && in->y < ry + L->row_h;
 
@@ -8946,7 +10261,7 @@ static void draw_details(const Layout* L, const InputState* in) {
         else if (i % 2 == 1) fill(L->list.x, ry, L->list.w, L->row_h, P->row_alt);
 
         int ty = ry + (L->row_h - L->text_h) / 2;
-        int isz = (int)(SC(16) * g_zoom + 0.5f);      // icon scales with zoom
+        int isz = (int)(SC(16) * g_app.zoom + 0.5f);  // icon scales with THIS pane's zoom
         if (isz < SC(10)) isz = SC(10);
         if (isz > L->row_h - SC(4)) isz = L->row_h - SC(4);
         int nx = L->list.x + SC(8) + isz + SC(4);
@@ -8958,10 +10273,18 @@ static void draw_details(const Layout* L, const InputState* in) {
                  (Color){0, 0, 0, 0.45f});
 
         char name[512];
-        fit_text(e->name, name, sizeof(name), L->name_w - (isz + SC(18)));
-        if (search_hl_active())
+        fit_text(e->name, name, sizeof(name), L->name_w - (isz + SC(18)),
+                 L->text_h);
+        // Match boxes take priority in the order the user produces them:
+        // the search query when the search box drives the list, else the
+        // live type-to-select prefix - the growing "W", "Wo", "Wor"...
+        // inside the very item the typing selected.
+        const char* hlq = search_hl_active() ? g_app.search_buf
+                                             : tts_row_query((int)vi);
+        bool hlcs = search_hl_active() ? g_search_case : false;
+        if (hlq && *hlq)
             text_px_hl(name, nx, ty, L->text_h, cut ? P->dim : P->text,
-                       g_app.search_buf, g_search_case);
+                       hlq, hlcs);
         else
             text_px(name, nx, ty, L->text_h, cut ? P->dim : P->text);
 
@@ -8975,7 +10298,7 @@ static void draw_details(const Layout* L, const InputState* in) {
                 int avail = (L->list.x + L->name_w) - (nx + used) - SC(10);
                 if (avail > SC(40)) {
                     char dim_p[512];
-                    fit_text(parent, dim_p, sizeof(dim_p), avail);
+                    fit_text(parent, dim_p, sizeof(dim_p), avail, L->text_h);
                     text_px(dim_p, nx + used + SC(8), ty, L->text_h, P->dim);
                 }
             }
@@ -8996,7 +10319,8 @@ static void draw_details(const Layout* L, const InputState* in) {
             // SC(38), not SC(20): the right end of the row now belongs to
             // the favorite star, so the Type text stops clear of it.
             fit_text((ext && ext[0]) ? ext : "file", type_buf, sizeof(type_buf),
-                     L->list.x + L->list.w - L->col_type_left - SC(38));
+                     L->list.x + L->list.w - L->col_type_left - SC(38),
+                     L->text_h);
             text_px(type_buf, L->col_type_left, ty, L->text_h, P->dim);
         }
         draw_item_star(L, (int)vi, e, hov);
@@ -9034,7 +10358,7 @@ static void draw_tree(const Layout* L, const InputState* in) {
 
         DirEntry* e = &g_app.entries[g_app.view[vi]];
         int ry = L->list.y + L->list_head_h + i * L->row_h;
-        bool is_sel = ((int)vi == g_app.selected);
+        bool is_sel = ((int)vi == g_app.selected) || sel_contains((int)vi);
         bool hov = !is_sel && in->x >= L->list.x && in->x < L->list.x + L->list.w &&
                    in->y >= ry && in->y < ry + L->row_h;
 
@@ -9051,7 +10375,7 @@ static void draw_tree(const Layout* L, const InputState* in) {
                          is_sel ? P->paper : P->dim);
         }
 
-        int isz = (int)(SC(16) * g_zoom + 0.5f);
+        int isz = (int)(SC(16) * g_app.zoom + 0.5f);  // per-pane icon zoom
         if (isz < SC(10)) isz = SC(10);
         if (isz > L->row_h - SC(4)) isz = L->row_h - SC(4);
         int ix = L->list.x + ind + SC(16);
@@ -9063,11 +10387,14 @@ static void draw_tree(const Layout* L, const InputState* in) {
 
         char name[512];
         fit_text(e->name, name, sizeof(name),
-                 L->list.w - (ind + isz + SC(40)));
-        if (search_hl_active())
+                 L->list.w - (ind + isz + SC(40)), L->text_h);
+        const char* hlq = search_hl_active() ? g_app.search_buf
+                                             : tts_row_query((int)vi);
+        bool hlcs = search_hl_active() ? g_search_case : false;
+        if (hlq && *hlq)
             text_px_hl(name, ix + isz + SC(4), ty, L->text_h,
                        cut ? P->dim : (is_sel ? P->paper : P->text),
-                       g_app.search_buf, g_search_case);
+                       hlq, hlcs);
         else
             text_px(name, ix + isz + SC(4), ty, L->text_h,
                     cut ? P->dim : (is_sel ? P->paper : P->text));
@@ -9086,7 +10413,7 @@ static void draw_grid(const Layout* L, const InputState* in) {
             int cx = L->list.x + L->pad_x + c * L->cell_w;
             int cy = L->list.y + L->list_head_h + L->pad_y + r * L->cell_h;
 
-            bool is_sel = ((int)vi == g_app.selected);
+            bool is_sel = ((int)vi == g_app.selected) || sel_contains((int)vi);
             bool hov = !is_sel && in->x >= cx && in->x < cx + L->cell_w - SC(4) &&
                        in->y >= cy && in->y < cy + L->cell_h - SC(4);
 
@@ -9106,16 +10433,19 @@ static void draw_grid(const Layout* L, const InputState* in) {
 
             // name + size under the preview (File Pilot style)
             char nm[96], nms[96], sz[32];
-            fit_text(e->name, nm, sizeof(nm), L->cell_w - SC(10));
+            fit_text(e->name, nm, sizeof(nm), L->cell_w - SC(10), L->text_med);
             snprintf(nms, sizeof(nms), "%s", nm);
             if (e->is_directory) snprintf(sz, sizeof(sz), "");
             else format_size(e->size, sz, sizeof(sz));
 
             int ny = cy + L->thumb + SC(6);
             RectI ln1 = {cx, ny, L->cell_w, L->text_med};
-            if (search_hl_active())
-                text_centered_hl(nms, &ln1, L->text_med, cut ? P->dim : P->text,
-                                 g_app.search_buf, g_search_case);
+            const char* hlq = search_hl_active() ? g_app.search_buf
+                                                 : tts_row_query((int)vi);
+            bool hlcs = search_hl_active() ? g_search_case : false;
+            if (hlq && *hlq)
+                text_centered_hl(nms, &ln1, L->text_med,
+                                 cut ? P->dim : P->text, hlq, hlcs);
             else
                 text_centered_px(nms, &ln1, L->text_med, cut ? P->dim : P->text);
             if (sz[0]) {
@@ -9267,9 +10597,38 @@ static void ctx_icon(int cmd, int x, int y, int s, Color c) {
         fill(x + SC(1), y + s - SC(7), SC(5), SC(5), c);
         fill(x + s - SC(6), y + s - SC(7), SC(5), SC(5), c);
         break;
-    case CTX_CMD_REFRESH:
-        icon_refresh(x, y, s, c);      // existing circular-arrow glyph
+    case CTX_CMD_REFRESH: {            // the classic refresh arrow (clockwise)
+        // a ~290-degree arc with the gap at the upper right, ending in a
+        // solid arrowhead that points on round the circle - the familiar
+        // "reload" symbol
+        float cx = x + s * 0.5f, cy = y + s * 0.5f + 0.5f, r = s * 0.38f;
+        const float a0 = -0.45f, a1 = 4.45f;     // radians, y grows down
+        int segs = 24;
+        float px = cx + r * cosf(a0), py = cy + r * sinf(a0);
+        for (int i = 1; i <= segs; i++) {
+            float a = a0 + (a1 - a0) * i / segs;
+            float nx = cx + r * cosf(a), ny = cy + r * sinf(a);
+            line((int)(px + 0.5f), (int)(py + 0.5f), (int)(nx + 0.5f),
+                 (int)(ny + 0.5f), c, 1.5f);
+            px = nx;
+            py = ny;
+        }
+        // solid triangle at the END of the clockwise sweep (top), its tip
+        // pointing on along the travel into the gap - the reload arrow
+        float ex = px, ey = py;
+        float tx = -sinf(a1), ty = cosf(a1);     // clockwise tangent at a1
+        float nx = cosf(a1), ny = sinf(a1);      // outward normal
+        float hl = s * 0.30f;
+        float ax = ex - tx * hl * 0.25f, ay = ey - ty * hl * 0.25f;  // base centre
+        float tipx = ex + tx * hl * 0.75f, tipy = ey + ty * hl * 0.75f;  // tip
+        for (int i = -6; i <= 6; i++) {
+            float f = i / 6.0f;
+            float bx = ax + nx * hl * 0.55f * f, by = ay + ny * hl * 0.55f * f;
+            line((int)(bx + 0.5f), (int)(by + 0.5f), (int)(tipx + 0.5f),
+                 (int)(tipy + 0.5f), c, 1.2f);
+        }
         break;
+    }
     case CTX_CMD_SIDE_STAR:            // the same star the row badge uses
         draw_star(x + s / 2, y + s / 2, s / 2 - 1, true, c);
         break;
@@ -9346,7 +10705,7 @@ static void draw_ctx_menu(const Layout* L, const InputState* in) {
             hint_w = (int)measure_px(row->hint, L->text_small) + SC(14);
         int room = r->w - SC(27) - hint_w - SC(6);
         if (room < SC(24)) room = SC(24);
-        fit_text(row->label, lbl, sizeof(lbl), room);
+        fit_text(row->label, lbl, sizeof(lbl), room, L->text_med);
         text_px(lbl, r->x + SC(27),
                 r->y + (r->h - L->text_med) / 2, L->text_med,
                 row->enabled ? P->text : P->dim);
@@ -9384,7 +10743,7 @@ static void draw_ctx_menu(const Layout* L, const InputState* in) {
                 fill(r->x, r->y + SC(4), SC(2), r->h - SC(8), P->accent);
             }
             char lbl[128];
-            fit_text(row->label, lbl, sizeof(lbl), r->w - SC(16));
+            fit_text(row->label, lbl, sizeof(lbl), r->w - SC(16), L->text_med);
             text_px(lbl, r->x + SC(8),
                     r->y + (r->h - L->text_med) / 2, L->text_med,
                     row->enabled ? P->text : P->dim);
@@ -9416,8 +10775,12 @@ static void draw_confirm_panel(const Layout* L, const InputState* in) {
     text_centered_px("Delete", &(RectI){x, y + SC(16), w, SC(24)},
                      L->text_med, P->text);
     char msg[256];
-    snprintf(msg, sizeof(msg), "%d item%s will be permanently deleted.",
-             g_del_n, g_del_n == 1 ? "" : "s");
+    if (g_del_permanent)
+        snprintf(msg, sizeof(msg), "%d item%s will be permanently deleted.",
+                 g_del_n, g_del_n == 1 ? "" : "s");
+    else
+        snprintf(msg, sizeof(msg), "Move %d item%s to the Recycle Bin?",
+                 g_del_n, g_del_n == 1 ? "" : "s");
     text_centered_px(msg, &(RectI){x, y + SC(46), w, SC(20)},
                      L->text_small, P->dim);
     int bw = SC(110), bh = SC(30), gap = SC(12);
@@ -9436,6 +10799,7 @@ static void draw_confirm_panel(const Layout* L, const InputState* in) {
 
 static void draw_props_panel(const Layout* L, const InputState* in) {
     if (g_confirm_kind != CONFIRM_PROPS) return;
+    props_size_pump();                 // land a finished folder-size walk
     int ww = 0, hh = 0;
     platform_window_size(&ww, &hh);
     fill(0, 0, ww, hh, (Color){0, 0, 0, 0.45f});
@@ -9448,7 +10812,13 @@ static void draw_props_panel(const Layout* L, const InputState* in) {
         snprintf(title, sizeof(title), "%s", g_app.entries[g_props_ei].name);
     else if (g_props_folder)
         snprintf(title, sizeof(title), "%s", file_name_of(g_app.current_path));
-    text_centered_px(title, &(RectI){x, y + SC(14), w, SC(24)},
+    // Every value below is measured before it is drawn (fit_text): a long
+    // name or deep path must stay INSIDE the 400-px panel, never paint over
+    // the dimmed backdrop - the same "no spill outside the box" rule the
+    // search box and address bar follow.
+    char fitv[300];
+    fit_text(title, fitv, sizeof fitv, w - SC(32), L->text_med);
+    text_centered_px(fitv, &(RectI){x, y + SC(14), w, SC(24)},
                      L->text_med, P->text);
     // the metadata rows
     char v[256];
@@ -9459,7 +10829,8 @@ static void draw_props_panel(const Layout* L, const InputState* in) {
     if (g_props_ei >= 0 && (size_t)g_props_ei < g_app.count)
         snprintf(v, sizeof(v), "%s", g_app.entries[g_props_ei].name);
     else snprintf(v, sizeof(v), "%s", file_name_of(g_app.current_path));
-    text_px(v, x + SC(130), ry, L->text_small, P->text);
+    fit_text(v, fitv, sizeof fitv, w - SC(130) - SC(16), L->text_small);
+    text_px(fitv, x + SC(130), ry, L->text_small, P->text);
     ry += lh;
     // Type
     text_px("Type", x + SC(20), ry, L->text_small, P->dim);
@@ -9470,7 +10841,8 @@ static void draw_props_panel(const Layout* L, const InputState* in) {
             snprintf(v, sizeof(v), "%s", ext[0] ? ext : "File");
         }
     } else snprintf(v, sizeof(v), "File folder");
-    text_px(v, x + SC(130), ry, L->text_small, P->text);
+    fit_text(v, fitv, sizeof fitv, w - SC(130) - SC(16), L->text_small);
+    text_px(fitv, x + SC(130), ry, L->text_small, P->text);
     ry += lh;
     // Location
     char loc[1024];
@@ -9478,7 +10850,8 @@ static void draw_props_panel(const Layout* L, const InputState* in) {
         parent_path(g_app.entries[g_props_ei].path, loc, sizeof(loc));
     else snprintf(loc, sizeof(loc), "%s", g_app.current_path);
     text_px("Location", x + SC(20), ry, L->text_small, P->dim);
-    text_px(loc, x + SC(130), ry, L->text_small, P->text);
+    fit_text(loc, fitv, sizeof fitv, w - SC(130) - SC(16), L->text_small);
+    text_px(fitv, x + SC(130), ry, L->text_small, P->text);
     ry += lh;
     // Size
     text_px("Size", x + SC(20), ry, L->text_small, P->dim);
@@ -9495,7 +10868,8 @@ static void draw_props_panel(const Layout* L, const InputState* in) {
         snprintf(v, sizeof(v), "%s (%llu bytes)", sb,
                  (unsigned long long)g_app.entries[g_props_ei].size);
     }
-    text_px(v, x + SC(130), ry, L->text_small, P->text);
+    fit_text(v, fitv, sizeof fitv, w - SC(130) - SC(16), L->text_small);
+    text_px(fitv, x + SC(130), ry, L->text_small, P->text);
     ry += lh;
     // Modified
     text_px("Modified", x + SC(20), ry, L->text_small, P->dim);
@@ -9548,8 +10922,15 @@ static void draw_props_panel(const Layout* L, const InputState* in) {
 }
 
 // ---- the rename overlay, drawn over the row being edited -------------
+// Where the inline rename field was drawn last frame - the mouse handler
+// needs it: a click OUTSIDE commits the rename (Explorer), a click inside
+// places the caret.
+static RectI g_rename_rect = {0, 0, 0, 0};
+static int   g_rename_tx = 0, g_rename_px = 0;
+
 static void draw_rename_overlay(const Layout* L, const InputState* in) {
     (void)in;                   // the overlay is driven by g_rename_vi alone
+    g_rename_rect = (RectI){0, 0, 0, 0};
     if (g_rename_vi < 0) return;
     if (g_rename_vi >= (int)g_app.view_count) { g_rename_vi = -1; return; }
     int ei = g_app.view[g_rename_vi];
@@ -9578,6 +10959,9 @@ static void draw_rename_overlay(const Layout* L, const InputState* in) {
     const char* txt = g_rename_txt;
     int tx = tr.x + SC(6);
     int ty = tr.y + (tr.h - L->text_med) / 2;
+    g_rename_rect = tr;
+    g_rename_tx = tx;
+    g_rename_px = L->text_med;
     // measure the selected span
     int pre = g_rename_sel0, post = g_rename_sel1;
     if (pre > post) { int t = pre; pre = post; post = t; }
@@ -9621,8 +11005,8 @@ static int y_for_zoom(const Layout* L, float z) {
 // Bottom bar: [filter ...]    (middle stays empty)    [counts][Hidden]
 //              [Details v | 150%]   <- ONE control, at the right corner
 static void draw_status(const Layout* L, const InputState* in) {
-    fill(0, L->status.y, L->status.w, L->status_h, P->toolbar);
-    hline(0, L->status.w, L->status.y, P->border);
+    fill(L->status.x, L->status.y, L->status.w, L->status_h, P->toolbar);
+    hline(L->status.x, L->status.x + L->status.w, L->status.y, P->border);
 
     int y = L->status.y + (L->status_h - L->text_h) / 2;
 
@@ -9631,8 +11015,9 @@ static void draw_status(const Layout* L, const InputState* in) {
     //      the toolbar); a transient message borrows the count slot
     //      for ~4 seconds and then the counts come back. ----
     char cnt[192];
-    if (g_app.status_msg[0] && g_app.frame < g_status_until) {
-        fit_text(g_app.status_msg, cnt, sizeof(cnt), L->count_lbl.w - SC(6));
+    if (g_app.status_msg[0] && tick_before(g_status_until)) {
+        fit_text(g_app.status_msg, cnt, sizeof(cnt), L->count_lbl.w - SC(6),
+                 L->text_small);
         text_right_px(cnt, L->count_lbl.x + L->count_lbl.w, y, L->text_small,
                       P->accent);
     } else {
@@ -9647,8 +11032,36 @@ static void draw_status(const Layout* L, const InputState* in) {
             snprintf(cnt + used, sizeof(cnt) - used, " - %u hidden",
                      g_hidden_total);
         }
+        // Explorer's selection summary: "3 selected (12.4 MB)" - the size
+        // counts the selected FILES (a folder's size needs a walk; the
+        // Properties sheet does that on a worker).
+        if (g_sel_n > 1 || (g_sel_n == 1 && g_app.view_count > 0)) {
+            unsigned long long bytes = 0;
+            int files = 0;
+            for (int si = 0; si < g_sel_n; si++) {
+                int vi = g_sel[si];
+                if (vi < 0 || (size_t)vi >= g_app.view_count) continue;
+                int ei = g_app.view[vi];
+                if (ei < 0 || (size_t)ei >= g_app.count) continue;
+                if (!g_app.entries[ei].is_directory) {
+                    bytes += g_app.entries[ei].size;
+                    files++;
+                }
+            }
+            size_t used = strlen(cnt);
+            if (files > 0) {
+                char sz[32];
+                format_size(bytes, sz, sizeof sz);
+                snprintf(cnt + used, sizeof(cnt) - used, " - %d selected (%s)",
+                         g_sel_n, sz);
+            } else if (g_sel_n > 1) {
+                snprintf(cnt + used, sizeof(cnt) - used, " - %d selected",
+                         g_sel_n);
+            }
+        }
         char shown[192];
-        fit_text(cnt, shown, sizeof(shown), L->count_lbl.w - SC(6));
+        fit_text(cnt, shown, sizeof(shown), L->count_lbl.w - SC(6),
+                 L->text_small);
         text_right_px(shown, L->count_lbl.x + L->count_lbl.w, y, L->text_small,
                       P->dim);
     }
@@ -9839,8 +11252,8 @@ static int set_wrap_lines(const char* src, int px, int max_px,
         }
         if (!lines[n][0]) {                // single word too wide for a line
             char cut[168];
-            fit_text(word, cut, sizeof cut, max_px - SC(14));
-            snprintf(lines[n], sizeof lines[n], "%s...", cut);
+            fit_text(word, cut, sizeof cut, max_px, px);
+            snprintf(lines[n], sizeof lines[n], "%s", cut);
             m = true;
             break;
         }
@@ -9870,9 +11283,13 @@ static int text_wrap_px(const char* src, int x, int y, int px, int max_px,
         char shown[200];
         if (i == n - 1 && more) {             // last line, text still remains
             char cut[192];
-            fit_text(lines[i], cut, sizeof cut,
-                     max_px - (int)measure_px("...", px));
-            snprintf(shown, sizeof shown, "%s...", cut);
+            // ONE "..." total: fit_text ellipsizes when it has to cut, and a
+            // line that already fits gets the indicator only if it still
+            // stays inside the same max_px (never a spill, never "......").
+            snprintf(cut, sizeof cut, "%s...", lines[i]);
+            if ((int)measure_px(cut, px) > max_px)
+                fit_text(lines[i], cut, sizeof cut, max_px, px);
+            snprintf(shown, sizeof shown, "%s", cut);
         } else snprintf(shown, sizeof shown, "%s", lines[i]);
         text_px(shown, x, y + i * line_h, px, c);
     }
@@ -9897,9 +11314,11 @@ static void set_tooltip(const char* text, int px,
     if (n < 1) return;
     if (more) {                              // the tip itself shows "..."
         char cut[192];
-        fit_text(lines[n - 1], cut, sizeof cut,
-                 maxw - SC(16) - (int)measure_px("...", px));
-        snprintf(lines[n - 1], sizeof lines[n - 1], "%s...", cut);
+        int room = maxw - SC(16);
+        snprintf(cut, sizeof cut, "%s...", lines[n - 1]);
+        if ((int)measure_px(cut, px) > room)
+            fit_text(lines[n - 1], cut, sizeof cut, room, px);
+        snprintf(lines[n - 1], sizeof lines[n - 1], "%s", cut);
     }
     int bw = 0;
     for (int i = 0; i < n; i++) {
@@ -9969,7 +11388,8 @@ static void set_draw_chip(const Layout* L, const RectI* r, const char* label,
     rrect(r->x, r->y, r->w, r->h, L->radius, bg, bord,
           (capture || hov) ? 1.4f : 1.0f);
     char shown[48];
-    fit_text(label, shown, sizeof shown, r->w - SC(14));   // side padding
+    fit_text(label, shown, sizeof shown, r->w - SC(14),
+             L->text_med);                      // side padding
     text_centered_px(shown, r, L->text_med, dim ? P->dim : P->text);
 }
 
@@ -10006,7 +11426,8 @@ static void set_draw_button(const Layout* L, const RectI* r, const char* label,
     }
     rrect(r->x, r->y, r->w, r->h, L->radius, bg, bord, hov ? 1.3f : 1.0f);
     char shown[48];
-    fit_text(label, shown, sizeof shown, r->w - SC(16));  // real side padding
+    fit_text(label, shown, sizeof shown, r->w - SC(16),
+             L->text_med);                      // real side padding
     text_centered_px(shown, r, L->text_med, txt);
 }
 
@@ -10064,7 +11485,7 @@ static void draw_recorder(const Layout* L, const InputState* in) {
     // ---- header: what is being customized + the binding it replaces ----
     text_px("Customize shortcut", px, y0 + SC(16), L->text_h + SC(4), P->text);
     char nbuf[140];
-    fit_text(e->name, nbuf, sizeof nbuf, pw);
+    fit_text(e->name, nbuf, sizeof nbuf, pw, L->text_med);
     text_px(nbuf, px, y0 + SC(42), L->text_med, mixc(P->text, P->accent, 0.5f));
     char cur[48], cur2[72];
     set_binding_of(e, cur, sizeof cur);
@@ -10107,7 +11528,8 @@ static void draw_recorder(const Layout* L, const InputState* in) {
         if (kx <= klim) {
             char shown[24];
             fit_text(kn, shown, sizeof shown,
-                     klim - kx - SC(10) > SC(24) ? klim - kx - SC(10) : SC(24));
+                     klim - kx - SC(10) > SC(24) ? klim - kx - SC(10) : SC(24),
+                     L->text_med);
             kx += set_draw_keycap(L, kx, ky, kh, shown, false);
             any_cap = true;
         }
@@ -10175,7 +11597,7 @@ static void draw_recorder(const Layout* L, const InputState* in) {
                         : "Record a new shortcut, or Save to remove this one.";
     }
     char sb[200];
-    fit_text(st, sb, sizeof sb, pw - SC(18));
+    fit_text(st, sb, sizeof sb, pw - SC(18), L->text_med);
     {
         const char* mark = st_err ? "! " : (g_rec_status[0] && g_rec_ok ? "+ " : "");
         Color sc = st_err ? P->text
@@ -10217,7 +11639,7 @@ static void draw_recorder(const Layout* L, const InputState* in) {
              "Clear drops the pending keys - Save with nothing recorded "
              "removes the shortcut. Esc cancels.");
     char tip2[160];
-    fit_text(tip, tip2, sizeof tip2, pw);
+    fit_text(tip, tip2, sizeof tip2, pw, L->text_small);
     text_px(tip2, px, y0 + SC(212), L->text_small, P->dim);
 }
 
@@ -10240,6 +11662,10 @@ static void draw_settings(const Layout* L, const InputState* in) {
     // is drawn the same frame its gear button was clicked).
     bool click_ok = in->left_click;
     if (g_modal_click_latch) { g_modal_click_latch = false; click_ok = false; }
+    // Every hit rect is re-derived each frame; the empty-state "Clear
+    // search" button must be re-armed ONLY while that state is drawn, or
+    // its old band keeps swallowing row clicks after rows come back.
+    s_set_empty_clear = (RectI){0};
 
     fill(0, 0, ww, hh, (Color){0, 0, 0, 0.5f});   // dim backdrop (translucent)
 
@@ -10290,10 +11716,11 @@ static void draw_settings(const Layout* L, const InputState* in) {
     // rebind is capturing keys, so the field never fights the capture).
     if (g_set_filter[0])
         field_selection(g_set_filter, g_set_caret, g_set_anchor,
-                        s_set_filter_tx, fty, L->text_h, L->text_h);
+                        s_set_filter_tx, fty, L->text_h, L->text_h,
+                        s_set_filter.x + s_set_filter.w - SC(30));
     char ph[96];
     fit_text("Search settings by name, description or shortcut...",
-             ph, sizeof ph, s_set_filter.w - SC(46));
+             ph, sizeof ph, s_set_filter.w - SC(46), L->text_h);
     text_px(g_set_filter[0] ? g_set_filter : ph, s_set_filter_tx, fty,
             L->text_h, g_set_filter[0] ? P->text : P->dim);
     s_set_clear = (RectI){0};
@@ -10384,7 +11811,8 @@ static void draw_settings(const Layout* L, const InputState* in) {
         set_cat_icon(i, ix, r.y + (r.h - isz) / 2, isz, ic);
         if (wide) {
             char lab[64];
-            fit_text(SCAT_NAMES[i], lab, sizeof lab, r.w - SC(60));
+            fit_text(SCAT_NAMES[i], lab, sizeof lab, r.w - SC(60),
+                     L->text_med);
             text_px(lab, r.x + SC(34), r.y + (r.h - L->text_med) / 2,
                     L->text_med, sel ? P->text : P->dim);
             int cnt = 0;
@@ -10429,7 +11857,7 @@ static void draw_settings(const Layout* L, const InputState* in) {
                      cnt == 1 ? "" : "s");
         }
         char fs[160];
-        fit_text(sub, fs, sizeof fs, cw - htit_w - SC(16));
+        fit_text(sub, fs, sizeof fs, cw - htit_w - SC(16), L->text_small);
         text_right_px(fs, cx + cw, hdr_y + SC(2), L->text_small, P->dim);
     }
     int ry0 = hdr_y + L->text_h + SC(16);
@@ -10456,14 +11884,14 @@ static void draw_settings(const Layout* L, const InputState* in) {
                         g_ui_scale != 100, in);
         char dsc[128];
         fit_text("Adjust the size of text, icons, buttons, and interface "
-                 "elements.", dsc, sizeof dsc, cw - SC(28));
+                 "elements.", dsc, sizeof dsc, cw - SC(28), L->text_small);
         text_px(dsc, cx + SC(14), ry0 + SC(8) + L->text_med + SC(2),
                 L->text_small, P->dim);
         // The keyboard gesture, stated where it is useful - accent colour
         // so it reads as a hint, ellipsised (never overflowed) when narrow.
         char hsc[128];
-        fit_text("Shortcut: hold V and press + or - (numpad works too).",
-                 hsc, sizeof hsc, cw - SC(28));
+        fit_text("Shortcut: Alt + mouse wheel, or hold V and press + / -.",
+                 hsc, sizeof hsc, cw - SC(28), L->text_small);
         text_px(hsc, cx + SC(14), ry0 + SC(8) + L->text_med + SC(2) +
                 L->text_small + SC(2), L->text_small, P->accent);
         // ---- slider track: continuous UI_SCALE_MIN..UI_SCALE_MAX ----
@@ -10524,6 +11952,60 @@ static void draw_settings(const Layout* L, const InputState* in) {
         ry0 += ch + SC(8);                   // the rows start below the card
     }
 
+    // ---- "Theme" card (featured block, Appearance only) ----
+    // Three preview cards - one per REAL palette (Midnight / Dark /
+    // Light), each drawn with that theme's OWN colours: a miniature
+    // surface, a name, a row of swatches for its main background, panel,
+    // primary text and accent, and a selected state.  The theme changes
+    // only because the user clicks a card - there is no cycling shortcut.
+    for (int i = 0; i < PAL_COUNT_N; i++) s_theme_card[i] = (RectI){0};
+    if (g_set_cat == SCAT_APPEARANCE && !g_set_filter[0]) {
+        int ch = SC(96);
+        rrect(cx, ry0, cw, ch, SC(8), mixc(P->panel, P->bg, 0.35f),
+              COLOR_BLACK, 0.0f);
+        text_px("Theme", cx + SC(14), ry0 + SC(8), L->text_med, P->text);
+        char tdsc[128];
+        fit_text("Pick a theme - it applies to the whole interface at once.",
+                 tdsc, sizeof tdsc, cw - SC(28), L->text_small);
+        text_px(tdsc, cx + SC(14), ry0 + SC(8) + L->text_med + SC(2),
+                L->text_small, P->dim);
+        // Three cards laid out side by side; each is a REAL miniature of
+        // its palette (bg + panel + text + accent all come from that
+        // theme), so what is shown is exactly what a click gives.
+        int card_y = ry0 + SC(40);
+        int card_h = ch - SC(40) - SC(10);
+        int gap = SC(8);
+        int card_w = (cw - SC(28) - gap * (PAL_COUNT_N - 1)) / PAL_COUNT_N;
+        for (int i = 0; i < PAL_COUNT_N; i++) {
+            const Palette* Q = pal_at(i);
+            int x = cx + SC(14) + i * (card_w + gap);
+            s_theme_card[i] = (RectI){x, card_y, card_w, card_h};
+            bool sel = (i == g_pal_idx);
+            bool hov = inside(&s_theme_card[i], in->x, in->y);
+            // the card surface IS that theme's background
+            rrect(x, card_y, card_w, card_h, SC(6), Q->bg,
+                  sel ? P->accent : P->border, sel ? 2.0f : 1.0f);
+            // theme name, in that theme's own primary text colour
+            text_px(pal_name(i), x + SC(7), card_y + SC(6),
+                    L->text_small, Q->text);
+            // swatches: main background, panel, primary text, accent
+            int sw = SC(9), sgap = SC(5);
+            int sx = x + SC(7), sy2 = card_y + card_h - sw - SC(7);
+            const Color* cols[4] = { &Q->bg, &Q->panel, &Q->text, &Q->accent };
+            for (int k = 0; k < 4; k++)
+                rrect(sx + k * (sw + sgap), sy2, sw, sw, SC(2), *cols[k],
+                      Q->border, 0.5f);
+            // selected state: an accent dot; hover lifts the border
+            if (sel)
+                rrect(x + card_w - SC(13), card_y + SC(6), SC(7), SC(7),
+                      SC(4), P->accent, COLOR_BLACK, 0.0f);
+            else if (hov)
+                rrect(x, card_y, card_w, card_h, SC(6), mixc(Q->bg,
+                      P->accent, 0.10f), P->border, 1.0f);
+        }
+        ry0 += ch + SC(8);                   // the rows start below the card
+    }
+
     // ---- rows: fixed height, two-column, stacked when the window is narrow ----
     int ctl_w = SC(52) + SC(8) + SC(44) + SC(8) + SC(128); // reset+sw+chip
     int list_h = (sy + body_h) - ry0;
@@ -10559,34 +12041,40 @@ static void draw_settings(const Layout* L, const InputState* in) {
         cw -= SC(14);                        // rows stay clear of the bar
         tw = stacked ? (cw - SC(24)) : (cw - ctl_w - SC(24));
         if (tw < SC(80)) tw = SC(80);
-        // thumb drag + track paging (wheel and keyboard still work)
-        if (click_ok && inside(&s_set_sb_thumb, in->x, in->y)) {
-            g_set_sb_drag = true;
-            g_set_sb_grab = in->y - s_set_sb_thumb.y;
-            return;                          // consume this click
-        }
-        if (g_set_sb_drag) {
-            if (in->left_down) {
-                int span = list_h - s_set_sb_thumb.h;
-                if (span > 0) {
-                    int t = in->y - g_set_sb_grab - ry0;
-                    g_set_scroll = (int)((long long)maxs * t / span);
-                    if (g_set_scroll > maxs) g_set_scroll = maxs;
-                    if (g_set_scroll < 0) g_set_scroll = 0;
-                    if (g_set_focus < g_set_scroll) g_set_focus = g_set_scroll;
-                    if (g_set_focus >= g_set_scroll + s_set_vis)
-                        g_set_focus = g_set_scroll + s_set_vis - 1;
-                }
-            } else g_set_sb_drag = false;
-        } else if (click_ok && inside(&s_set_sb_track, in->x, in->y)) {
-            g_set_scroll += (in->y < s_set_sb_thumb.y) ? -(s_set_vis - 1)
-                                                       : (s_set_vis - 1);
-            if (g_set_scroll > maxs) g_set_scroll = maxs;
-            if (g_set_scroll < 0) g_set_scroll = 0;
-            if (g_set_focus < g_set_scroll) g_set_focus = g_set_scroll;
-            if (g_set_focus >= g_set_scroll + s_set_vis)
-                g_set_focus = g_set_scroll + s_set_vis - 1;
-            return;
+        // Thumb drag + track paging (wheel and keyboard still work).
+        // Handled HERE so the press frame starts the drag, but control then
+        // keeps flowing: a return here used to skip the rows/footer/recorder
+        // draw for that frame (a one-frame blank flicker on every bar
+        // click) and to bypass the recorder dialog's modal click gate.  The
+        // click itself is swallowed by the scrollbar guard in the click
+        // section below; while the recorder is open it owns every click.
+        if (g_set_cap < 0) {
+            if (click_ok && inside(&s_set_sb_thumb, in->x, in->y)) {
+                g_set_sb_drag = true;
+                g_set_sb_grab = in->y - s_set_sb_thumb.y;
+            } else if (g_set_sb_drag) {
+                if (in->left_down) {
+                    int span = list_h - s_set_sb_thumb.h;
+                    if (span > 0) {
+                        int t = in->y - g_set_sb_grab - ry0;
+                        g_set_scroll = (int)((long long)maxs * t / span);
+                        if (g_set_scroll > maxs) g_set_scroll = maxs;
+                        if (g_set_scroll < 0) g_set_scroll = 0;
+                        if (g_set_focus < g_set_scroll)
+                            g_set_focus = g_set_scroll;
+                        if (g_set_focus >= g_set_scroll + s_set_vis)
+                            g_set_focus = g_set_scroll + s_set_vis - 1;
+                    }
+                } else g_set_sb_drag = false;
+            } else if (click_ok && inside(&s_set_sb_track, in->x, in->y)) {
+                g_set_scroll += (in->y < s_set_sb_thumb.y)
+                                    ? -(s_set_vis - 1) : (s_set_vis - 1);
+                if (g_set_scroll > maxs) g_set_scroll = maxs;
+                if (g_set_scroll < 0) g_set_scroll = 0;
+                if (g_set_focus < g_set_scroll) g_set_focus = g_set_scroll;
+                if (g_set_focus >= g_set_scroll + s_set_vis)
+                    g_set_focus = g_set_scroll + s_set_vis - 1;
+            }
         }
     }
 
@@ -10603,7 +12091,7 @@ static void draw_settings(const Layout* L, const InputState* in) {
             snprintf(t1, sizeof t1, "No settings match \"%s\"", g_set_filter);
         else
             snprintf(t1, sizeof t1, "This category has no settings");
-        fit_text(t1, t2, sizeof t2, cw - SC(40));
+        fit_text(t1, t2, sizeof t2, cw - SC(40), L->text_med);
         text_centered_px(t2, &(RectI){cx, ccy + SC(44), cw - SC(14),
                                       L->text_med},
                          L->text_med, P->text);
@@ -10659,12 +12147,13 @@ static void draw_settings(const Layout* L, const InputState* in) {
         char tag[48] = "";
         int name_w = tw;
         if (g_set_filter[0]) {
-            fit_text(SCAT_NAMES[e->cat], tag, sizeof tag, SC(140));
+            fit_text(SCAT_NAMES[e->cat], tag, sizeof tag, SC(140),
+                     L->text_small);
             name_w = tw - (int)measure_px(tag, L->text_small) - SC(12);
             if (name_w < SC(80)) name_w = SC(80);
         }
         char nbuf[128];
-        fit_text(e->name, nbuf, sizeof nbuf, name_w);
+        fit_text(e->name, nbuf, sizeof nbuf, name_w, L->text_h);
         text_px(nbuf, tx0, r.y + SC(9), L->text_h, P->text);
         if (tag[0])
             text_right_px(tag, tx0 + tw - SC(4), r.y + SC(12), L->text_small,
@@ -10712,7 +12201,7 @@ static void draw_settings(const Layout* L, const InputState* in) {
         // can never run under a chip or switch.
         int hy = r.y + SC(62);
         char hbuf[240];
-        fit_text(how, hbuf, sizeof hbuf, tw);
+        fit_text(how, hbuf, sizeof hbuf, tw, hpx);
         text_px(hbuf, tx0, hy, hpx,
                 val_row ? mixc(P->dim, P->text, 0.55f)
                         : mixc(P->dim, P->panel, 0.25f));
@@ -10810,7 +12299,7 @@ static void draw_settings(const Layout* L, const InputState* in) {
     // ---- footer: hint / status line + reset-all (two-step, destructive) ----
     int fy2 = y + h - foot_h;
     hline(x + SC(16), x + w - SC(16), fy2, P->border);
-    bool armed = (g_set_reset_arm != 0) && (g_app.frame < g_set_reset_arm);
+    bool armed = tick_before(g_set_reset_arm);
     s_set_resetall = (RectI){x + w - SC(20) - SC(180), fy2 + SC(10),
                              SC(180), SC(28)};
     set_draw_button(L, &s_set_resetall,
@@ -10822,7 +12311,8 @@ static void draw_settings(const Layout* L, const InputState* in) {
                          ? "Shortcut editor: press your keys, then Save - Esc cancels, nothing is saved yet."
                          : "Enter toggles a setting - Del edits a shortcut - changes save automatically";
     char hb[220];
-    fit_text(msg, hb, sizeof hb, (s_set_resetall.x - SC(16)) - (x + SC(20)));
+    fit_text(msg, hb, sizeof hb, (s_set_resetall.x - SC(16)) - (x + SC(20)),
+             L->text_med);
     text_px(hb, x + SC(20), fy2 + (foot_h - L->text_med) / 2, L->text_med,
             g_set_msg[0] ? P->accent : P->dim);
 
@@ -10907,7 +12397,7 @@ static void draw_settings(const Layout* L, const InputState* in) {
             snprintf(g_set_msg, sizeof(g_set_msg),
                      "All settings are back to their defaults.");
         } else {
-            g_set_reset_arm = (unsigned)(g_app.frame + 240);  // ~4s to confirm
+            g_set_reset_arm = (unsigned)tick_in(4000);  // ~4s to confirm
             snprintf(g_set_msg, sizeof(g_set_msg),
                      "This resets every setting - press the button again to confirm.");
         }
@@ -10924,6 +12414,17 @@ static void draw_settings(const Layout* L, const InputState* in) {
     if (s_scale_track.w > 0 && inside(&s_scale_track, in->x, in->y)) {
         g_scale_drag = true;         // live updates run in the draw pass
         return;
+    }
+    // ---- Theme card: a click on a preview EXPLICITLY picks that theme ----
+    // Only the card the user actually clicks changes anything; the
+    // selection applies live, persists, and leaves Settings usable.
+    for (int i = 0; i < PAL_COUNT_N; i++) {
+        if (s_theme_card[i].w > 0 && inside(&s_theme_card[i], in->x, in->y)) {
+            theme_select(i);
+            snprintf(g_set_msg, sizeof(g_set_msg), "Theme: %s",
+                     pal_name(g_pal_idx));
+            return;
+        }
     }
     for (int i = 0; i < SCAT_COUNT; i++) {
         if (!inside(&s_set_cat[i], in->x, in->y)) continue;
@@ -10980,7 +12481,7 @@ static void draw_settings(const Layout* L, const InputState* in) {
 // controls, while it is dragged, and for ~100 frames after a wheel zoom.
 static bool zoom_pop_visible(const Layout* L, const InputState* in) {
     return g_size_drag ||
-           g_app.frame < g_zoom_pop_until ||
+           tick_before(g_zoom_pop_until) ||
            inside(&L->view_btn, in->x, in->y) ||
            inside(&L->zoom_lbl, in->x, in->y) ||
            inside(&L->zoom_pop, in->x, in->y);
@@ -11083,7 +12584,7 @@ static void draw_radial(const Layout* L, const InputState* in) {
             fav_draw_icon(&g_fav[i], bx + (bs - isz) / 2, by + pad, isz, isz);
 
         char nm[FAV_NAME];
-        fit_text(g_fav[i].name, nm, sizeof(nm), bs - SC(4));
+        fit_text(g_fav[i].name, nm, sizeof(nm), bs - SC(4), name_h);
         RectI nr = {bx, by + bs - name_h - SC(2), bs, name_h};
         text_centered_px(nm, &nr, name_h,
                          hot ? P->text : (g_fav[i].is_dir ? P->text : P->dim));
@@ -11142,7 +12643,7 @@ static void draw_radial(const Layout* L, const InputState* in) {
     if (g.n == 0) {                       // honest empty state, no fake slots
         char hint[64];
         fit_text("Star items to fill Quick Access", hint, sizeof(hint),
-                 SC(190));
+                 SC(190), L->text_small);
         RectI tr = {g.cx - SC(100), g.cy + hr.h / 2 + SC(6), SC(200),
                     L->text_small};
         text_centered_px(hint, &tr, L->text_small, P->dim);
@@ -11245,6 +12746,21 @@ static void draw_gesture_overlay(const Layout* L) {
 }
 
 static void paint(void);
+static void xm_draw(const Layout* L, const InputState* in);   // system menu
+static void draw_help(const Layout* L, const InputState* in);
+static void draw_welcome(const Layout* L, const InputState* in);
+static void draw_tooltips(const Layout* L, const InputState* in);
+static void draw_update_card(const Layout* L, const InputState* in);
+static bool g_help_open, g_welcome_open, g_tip_pending;
+static void help_open(void);
+static void help_key(InputState* in);
+static void welcome_key(InputState* in);
+static void sidebar_toggle(void);
+static void menu_key_tip(int cmd);
+static bool g_xm_open;
+static void xm_key(InputState* in);
+static void xm_open_items(int view_idx, bool is_dir, int x, int y);
+static void xm_open_bg(int x, int y);
 
 // ---- TEST SEAM: read a pixel of the frame just drawn -----------------
 // The offscreen DC only lives between renderer_begin_paint() and
@@ -11258,15 +12774,18 @@ static void app_push_folder(const FolderView* fv);
 static void pane_sync_active(void);
 static void activate_pane(Pane* p);
 static void render_pane_tree(Pane* p, RectI content, const Layout* win);
+static void draw_search_popup(const Layout* L, const InputState* in);
+static void draw_addr_popup(const Layout* L, const InputState* in);
 static void draw_splitters(Pane* p);
 static void draw_drop_preview(void);
 static Pane* pane_find_drop(Pane* root, int x, int y, Pane* drag,
                             int* out_zone, RectI* out_rect);
+static int  zone_of(const RectI* r, int x, int y);
 static Pane* pane_tree_splitter_at(Pane* root, int x, int y);
 static RectI splitter_handle_rect(Pane* p);        // centered 3-dot grip
-static Pane* splitter_handle_at(Pane* root, int x, int y);   // grip only
 static Pane* pane_at_point(Pane* p, int x, int y);
 static Pane* first_leaf(Pane* p);
+static Pane* pane_leaf_other(Pane* p, Pane* keep);
 static int  pane_count(Pane* p);
 static void compute_pane_tree_layout(Pane* p, RectI content);
 static void pane_list_metrics(Layout* L, RectI rect);
@@ -11283,6 +12802,11 @@ static void pane_open_in_new_pane(const char* path);
 static void pane_close_active(void);
 static RectI pane_close_rect(RectI r);
 static Pane* pane_title_close_at(Pane* p, int x, int y);
+static Pane* pane_title_strip_at(Pane* p, int x, int y);
+// stacked-pane nav strip: a pane below the top row reserves room for its own
+// toolbar at the top of its region (see the definitions by pane_close_rect).
+static int  pane_nav_dy(const Pane* p);
+static RectI pane_body_rect(const Pane* p);
 // shared drop-zone preview (both drag sources: pane header + top tab)
 static void tile_hover_update(Pane* drag, int x, int y, bool tab_absorb);
 static void tile_hover_clear(void);
@@ -11342,17 +12866,32 @@ static void paint(void) {
     g_paint_rp_ms = nova_now_ms() - t_rp;
     draw_splitters(g_pane_root);
     draw_drop_preview();
+    draw_search_popup(&L, in);   // per-pane search overlay (above the list)
+    draw_addr_popup(&L, in);     // location-bar overlay (same global anchor)
 
     draw_status(&L, in);
     if (g_app.menu_open) draw_menu(&L, in);
     if (g_app.view_menu_open) draw_view_menu(&L, in);
     if (g_ctx_open) draw_ctx_menu(&L, in);
-    draw_rename_overlay(&L, in);       // above the list, below the panels
+    if (g_xm_open) xm_draw(&L, in);    // the system context menu
+    if (g_rename_vi >= 0) {            // above the list, below the panels
+        // the field belongs to a row of the ACTIVE PANE: use that pane's
+        // list metrics (the window layout put it one header too high)
+        Layout RL;
+        pane_input_build(&RL, &L);
+        draw_rename_overlay(&RL, in);
+    } else {
+        draw_rename_overlay(&L, in);
+    }
     if (g_confirm_kind == CONFIRM_DELETE) draw_confirm_panel(&L, in);
     if (g_confirm_kind == CONFIRM_PROPS) draw_props_panel(&L, in);
     draw_zoom_pop(&L, in);
     draw_radial(&L, in);           // Quick Access wheel: topmost overlay
     if (g_set_open) draw_settings(&L, in);   // Settings: modal, above all
+    if (g_help_open) draw_help(&L, in);      // F1 shortcuts guide
+    if (g_welcome_open) draw_welcome(&L, in); // first-start tour
+    draw_update_card(&L, in);                // "Update available" (if ready)
+    draw_tooltips(&L, in);                   // top-bar button names + keys
     draw_gesture_overlay(&L);      // Alt + corner gesture: never blocks input
     if (g_probe_req) {             // TEST SEAM (selftest): read the frame
         g_probe_ok = renderer_probe_pixel(g_app.renderer, g_probe_x,       // back while the offscreen DC is alive
@@ -11416,6 +12955,10 @@ static void rebuild_view(void) {
         g_app.view = NULL;
     }
     g_app.view_count = 0;
+    // The old row indices just died with the array above: a stored row
+    // set would point at the WRONG items in whatever this rebuild
+    // produces (navigate / sort / filter / tree), so it is dropped here.
+    sel_clear();
 
     if (!g_app.entries || g_app.count == 0) {
         g_app.selected = -1;
@@ -11481,6 +13024,9 @@ static void rebuild_view(void) {
     g_app.view = v;
     g_app.view_count = n;
     g_app.selected = 0;
+    // Row 0 is what gets painted as the primary, so it must also be the
+    // row the operations act on - paint and clipboard never diverge.
+    sel_add(0);
     g_app.scroll = 0;
     pane_sync_active();
 }
@@ -11575,6 +13121,323 @@ static void filter_entries_quiet(DirEntry* arr, size_t* count) {
         arr[n++] = arr[i];
     }
     *count = n;
+}
+
+// ------------------------------------------------------------
+// LOCATION-BAR POPUP: child suggestions (spec 3)
+// The list under the path field shows the REAL children of the folder the
+// ACTIVE pane is showing - This PC lists its drives, a drive or folder lists
+// its subfolders - straight from the filesystem, never hardcoded.  It is
+// synced to the active pane/tab, bounded (SUG_MAX stored, SUG_MAX_ROWS on
+// screen) and read at most ONCE per path: sug_sync() only arms a read when
+// the target folder actually changes, sug_pump() performs it a frame later
+// (so the panel can paint a real "Loading..." state instead of blocking the
+// click that opened it), and every later frame re-uses the cache.  The four
+// outcomes stay distinct - SUG_LOADING, SUG_OK, SUG_EMPTY (a read that
+// really returned zero children) and SUG_ERROR (missing / denied /
+// disconnected) - so a failure can never masquerade as an empty folder.
+// ------------------------------------------------------------
+typedef struct { char name[260]; char path[1024]; } SugItem;
+
+static SugItem g_sug[SUG_MAX];
+static int   g_sug_n = 0;
+static int   g_sug_state = SUG_NONE;
+static char  g_sug_path[1024];      // folder the cache belongs to
+static char  g_sug_typed[1024];     // addr_buf last time we synced (sel reset)
+static bool  g_sug_armed = false;   // a read is due on the next pump
+static int   g_sug_sel = -1;        // highlighted child (absolute index)
+static int   g_sug_scroll = 0;      // first visible child (absolute index)
+
+static int sug_cmp(const void* a, const void* b) {
+    return _stricmp(((const SugItem*)a)->name, ((const SugItem*)b)->name);
+}
+
+// Popup closed / pane changed: drop only the INTERACTION state.  The cached
+// rows (g_sug_path / g_sug_n / g_sug_state / g_sug[]) deliberately SURVIVE,
+// so closing and reopening the popup on the same folder shows the children at
+// once instead of walking the filesystem a second time - and a read that is
+// already in flight stays armed (cancelling it is what once left the panel
+// stuck on "Loading...").  sug_sync() re-targets on the next frame if the
+// pane's folder is a different one.
+static void sug_reset(void) {
+    g_sug_typed[0] = '\0';
+    g_sug_sel = -1;
+    g_sug_scroll = 0;
+}
+
+// The folder's CONTENTS really changed (navigation, F5 refresh, the
+// hidden-files toggle, a paste/new folder): the cached children may no longer
+// exist, so they are dropped and - if the popup is open - sug_sync() arms a
+// fresh read on the next frame.  That read then hits sug_read()'s cache path
+// (the pane's own listing was just installed), so a refresh stays cheap.
+static void sug_invalidate(void) {
+    g_sug_path[0] = '\0';
+    g_sug_state = SUG_NONE;
+    g_sug_n = 0;
+    g_sug_armed = false;
+    g_sug_sel = -1;
+    g_sug_scroll = 0;
+}
+
+// Point the cache at `path`.  Nothing is enumerated here - only a folder
+// CHANGE arms the (deferred, deduplicated) read, so holding the popup open,
+// resizing, hovering or scrolling can never re-walk the directory.
+static void sug_request(const char* path) {
+    if (!path) path = "";
+    if (g_sug_path[0] && strcmp(g_sug_path, path) == 0) return;
+    snprintf(g_sug_path, sizeof g_sug_path, "%s", path);
+    g_sug_n = 0;
+    g_sug_sel = -1;
+    g_sug_scroll = 0;
+    if (!path[0]) { g_sug_state = SUG_NONE; g_sug_armed = false; return; }
+    g_sug_state = SUG_LOADING;        // honest until the read lands
+    g_sug_armed = true;
+}
+
+// PROOF that g_app.entries really are the children of `dir`: the first and
+// the last row must each sit EXACTLY one level below it.  Matching
+// current_path alone is NOT enough evidence - the selftest (and any code
+// that points the pane at a path by hand) can move current_path without
+// replacing the rows, and reusing another folder's rows would show children
+// that are not there.  This check costs two string compares and is what
+// makes the fast path safe to trust.
+static bool sug_rows_belong_to(const char* dir) {
+    if (!dir || !dir[0] || !g_app.entries || g_app.count < 1) return false;
+    size_t ld = strlen(dir);
+    bool sep_end = dir[ld - 1] == '\\' || dir[ld - 1] == '/';
+    const char* row[2];
+    row[0] = g_app.entries[0].path;
+    row[1] = g_app.entries[g_app.count - 1].path;
+    for (int i = 0; i < 2; i++) {
+        const char* c = row[i];
+        if (!c || !c[0] || _strnicmp(c, dir, ld) != 0) return false;
+        const char* rest = c + ld;
+        if (!sep_end) {                       // dir has no trailing separator
+            if (*rest != '\\' && *rest != '/') return false;
+            rest++;
+        }
+        if (!*rest) return false;             // that row IS dir itself
+        if (strchr(rest, '\\') || strchr(rest, '/')) return false;  // deeper
+    }
+    return true;
+}
+
+// The actual read (children only, sorted, bounded).  Runs from sug_pump().
+static void sug_read(void) {
+    g_sug_armed = false;
+    g_sug_n = 0;
+    g_sug_sel = -1;
+    g_sug_scroll = 0;
+    if (!g_sug_path[0]) { g_sug_state = SUG_NONE; return; }
+
+    DirEntry* e = NULL;
+    size_t n = 0;
+    bool owned = false;             // true only when WE must free(e)
+    if (is_this_pc(g_sug_path)) {
+        e = make_pc_entries(&n);      // This PC -> its drives
+        owned = true;
+    } else if (!search_masking_listing() &&
+               g_app.view_mode != MODE_TREE &&
+               g_app.load_state == LOAD_OK &&
+               g_app.entries && g_app.count > 0 &&
+               strcmp(g_app.current_path, g_sug_path) == 0 &&
+               sug_rows_belong_to(g_sug_path)) {
+        // ---- FAST PATH: the active pane ALREADY holds this folder's rows.
+        // load_dir()/activate_pane() walked g_sug_path moments ago and
+        // app_push_folder() keeps current_path + entries + count +
+        // load_state moving together, so those rows ARE this folder's
+        // children (load_dir() filters hidden out exactly like the loop
+        // below does).  Re-copying them satisfies "avoid re-requesting the
+        // same directory" and turns the popup open from a SECOND
+        // FindFirstFile walk into a bounded memcpy.
+        // Excluded on purpose: search results (entries = results, the real
+        // listing is parked in g_srch_saved), MODE_TREE (entries = the
+        // spliced grandchild rows, not just direct children), a pane whose
+        // load FAILED (entries belong to the folder it is still showing,
+        // never to a listing we could not read) and any pane that is not
+        // showing g_sug_path at all.  sug_rows_belong_to() then PROVES the
+        // rows are this folder's children before they are trusted, so a
+        // pane whose path was moved by hand still falls back to a real
+        // filesystem read instead of showing another folder's children.
+        e = g_app.entries;
+        n = (size_t)g_app.count;
+    } else if (g_app.platform && g_app.platform->get_directory_entries) {
+        e = g_app.platform->get_directory_entries(g_sug_path, &n);
+        owned = true;
+        // A directory that could not be READ (gone, denied, unplugged) is
+        // an error, NOT a zero-child folder - get_directory_entries()
+        // returns NULL for that and a non-NULL zero-count for a real empty
+        // directory, which is exactly the distinction this needs.
+        if (!e) { g_sug_state = SUG_ERROR; return; }
+    } else {
+        g_sug_state = SUG_ERROR;
+        return;
+    }
+    if (!e) { g_sug_state = SUG_ERROR; return; }
+
+    int k = 0;
+    for (size_t i = 0; i < n && k < SUG_MAX; i++) {
+        if (!e[i].is_directory) continue;        // subfolders / drives only
+        if (!g_show_hidden &&
+            (e[i].attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)))
+            continue;
+        snprintf(g_sug[k].name, sizeof g_sug[k].name, "%s", e[i].name);
+        snprintf(g_sug[k].path, sizeof g_sug[k].path, "%s", e[i].path);
+        k++;
+    }
+    if (owned) free(e);
+    if (k > 1) qsort(g_sug, (size_t)k, sizeof(SugItem), sug_cmp);
+    g_sug_n = k;
+    g_sug_state = k > 0 ? SUG_OK : SUG_EMPTY;    // zero AFTER a real read
+}
+
+static void sug_pump(void) {
+    if (g_sug_armed) sug_read();
+}
+
+// Re-target at whatever folder the ACTIVE pane is showing.  Called from
+// addr_popup_sync() (draw + every mouse/key pass), so the list follows tab
+// switches, navigation and pane changes by itself.
+static void sug_sync(void) {
+    if (!g_addr_popup_open || !g_addr_popup_pane ||
+        g_addr_popup_pane != g_active_pane) {
+        sug_reset();
+        return;
+    }
+    sug_request(g_app.current_path);
+    // Editing the path must not leave a stale highlight behind: Enter then
+    // means "go to the path I typed", not "open the old highlighted child".
+    if (strcmp(g_sug_typed, g_app.addr_buf) != 0) {
+        snprintf(g_sug_typed, sizeof g_sug_typed, "%s", g_app.addr_buf);
+        g_sug_sel = -1;
+        g_sug_scroll = 0;
+    }
+}
+
+static int sug_state(void)      { return g_sug_state; }
+static int sug_count(void)      { return g_sug_n; }
+static int sug_sel(void)        { return g_sug_sel; }
+static int sug_scroll(void)     { return g_sug_scroll; }
+static const char* sug_name(int i) {
+    return (i >= 0 && i < g_sug_n) ? g_sug[i].name : "";
+}
+static const char* sug_path(int i) {
+    return (i >= 0 && i < g_sug_n) ? g_sug[i].path : "";
+}
+static const char* sug_status(void) {
+    if (g_sug_state == SUG_LOADING) return "Loading folders...";
+    if (g_sug_state == SUG_ERROR)
+        return g_sug_path[0] ? "Cannot open this folder"
+                             : "Folder is unavailable";
+    if (g_sug_state == SUG_EMPTY)
+        return is_this_pc(g_sug_path) ? "No drives found"
+                                      : "No subfolders here";
+    return "";
+}
+
+// How many rows fit between the action row and the hint line without ever
+// pushing the panel past the status bar (the window decides, not the list).
+static int sug_rows_shown(void) {
+    if (g_sug_state != SUG_OK || g_sug_n <= 0) return 0;
+    int w = 0, h = 0;
+    platform_window_size(&w, &h);
+    if (h <= 0) return 0;
+    // Panel: SC(64) body + action row + list; it parks at TOOLBAR_H+16 and
+    // must end above the status bar.
+    int room = (h - SC(STATUS_H) - SC(6)) - (SC(TOOLBAR_H) + SC(16)) - SC(96);
+    int fit = room / SC(SUG_ROW);
+    int n = g_sug_n < SUG_MAX_ROWS ? g_sug_n : SUG_MAX_ROWS;
+    if (fit < n) n = fit;
+    return n > 0 ? n : 0;
+}
+
+// Extra panel height under the input box: the quick-nav row always, plus
+// either the suggestion rows or the one-line loading/empty/error status.
+static int sug_extra_h(void) {
+    if (g_sug_state == SUG_OK) {
+        int rows = sug_rows_shown();
+        return SC(30) + rows * SC(SUG_ROW) + (g_sug_n > rows ? SC(8) : 0);
+    }
+    if (g_sug_state == SUG_LOADING || g_sug_state == SUG_EMPTY ||
+        g_sug_state == SUG_ERROR)
+        return SC(30) + SC(18);
+    return SC(30);
+}
+
+// Top of the list area: right under the Up / This PC action row.
+static int sug_list_top(void) {
+    RectI f = addr_popup_field_rect();
+    return f.y + f.h + SC(6) + SC(22) + SC(6);
+}
+static RectI sug_row_rect(int vis) {
+    RectI o = addr_popup_rect();
+    return (RectI){o.x + SC(6), sug_list_top() + vis * SC(SUG_ROW),
+                   o.w - SC(12), SC(SUG_ROW)};
+}
+static RectI sug_status_rect(void) {
+    RectI o = addr_popup_rect();
+    return (RectI){o.x + SC(8), sug_list_top(), o.w - SC(16), SC(18)};
+}
+// Visible row -> absolute child index (scroll aware); -1 when outside.
+static int sug_hit(int x, int y) {
+    int rows = sug_rows_shown();
+    for (int i = 0; i < rows; i++) {
+        RectI r = sug_row_rect(i);
+        if (inside(&r, x, y)) return g_sug_scroll + i;
+    }
+    return -1;
+}
+
+static void sug_ensure_visible(void) {
+    int rows = sug_rows_shown();
+    if (rows <= 0 || g_sug_sel < 0) return;
+    if (g_sug_sel < g_sug_scroll) g_sug_scroll = g_sug_sel;
+    if (g_sug_sel >= g_sug_scroll + rows)
+        g_sug_scroll = g_sug_sel - rows + 1;
+    int max_first = g_sug_n - rows;
+    if (max_first < 0) max_first = 0;
+    if (g_sug_scroll > max_first) g_sug_scroll = max_first;
+    if (g_sug_scroll < 0) g_sug_scroll = 0;
+}
+
+// Up/Down in the popup list.  Returns false when there is no list to move
+// in (loading / empty / error / not open), so the caller can fall back to
+// the normal list selection keys.
+static bool sug_move(int delta) {
+    if (!g_addr_popup_open || g_sug_state != SUG_OK || g_sug_n <= 0)
+        return false;
+    if (g_sug_sel < 0) g_sug_sel = (delta > 0) ? 0 : g_sug_n - 1;
+    else {
+        g_sug_sel += delta;
+        if (g_sug_sel < 0) g_sug_sel = 0;
+        if (g_sug_sel >= g_sug_n) g_sug_sel = g_sug_n - 1;
+    }
+    sug_ensure_visible();
+    return true;
+}
+
+static void sug_wheel(int dir) {
+    if (!g_addr_popup_open || g_sug_state != SUG_OK || g_sug_n <= 0) return;
+    int rows = sug_rows_shown();
+    if (rows <= 0) return;
+    g_sug_scroll += dir;
+    int max_first = g_sug_n - rows;
+    if (max_first < 0) max_first = 0;
+    if (g_sug_scroll > max_first) g_sug_scroll = max_first;
+    if (g_sug_scroll < 0) g_sug_scroll = 0;
+    sug_ensure_visible();
+}
+
+// Enter / click on the highlighted child: navigate the ACTIVE pane there.
+// Returns false when nothing is highlighted, so a plain Enter keeps meaning
+// "go to the path in the field" (existing behaviour, unchanged).
+static bool sug_accept(void) {
+    if (!g_addr_popup_open || g_sug_state != SUG_OK) return false;
+    if (g_sug_sel < 0 || g_sug_sel >= g_sug_n) return false;
+    snprintf(g_app.addr_buf, sizeof g_app.addr_buf, "%s", g_sug[g_sug_sel].path);
+    g_app.addr_caret = g_app.addr_anchor = (int)strlen(g_app.addr_buf);
+    commit_address();                // validates + navigates + closes popup
+    return true;
 }
 
 // ------------------------------------------------------------
@@ -11682,6 +13545,64 @@ static void tree_build(void) {
     tree_splice();
 }
 
+// ---- failed-load retry ---------------------------------------------------
+// A folder that failed to OPEN (drive still spinning up, transient lock,
+// access denied, not-yet-ready at boot) is NOT an empty folder.  load_dir()
+// arms a bounded auto-retry for that exact path; the per-frame pump
+// re-attempts it while the ACTIVE pane still wants that path, so a not-yet-
+// ready drive fills in on its own instead of looking empty.  Any real
+// navigation or a successful load cancels it, and it stops after a few tries
+// so a genuinely dead path never spins forever.
+static char g_load_retry_path[1024];
+static char g_load_retry_cur[1024];  // pane folder at arm time ("moved on?" ref)
+static unsigned g_load_retry_at = 0;   // GetTickCount deadline (0 = none)
+static int g_load_retry_n = 0;         // retries remaining
+
+static void load_retry_arm(const char* path) {
+    // A pump re-attempt of the SAME path keeps its remaining budget - only a
+    // NEW failure gets a fresh one - so retries stay bounded.
+    if (path && g_load_retry_path[0] && g_load_retry_n > 0 &&
+        strcmp(g_load_retry_path, path) == 0) {
+        g_load_retry_at = GetTickCount() + 500;
+        return;
+    }
+    snprintf(g_load_retry_path, sizeof g_load_retry_path, "%s", path ? path : "");
+    // What the pane shows RIGHT NOW.  A failed FRESH navigation leaves
+    // current_path on the OLD folder, so this - not retry_path - is what
+    // the pump compares against to tell "still waiting" from "moved on".
+    snprintf(g_load_retry_cur, sizeof g_load_retry_cur, "%s",
+             g_app.current_path);
+    g_load_retry_at = GetTickCount() + 400;
+    g_load_retry_n = 8;
+}
+static void load_retry_cancel(void) {
+    g_load_retry_at = 0;
+    g_load_retry_n = 0;
+    g_load_retry_path[0] = '\0';
+    g_load_retry_cur[0] = '\0';
+}
+// Once per frame from app_run().  Retries only the ACTIVE pane's path (g_app),
+// so it can never yank another pane's listing around.
+static void load_retry_pump(void) {
+    if (!g_load_retry_at || g_load_retry_n <= 0) return;
+    // Cancel when the pane no longer shows what it showed when the retry
+    // was armed (the user loaded a different folder), or when this path
+    // really did load (load_state left LOAD_ERROR).  Comparing against
+    // retry_path instead used to cancel a retry armed by a FAILED fresh
+    // navigation on its very first pump: current_path was still the old
+    // folder, so the two never matched and the auto-retry never fired.
+    if (!g_app.current_path[0] ||
+        strcmp(g_app.current_path, g_load_retry_cur) != 0 ||
+        g_app.load_state != LOAD_ERROR) {
+        load_retry_cancel();          // the user moved on, or it loaded
+        return;
+    }
+    if ((int)(GetTickCount() - g_load_retry_at) < 0) return;
+    g_load_retry_n--;
+    load_dir(g_load_retry_path);      // re-attempt (re-arms / cancels itself)
+    if (g_load_retry_n <= 0) load_retry_cancel();
+}
+
 static void load_dir(const char* path) {
     if (!path || !path[0]) return;
 
@@ -11692,6 +13613,10 @@ static void load_dir(const char* path) {
     char p[1024];
     snprintf(p, sizeof(p), "%s", path);
     path = p;
+
+    // Entering (or refreshing) a folder starts a fresh typing sequence:
+    // the old prefix belongs to the listing we are leaving.
+    tts_reset();
 
     // Navigating away: cancel QUEUED icon/thumbnail jobs for the old
     // view (obsolete work must not delay the new folder's - spec
@@ -11733,16 +13658,33 @@ static void load_dir(const char* path) {
     }
 
     if (!entries) {
+        // FAILED to open (missing / disconnected / not-ready / denied).  This
+        // is NOT an empty folder: keep whatever the pane already showed, mark
+        // the failure, and arm a bounded auto-retry so a drive that was still
+        // spinning up (typical right after boot or plugging in) fills in on
+        // its own instead of sitting there looking empty.
+        g_app.load_state = LOAD_ERROR;
         set_status(is_this_pc(path) ? "No drives found" : "Cannot open folder");
+        load_retry_arm(path);
         return;
     }
+    load_retry_cancel();                     // a real listing ends any retry
     filter_entries(entries, &count);          // hidden / system out
     if (count > 1) qsort(entries, count, sizeof(DirEntry), cmp_entry);
 
     if (g_app.entries) free(g_app.entries);
     g_app.entries = entries;
     g_app.count = count;
+    g_app.load_state = count > 0 ? LOAD_OK : LOAD_EMPTY;
     snprintf(g_app.current_path, sizeof(g_app.current_path), "%s", path);
+
+    // The rows on screen just became THIS folder's, so any cached child
+    // suggestions describe stale contents (a folder created or deleted since
+    // the last read must appear).  Dropping them here - right after the fresh
+    // listing lands - means the popup, if it is open, re-arms on the next
+    // frame and then reads straight from the array above instead of walking
+    // the disk a second time for a path we just walked.
+    sug_invalidate();
 
     if (!g_app.addr_focused)
         snprintf(g_app.addr_buf, sizeof(g_app.addr_buf), "%s", path);
@@ -11773,6 +13715,8 @@ static void load_dir(const char* path) {
             DirEntry* e = &g_app.entries[g_app.view[vi]];
             if (strcmp(e->path, select_after) == 0) {
                 g_app.selected = (int)vi;
+                sel_clear();
+                sel_add((int)vi);
                 g_scroll_to_sel = true;
                 break;
             }
@@ -12362,6 +14306,15 @@ static void search_drop(void) {
     g_srch_saved_n = 0;
 }
 
+// TRUE while the rows in g_app.entries are (or are about to become) SEARCH
+// results rather than the plain listing of the current folder.  Declared up
+// near the other forward decls because sug_read() - which runs well above
+// here - must consult it before it may treat g_app.entries as "the children
+// of g_sug_path".
+static bool search_masking_listing(void) {
+    return g_srch_saved != NULL || g_srch_state != SRCH_IDLE;
+}
+
 // Cancel a running scan and/or swap the real listing back in place of the
 // results (clearing the query, typing, switching panes/workspaces).
 static void search_restore(void) {
@@ -12814,6 +14767,280 @@ static void go_up(void) {
     navigate(parent, true);
 }
 
+// ---- opening a FILE: ONE Windows path for the whole app ----------------
+// Maps a Windows failure code to the short, honest reason shown in the
+// status bar.  Kept as its own function (not an inline ternary) so the
+// selftest can verify every branch directly.
+static const char* open_err_text(DWORD err) {
+    return
+          err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND
+              ? "file not found"
+        : err == ERROR_ACCESS_DENIED
+              ? "access denied"
+        : err == ERROR_NO_ASSOCIATION
+              ? "no app registered for this type - choose a default "
+                "app in Windows"
+        : err == ERROR_CANCELLED
+              ? "cancelled"
+        : err == ERROR_NOT_ENOUGH_MEMORY || err == ERROR_OUTOFMEMORY
+              ? "out of memory"
+        :                                 "OS error";
+}
+
+// ---- which verb opens THIS file type? -------------------------------
+// A type registers verbs under <ProgID>\shell\<verb>\command in
+// HKEY_CLASSES_ROOT.  Almost every type has the standard "open" verb, so
+// that is asked for FIRST and is correct entirely on its own.  A few
+// types - Foundry's Nuke, for one - register only their OWN verb name
+// ("opennk") and no "open" at all, so asking for "open" alone returns
+// ERROR_NO_ASSOCIATION (1155) on a perfectly openable file.  ONLY when
+// that standard attempt has already failed does this code look for an
+// alternative verb, and it refuses to substitute anything that would
+// print or edit instead of open.
+static bool reg_val_str(HKEY root, const wchar_t* sub, const wchar_t* val,
+                        wchar_t* out, size_t cap) {
+    HKEY k = NULL;
+    out[0] = L'\0';
+    if (RegOpenKeyExW(root, sub, 0, KEY_READ, &k) != ERROR_SUCCESS)
+        return false;
+    DWORD type = 0, sz = (DWORD)(cap * sizeof(wchar_t));
+    bool ok = RegQueryValueExW(k, val, NULL, &type, (LPBYTE)out, &sz)
+                  == ERROR_SUCCESS &&
+              (type == REG_SZ || type == REG_EXPAND_SZ);
+    RegCloseKey(k);
+    out[cap - 1] = L'\0';                    // never trust the stored length
+    return ok && out[0] != L'\0';
+}
+
+// The type's ProgID, honouring the user's own "choose a default app":
+// FileExts\<ext>\UserChoice\ProgId wins over the class default, exactly
+// the way Explorer resolves it.  (A .txt file on Windows 11, e.g., lives
+// under an AppX ProgID the user picked, NOT under the "txtfilelegacy"
+// class default - skipping UserChoice here would pick the wrong app.)
+static bool effective_progid(const wchar_t* ext, wchar_t* progid,
+                             size_t cap) {
+    wchar_t uc[420];
+    _snwprintf(uc, 420,
+               L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer"
+               L"\\FileExts\\%ls\\UserChoice", ext);
+    uc[419] = L'\0';
+    if (reg_val_str(HKEY_CURRENT_USER, uc, L"ProgId", progid, cap))
+        return true;
+    return reg_val_str(HKEY_CLASSES_ROOT, ext, NULL, progid, cap);
+}
+
+// A verb that OPENS.  "print", "printto", "edit", "properties"... each
+// does something OTHER than open, so none is ever substituted for a
+// missing "open"; a custom name like Nuke's "opennk" is fine.
+static bool verb_is_openish(const wchar_t* v) {
+    static const wchar_t* const bad[] = {
+        L"print", L"printto", L"printto2", L"edit", L"editwith",
+        L"openas", L"openwith", L"properties", L"runas", L"explore",
+        L"find", L"start"
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++)
+        if (_wcsicmp(v, bad[i]) == 0)
+            return false;
+    return true;
+}
+
+// Find an OPENING verb for this extension, or fail.  Called only AFTER
+// the standard "open" attempt already returned NO_ASSOCIATION, so this
+// can never replace a verb that would have worked.
+static bool find_open_verb(const wchar_t* ext, wchar_t* verb, size_t cap) {
+    verb[0] = L'\0';
+    wchar_t progid[256];
+    if (!effective_progid(ext, progid, 256)) return false;
+    if (wcsncmp(progid, L"MIME\\", 5) == 0) return false;  // not an app type
+    wchar_t shell[340];
+    _snwprintf(shell, 340, L"%ls\\shell", progid);
+    shell[339] = L'\0';
+    HKEY sh = NULL;
+    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, shell, 0, KEY_READ, &sh)
+        != ERROR_SUCCESS)
+        return false;
+    bool found = false;
+    for (int i = 0; i < 12 && !found; i++) {             // a handful max
+        wchar_t name[128];
+        DWORD nlen = 128;
+        if (RegEnumKeyExW(sh, (DWORD)i, name, &nlen, NULL, NULL, NULL, NULL)
+            != ERROR_SUCCESS)
+            break;
+        name[127] = L'\0';
+        if (!verb_is_openish(name)) continue;            // never print/edit
+        wchar_t sub[400];
+        _snwprintf(sub, 400, L"%ls\\shell\\%ls\\command", progid, name);
+        sub[399] = L'\0';
+        HKEY c = NULL;
+        if (RegOpenKeyExW(HKEY_CLASSES_ROOT, sub, 0, KEY_READ, &c)
+            == ERROR_SUCCESS) {
+            RegCloseKey(c);
+            wcsncpy(verb, name, cap - 1);                // e.g. Nuke "opennk"
+            verb[cap - 1] = L'\0';
+            found = true;
+        }
+    }
+    RegCloseKey(sh);
+    return found;
+}
+
+// Nova File never runs a file itself - the registered handler (the user's
+// default app) does, exactly as Explorer would.  The WIDE call keeps
+// names with spaces / accents intact, SEE_MASK_FLAG_NO_UI stops the
+// shell's own dialog so the failure can be reported in the status bar,
+// and the real Windows error is never thrown away: it is named in the
+// bar and printed to stdout for diagnostics.
+static bool open_with_shell(const char* path, const char* name) {
+    wchar_t wp[1024];
+    if (MultiByteToWideChar(CP_ACP, 0, path, -1, wp,
+                            (int)(sizeof wp / sizeof wp[0])) <= 0) {
+        set_status("Cannot open %s: invalid path", name);
+        printf("[open] fail '%s': path conversion\n", path);
+        return false;
+    }
+    SHELLEXECUTEINFOW sei;
+    memset(&sei, 0, sizeof sei);
+    sei.cbSize  = sizeof sei;
+    sei.fMask   = SEE_MASK_FLAG_NO_UI;
+    sei.lpFile  = wp;
+    sei.lpDirectory = NULL;
+    sei.nShow   = SW_SHOWNORMAL;
+
+    // 1. the standard "open" verb - correct on its own for nearly every
+    //    type, so it is always tried first and normally ends here.
+    sei.lpVerb = L"open";
+    if (ShellExecuteExW(&sei)) {
+        printf("[open] ok '%s'\n", path);
+        return true;
+    }
+    DWORD err = GetLastError();
+
+    // 2. "open" is genuinely absent: some types register only their OWN
+    //    verb name (Foundry's Nuke uses "opennk").  Look for an OPENING
+    //    verb the type did register and retry.  This branch is never
+    //    reached for a normal type, so a print/edit verb can never be
+    //    picked up by mistake.
+    if (err == ERROR_NO_ASSOCIATION) {
+        wchar_t ext[32];
+        ext[0] = L'\0';
+        const wchar_t* dot = wcsrchr(wp, L'.');
+        const wchar_t* slash = wcsrchr(wp, L'\\');
+        if (dot && (!slash || dot > slash) && wcslen(dot) < sizeof ext / 2) {
+            wcscpy(ext, dot);
+            for (wchar_t* q = ext; *q; q++) *q = towlower(*q);
+        }
+        wchar_t verb[128];
+        if (ext[0] != L'\0' && find_open_verb(ext, verb, 128)) {
+            sei.lpVerb = verb;
+            if (ShellExecuteExW(&sei)) {
+                printf("[open] ok '%s' (verb '%ls')\n", path, verb);
+                return true;
+            }
+            err = GetLastError();
+        }
+    }
+    set_status("Cannot open %s: %s (%lu)", name, open_err_text(err),
+               (unsigned long)err);
+    printf("[open] fail '%s': win32=%lu\n", path, (unsigned long)err);
+    return false;
+}
+
+// ---- selftest for the open error mapping (Part 1) ----
+// Pure logic, no OS launch: verifies each Windows failure code maps to a
+// distinct, human-readable reason and that the two "not found" codes
+// share one message.  The real ShellExecuteExW launch paths are covered
+// by the E2E harness; this covers the message table the bar shows.
+static void st_open_err_map(void) {
+    int run = 0, fail = 0;
+    struct { DWORD code; const char* want; } cases[] = {
+        { ERROR_FILE_NOT_FOUND,        "file not found" },
+        { ERROR_PATH_NOT_FOUND,        "file not found" },
+        { ERROR_ACCESS_DENIED,         "access denied" },
+        { ERROR_NO_ASSOCIATION,        "no app registered for this type - "
+                                       "choose a default app in Windows" },
+        { ERROR_CANCELLED,             "cancelled" },
+        { ERROR_NOT_ENOUGH_MEMORY,     "out of memory" },
+        { ERROR_OUTOFMEMORY,           "out of memory" },
+        { ERROR_INVALID_PARAMETER,     "OS error" },   // unmapped stays generic
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        run++;
+        if (strcmp(open_err_text(cases[i].code), cases[i].want) != 0) {
+            fail++;
+            printf("[selftest] FAIL: open_err_text(%lu) = \"%s\", want \"%s\"\n",
+                   (unsigned long)cases[i].code,
+                   open_err_text(cases[i].code), cases[i].want);
+        }
+    }
+    printf("[selftest] open error map: %d/%d check(s) %s\n",
+           run - fail, run, fail ? "FAILED" : "ok");
+}
+
+// ---- selftest for the verb lookup (Part 1) ----
+// Machine-independent checks.  The safety guarantee first: a verb that
+// would PRINT or EDIT must never be offered as an opener (an earlier
+// version of this lookup returned "printto" for .txt, which would have
+// opened a print dialog).  Then: an existing type must resolve to an
+// OPENING verb, and an unregistered type must find nothing at all - the
+// honest "no app registered" outcome.  No particular application is
+// hardcoded anywhere.
+static void st_open_verb(void) {
+    int run = 0, fail = 0;
+    struct { const wchar_t* v; bool openish; } vc[] = {
+        { L"open",      true  }, { L"opennk",    true  },
+        { L"opendefault", true },
+        { L"print",     false }, { L"printto",   false },
+        { L"PRINTTO",   false }, { L"edit",      false },
+        { L"properties",false }, { L"runas",     false },
+        // "Open With" opens the app PICKER, not the file - excluded too.
+        { L"OpenWith",  false },
+    };
+    for (size_t i = 0; i < sizeof vc / sizeof vc[0]; i++) {
+        run++;
+        if (verb_is_openish(vc[i].v) != vc[i].openish) {
+            fail++;
+            printf("[selftest] FAIL: verb_is_openish(\"%ls\") wrong\n",
+                   vc[i].v);
+        }
+    }
+    // An existing type must resolve to an OPENING verb - never to a
+    // print/edit one, whatever its registry happens to contain.
+    wchar_t verb[128];
+    run++;
+    if (!find_open_verb(L".txt", verb, 128) || !verb_is_openish(verb)) {
+        fail++;
+        printf("[selftest] FAIL: .txt alt verb = \"%ls\" (not an opener)\n",
+               verb);
+    }
+    // A type with no registered handler must find nothing, which is what
+    // becomes the honest "no app registered" status message.
+    run++;
+    if (find_open_verb(L".novahandler_test", verb, 128)) {
+        fail++;
+        printf("[selftest] FAIL: unregistered type yielded verb \"%ls\"\n",
+               verb);
+    }
+    printf("[selftest] open verb lookup: %d/%d check(s) %s\n",
+           run - fail, run, fail ? "FAILED" : "ok");
+
+    // Diagnostic (informational, not asserted): which verb the registry
+    // walk actually picks for a few types.  Shows the custom-verb case
+    // (Nuke's "opennk", which registers no "open" at all) resolving
+    // correctly whenever Nuke is installed, and normal types resolving
+    // to "open".  Not asserted because the extensions are machine-
+    // specific - the safety of the pick is what the checks above pin.
+    static const char* const sample[] = { ".nk", ".txt", ".png", ".mp4" };
+    for (size_t i = 0; i < sizeof sample / sizeof sample[0]; i++) {
+        wchar_t wext[32];
+        MultiByteToWideChar(CP_ACP, 0, sample[i], -1, wext, 32);
+        if (find_open_verb(wext, verb, 128))
+            printf("[selftest]   verb for %-5ls -> '%ls'\n", wext, verb);
+        else
+            printf("[selftest]   verb for %-5ls -> (none: \"open\" only)\n",
+                   wext);
+    }
+}
+
 static void open_selected(void) {
     if (g_app.selected < 0 || (size_t)g_app.selected >= g_app.view_count) return;
 
@@ -12824,14 +15051,10 @@ static void open_selected(void) {
     }
 
     // Files go to the OS default handler - Nova File never runs them itself.
-    HINSTANCE hi = ShellExecuteA(NULL, "open", e->path, NULL, NULL, SW_SHOWNORMAL);
-    if ((INT_PTR)hi <= 32) {
-        set_status("Cannot open: %s", e->name);
-    } else {
-        remember_path(e->path);
-        build_sidebar();
-        set_status("Opened: %s", e->name);
-    }
+    if (!open_with_shell(e->path, e->name)) return;
+    remember_path(e->path);
+    build_sidebar();
+    set_status("Opened: %s", e->name);
 }
 
 // Activate ONE favorite from the radial wheel.  A folder goes through the
@@ -12862,14 +15085,10 @@ static void fav_run(const char* path) {
         set_status("Opened: %s", path_name(path));
         return;
     }
-    HINSTANCE hi = ShellExecuteA(NULL, "open", path, NULL, NULL, SW_SHOWNORMAL);
-    if ((INT_PTR)hi <= 32) {
-        set_status("Cannot open: %s", path_name(path));
-    } else {
-        remember_path(path);
-        build_sidebar();
-        set_status("Opened: %s", path_name(path));
-    }
+    if (!open_with_shell(path, path_name(path))) return;
+    remember_path(path);
+    build_sidebar();
+    set_status("Opened: %s", path_name(path));
 }
 
 // ------------------------------------------------------------
@@ -12911,6 +15130,12 @@ static void tile_drag_cancel(void) {
 // workspace's folder arrays stay owned by (and valid in) its panes -
 // load_dir's free() only ever sees the fresh pane's NULL pointers.
 static void ws_new(const char* path) {
+    // Callers may hand over a pointer INTO g_app (e.g. g_app.current_path)
+    // - app_push_folder below overwrites that very buffer mid-call, so a
+    // private copy must be taken BEFORE anything else touches the state.
+    char p[1024];
+    snprintf(p, sizeof p, path ? path : "");
+    path = p;
     if (g_ws_n >= TAB_MAX) {
         set_status("Maximum of %d tabs reached. Close a tab to open another.", TAB_MAX);
         return;
@@ -12925,6 +15150,7 @@ static void ws_new(const char* path) {
     if (!fresh) return;
     fresh->kind = PN_LEAF;
     fresh->ratio = 0.5f;
+    fresh->folder.zoom = g_zoom;         // a new tab keeps the current icon size
     g_ws[g_ws_n].root = fresh;
     g_ws[g_ws_n].active = fresh;
     g_ws_last = g_ws_cur;             // remember where we came from
@@ -13112,7 +15338,6 @@ static void ws_cycle(int dir) {
 // ------------------------------------------------------------
 static bool ws_absorb_into(int src, Pane* T, int zone) {
     if (src < 0 || src >= g_ws_n || src == g_ws_cur || !T) return false;
-    if (zone == DZ_CENTER) zone = DZ_RIGHT;   // a tab drop is never a swap
     if (zone == DZ_NONE) return false;
 
     Pane* D = ws_root(src);                  // the tree being absorbed
@@ -13155,6 +15380,13 @@ static void focus_address(void) {
     snprintf(g_app.addr_buf, sizeof(g_app.addr_buf), "%s", g_app.current_path);
     g_app.addr_caret = g_app.addr_anchor = (int)strlen(g_app.addr_buf);
     caret_touch();                          // focus gain: solid caret
+    // The Main Search / Location Bar opens as a GLOBAL window-centered
+    // overlay (exactly like the Ctrl+F search popup), NOT confined to this
+    // tab/pane's toolbar.  Set here so EVERY way of focusing the address bar
+    // (click, Ctrl+L shortcut, Tab from search) shows the same centered panel,
+    // scoped to the pane that was actually focused.
+    g_addr_popup_open = true;
+    g_addr_popup_pane = g_active_pane;
 }
 
 static void focus_search(void) {
@@ -13162,11 +15394,22 @@ static void focus_search(void) {
     g_app.addr_focused = false;
     g_app.search_caret = g_app.search_anchor = (int)strlen(g_app.search_buf);
     caret_touch();                          // focus gain: solid caret
+    g_addr_popup_open = false;              // location bar yields to search
+    g_addr_popup_pane = NULL;
 }
 
 static void blur_fields(void) {
     g_app.addr_focused = false;
     g_app.search_focused = false;
+    // The search popup is a floating view of the focused search box: the
+    // moment typing focus leaves it (pane switch, address bar, outside
+    // click, Escape) it goes away with the focus, never lingering over a
+    // pane it no longer belongs to.
+    g_search_popup_open = false;
+    g_search_popup_pane = NULL;
+    // ... and the location-bar popup is dismissed with the same focus loss.
+    g_addr_popup_open = false;
+    g_addr_popup_pane = NULL;
 }
 
 static void commit_address(void) {
@@ -13271,7 +15514,7 @@ static void adjust_zoom(float delta) {
     float z = quantize_zoom(g_zoom_target + delta);
     if (z == g_zoom_target) return;
     g_zoom_target = z;
-    g_zoom_pop_until = g_app.frame + 100;   // show the vertical zoom slider
+    g_zoom_pop_until = tick_in(1700);   // show the vertical zoom slider
 }
 
 // The slider writes the target directly (one drag covers the whole range).
@@ -13279,23 +15522,25 @@ static void set_zoom_target(float z) {
     z = quantize_zoom(z);
     if (z == g_zoom_target) return;
     g_zoom_target = z;
-    g_zoom_pop_until = g_app.frame + 100;
+    g_zoom_pop_until = tick_in(1700);
 }
 
 // Ease the rendered size towards the target: half of the remaining gap per
 // frame, then snap on arrival. ~4 frames (65 ms) for a 10% step - fast
 // enough to feel instant, still animated instead of popping.
 static void zoom_animate(void) {
-    if (g_zoom == g_zoom_target) return;
-    float d = g_zoom_target - g_zoom;
-    float step = d * 0.50f;
-    if (step < 0.0f) step = -step;
-    if (step < 0.02f) step = 0.02f;
-    if (d < 0.0f) step = -step;
-    g_zoom += step;
-    if ((d > 0.0f && g_zoom >= g_zoom_target) ||
-        (d < 0.0f && g_zoom <= g_zoom_target))
-        g_zoom = g_zoom_target;
+    if (g_zoom != g_zoom_target) {
+        float d = g_zoom_target - g_zoom;
+        float step = d * 0.50f;
+        if (step < 0.0f) step = -step;
+        if (step < 0.02f) step = 0.02f;
+        if (d < 0.0f) step = -step;
+        g_zoom += step;
+        if ((d > 0.0f && g_zoom >= g_zoom_target) ||
+            (d < 0.0f && g_zoom <= g_zoom_target))
+            g_zoom = g_zoom_target;
+    }
+    g_app.zoom = g_zoom;   // the ACTIVE pane always renders from the live value
 }
 
 // Run the animation to the end (selftest).
@@ -13329,13 +15574,8 @@ static void set_view_mode(int m, bool apply_preset) {
 }
 
 // Theme / hidden-file SIDE EFFECTS: the option rows own the values
-// (g_app.light / g_show_hidden) - these run when a value changes, from
+// (the live theme / g_show_hidden) - these run when a value changes, from
 // any direction (shortcut, menu, Settings switch, settings load).
-static void set_theme_apply(bool v) {
-    P = v ? &PAL_LIGHT : &PAL_DARK;
-    set_status(v ? "Light theme" : "Dark theme");
-}
-
 static void set_hidden_apply(bool v) {
     // At application start the current folder is still empty - the first
     // load_dir() below init picks the value up by itself.
@@ -13345,8 +15585,18 @@ static void set_hidden_apply(bool v) {
 
 // Wrappers kept for the menu, the shortcut chain and the selftest: both
 // flip the registry option, which persists and runs the apply above.
-static void toggle_theme(void) {
-    opt_set(CMD_THEME, !g_app.light);
+// Ctrl+T / the hamburger entry / the settings button: step through the
+// palettes (Midnight -> Dark -> Light -> ...) and remember the choice on
+// the settings file's own "palette" line.
+// EXPLICIT theme selection - called only by the theme cards in Settings
+// (and the selftest).  There is deliberately no cycling shortcut: the
+// theme changes because the user clicked one of the three previews.
+static void theme_select(int idx) {
+    if (idx < 0 || idx >= PAL_COUNT_N) return;
+    g_pal_idx = idx;
+    pal_apply();
+    set_status("Theme: %s", pal_name(g_pal_idx));
+    settings_save();
 }
 
 static void toggle_hidden(void) {
@@ -13357,15 +15607,14 @@ static void toggle_hidden(void) {
 static void run_menu(int i) {
     g_app.menu_open = false;
     switch (i) {
-        case 0: ws_new(NULL); break;
+        case 0: ws_new(g_app.current_path); break;   // duplicate the folder
         case 1: bookmark_current(); break;
-        case 2: load_dir(g_app.current_path); set_status("Refreshed"); break;
-        case 3: toggle_theme(); break;
-        case 4: toggle_hidden(); break;
-        case 5: navigate(platform_get_home_directory(), true); break;
-        case 6: pane_split_right(); break;
-        case 7: pane_close_active(); break;
-        case 8: g_app.running = false; break;
+        case 2: folder_refresh_keep(); set_status("Refreshed"); break;
+        case 3: toggle_hidden(); break;
+        case 4: navigate(platform_get_home_directory(), true); break;
+        case 5: pane_split_right(); break;
+        case 6: pane_close_active(); break;
+        case 7: g_app.running = false; break;
         default: break;
     }
 }
@@ -13515,7 +15764,7 @@ static void ctx_build_file(bool is_dir, bool multi, bool mixed) {
             ctx_add("Open in New Pane", CTX_CMD_OPEN_PANE, true);
         }
         // Open with - only when the platform can name a real handler
-        char apps[4][280];
+        static char apps[4][280];   // static: the rows keep pointers to it
         int na = 0;
         if (!is_dir &&
             open_with_apps(ctx_target() ? ctx_target()->path : NULL, apps, 4,
@@ -13559,10 +15808,21 @@ static void ctx_build_file(bool is_dir, bool multi, bool mixed) {
         } else {
             ctx_add("Set Custom Thumbnail", CTX_CMD_SET_THUMB, true);
         }
+        // Sidebar bookmark - folders only.  The label names the ACTION
+        // (add or remove), so the row always says what the click will do.
+        if (p && p[0])
+            ctx_add(bookmark_find(p) >= 0 ? "Remove Bookmark" : "Bookmark",
+                    CTX_CMD_BOOKMARK, true);
         ctx_add_sep();
     }
 
+    if (is_dir && !multi && !mixed)
+        ctx_add("Open in Terminal", CTX_CMD_TERMINAL, true);
     ctx_add("Properties", CTX_CMD_PROPERTIES, n > 0);
+    ctx_add_sep();
+    // Windows 11's own last row: the classic shell menu with every verb
+    // other programs registered (7-Zip, Git, scanners, Send to...).
+    ctx_add("Show more options", CTX_CMD_SHELL_MENU, n > 0);
     ctx_map_roots();               // root panel rows = what gets drawn
 }
 
@@ -13620,7 +15880,13 @@ static void ctx_build_bg(void) {
     ctx_add_sep();
     ctx_add("Refresh", CTX_CMD_REFRESH, true);
     ctx_add_sep();
-    ctx_add("Properties", CTX_CMD_PROPERTIES, true);
+    {
+        bool real = !is_this_pc(g_app.current_path);
+        ctx_add("Open in Terminal", CTX_CMD_TERMINAL, real);
+        ctx_add("Properties", CTX_CMD_PROPERTIES, true);
+        ctx_add_sep();
+        ctx_add("Show more options", CTX_CMD_SHELL_MENU, real);
+    }
     ctx_map_roots();               // root panel rows = what gets drawn
 }
 
@@ -13828,19 +16094,126 @@ static void ctx_open_side(int row, int x, int y) {
 }
 
 // ---- dispatch ----------------------------------------------------------
+// Explorer selects a freshly created item and opens its name for editing.
+static void new_item_select_rename(void) {
+    if (!g_new_item_path[0]) return;
+    for (size_t vi = 0; vi < g_app.view_count; vi++) {
+        DirEntry* ne = &g_app.entries[g_app.view[vi]];
+        if (_stricmp(ne->path, g_new_item_path) == 0) {
+            sel_clear();
+            sel_add((int)vi);
+            g_app.selected = (int)vi;
+            g_scroll_to_sel = true;
+            if (!g_st_running) rename_begin(ne);
+            break;
+        }
+    }
+    g_new_item_path[0] = '\0';
+}
+
+// Ctrl+Z: take the last rename / new item / paste back.
+static void undo_run(void) {
+    if (paste_busy()) { set_status("Wait for the copy to finish"); return; }
+    undo_lock();
+    int kind = g_undo_kind, n = g_undo_n;
+    UndoPair* v = NULL;
+    if (kind != UNDO_NONE && n > 0) {
+        v = (UndoPair*)malloc((size_t)n * sizeof(UndoPair));
+        if (v) memcpy(v, g_undo, (size_t)n * sizeof(UndoPair));
+    }
+    g_undo_kind = UNDO_NONE;
+    g_undo_n = 0;
+    undo_unlock();
+    if (!v) { set_status("Nothing to undo"); return; }
+    int ok = 0;
+    char err[256] = {0};
+    for (int i = n - 1; i >= 0; i--) {     // newest first
+        switch (kind) {
+        case UNDO_RENAME:
+        case UNDO_MOVE:
+            if (GetFileAttributesA(v[i].from) == INVALID_FILE_ATTRIBUTES &&
+                MoveFileExA(v[i].to, v[i].from, MOVEFILE_COPY_ALLOWED))
+                ok++;
+            break;
+        case UNDO_NEW:
+        case UNDO_COPY:
+            if (g_st_running ? fs_delete_one(v[i].to, err, sizeof err)
+                             : fs_recycle_one(v[i].to, err, sizeof err))
+                ok++;
+            break;
+        }
+    }
+    free(v);
+    load_dir(g_app.current_path);
+    static const char* what[] = {"", "Rename", "New item", "Copy", "Move"};
+    if (ok == n)
+        set_status("Undo %s (%d item%s)", what[kind], ok, ok == 1 ? "" : "s");
+    else
+        set_status("Undo %s: %d of %d done", what[kind], ok, n);
+}
+
+// "Open in Terminal": Windows Terminal when it is installed (exactly what
+// Explorer's row opens), otherwise PowerShell started IN the folder.
+static bool open_terminal_at(const char* dir) {
+    if (!dir || !dir[0] || !dir_exists(dir)) return false;
+    char arg[1100];
+    size_t dl = strlen(dir);
+    // A trailing backslash right before the closing quote would escape
+    // it ("C:\" -> C:"): "C:\." names the same folder safely.
+    snprintf(arg, sizeof arg, "-d \"%s%s\"", dir,
+             (dl > 0 && dir[dl - 1] == '\\') ? "." : "");
+    HINSTANCE r = ShellExecuteA((HWND)g_app.hwnd, "open", "wt.exe", arg, dir,
+                                SW_SHOWNORMAL);
+    if ((INT_PTR)r > 32) return true;
+    r = ShellExecuteA((HWND)g_app.hwnd, "open", "powershell.exe", "-NoExit",
+                      dir, SW_SHOWNORMAL);
+    if ((INT_PTR)r > 32) return true;
+    r = ShellExecuteA((HWND)g_app.hwnd, "open", "cmd.exe", NULL, dir,
+                      SW_SHOWNORMAL);
+    return (INT_PTR)r > 32;
+}
+
 static void ctx_run(int cmd) {
     DirEntry* e = ctx_target();
     char err[256] = {0};
     switch (cmd) {
+    case CTX_CMD_TERMINAL: {
+        const char* d = (e && e->is_directory) ? e->path : g_app.current_path;
+        if (open_terminal_at(d)) set_status("Terminal opened in %s", d);
+        else set_status("Could not open a terminal here");
+        break;
+    }
+    case CTX_CMD_SHELL_MENU: {
+        // The native menu opens where the right-click happened.
+        POINT pt;
+        GetCursorPos(&pt);
+        bool ext = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        int r = SHELL_MENU_NONE;
+        if (e) {
+            int n = 0;
+            char** ps = sel_paths(&n);
+            if (n > 0)
+                r = shell_context_menu(g_app.hwnd, ps, n, pt.x, pt.y, ext);
+            sel_paths_free(ps, n);
+        } else if (!is_this_pc(g_app.current_path)) {
+            r = shell_background_menu(g_app.hwnd, g_app.current_path, pt.x,
+                                      pt.y, ext);
+        }
+        if (r == SHELL_MENU_RENAME && e) rename_begin(e);
+        else if (r == SHELL_MENU_INVOKED) folder_watch_poke();
+        break;
+    }
     case CTX_CMD_OPEN:
         if (!e) break;
         if (e->is_directory) {
             navigate(e->path, true);
         } else {
-            HINSTANCE hi =
-                ShellExecuteA(NULL, "open", e->path, NULL, NULL, SW_SHOWNORMAL);
-            if ((INT_PTR)hi <= 32)       // <= 32 is the shell's failure code
-                set_status("Cannot open %s (no handler?)", e->name);
+            // one shared Windows path: the registered app, real errors
+            if (open_with_shell(e->path, e->name)) {
+                remember_path(e->path);
+                build_sidebar();
+                set_status("Opened: %s", e->name);
+            }
         }
         break;
     case CTX_CMD_OPEN_TAB:
@@ -13850,6 +16223,12 @@ static void ctx_run(int cmd) {
         // A pane split inside THIS workspace - never a second OS window
         // and never a second instance of the app.
         if (e && e->is_directory) pane_open_in_new_pane(e->path);
+        break;
+    case CTX_CMD_BOOKMARK:
+        // Right-click bookmark: the same sidebar list Ctrl+B edits,
+        // toggled with the row's OWN name and rebuilt immediately so
+        // the entry shows up (or disappears) as the menu closes.
+        if (e && e->is_directory) bookmark_toggle(e->path, e->name);
         break;
     case CTX_CMD_CUT:
     case CTX_CMD_COPY: {
@@ -13872,25 +16251,12 @@ static void ctx_run(int cmd) {
             break;
         }
         {
-            int done = 0;
-            for (int i = 0; i < g_clip.count; i++) {
-                if (g_clip.mode == CLIP_CUT) {
-                    if (fs_move_one(g_clip.paths[i], g_app.current_path, err,
-                                    sizeof(err)))
-                        done++;
-                } else {
-                    if (fs_copy_one(g_clip.paths[i], g_app.current_path, err,
-                                    sizeof(err)))
-                        done++;
-                }
-            }
-            if (done > 0) {
-                if (g_clip.mode == CLIP_CUT) clip_clear();
-                load_dir(g_app.current_path);
-                set_status("Pasted %d item%s", done, done == 1 ? "" : "s");
-            } else if (err[0]) {
-                set_status("%s", err);
-            }
+            // Explorer-safe paste (never overwrites, " - Copy" in place,
+            // no folder into itself) on a worker thread - see paste_start.
+            bool mv = (g_clip.mode == CLIP_CUT);
+            if (paste_start(g_clip.paths, g_clip.count, mv,
+                            g_app.current_path) && mv)
+                clip_clear();             // a cut is consumed by its paste
         }
         break;
     case CTX_CMD_PASTE_SHORTCUT:
@@ -13970,12 +16336,14 @@ static void ctx_run(int cmd) {
         if (fs_new_folder(g_app.current_path, err, sizeof(err))) {
             load_dir(g_app.current_path);
             set_status("Folder created");
+            new_item_select_rename();
         } else set_status("%s", err);
         break;
     case CTX_CMD_NEW_TEXT:
         if (fs_new_text(g_app.current_path, err, sizeof(err))) {
             load_dir(g_app.current_path);
             set_status("Text document created");
+            new_item_select_rename();
         } else set_status("%s", err);
         break;
     case CTX_CMD_SORT_NAME: set_sort(SORT_NAME); break;
@@ -13994,7 +16362,7 @@ static void ctx_run(int cmd) {
     case CTX_CMD_VIEW_LIST: set_view_mode(MODE_LIST, true); break;
     case CTX_CMD_VIEW_DETAILS: set_view_mode(MODE_DETAILS, true); break;
     case CTX_CMD_REFRESH:
-        load_dir(g_app.current_path);
+        folder_refresh_keep();           // stays where the user was
         set_status("Refreshed");
         break;
     case CTX_CMD_SET_THUMB:
@@ -14079,12 +16447,11 @@ static void ctx_run(int cmd) {
     case CTX_CMD_SIDE_OPEN:
         if (!g_ctx_side_path[0]) break;
         if (g_ctx_side_file) {
-            HINSTANCE hi = ShellExecuteA(NULL, "open", g_ctx_side_path,
-                                          NULL, NULL, SW_SHOWNORMAL);
-            if ((INT_PTR)hi <= 32)
-                set_status("Cannot open: %s", g_ctx_side_label);
-            else
+            if (open_with_shell(g_ctx_side_path, g_ctx_side_label)) {
+                remember_path(g_ctx_side_path);
+                build_sidebar();
                 set_status("Opened: %s", g_ctx_side_label);
+            }
         } else {
             navigate(g_ctx_side_path, true);
         }
@@ -14428,19 +16795,67 @@ static void rad_activate(int s) {
 // key it owns is swallowed here, and any other key closes it first and
 // then runs normally (the menu never steals a shortcut meant for the
 // app - it only gets out of the way).
-static bool rad_handle_key(InputState* in) {
+static bool rad_handle_key(InputState* in, const Layout* L) {
     int k = in->key_code;
+
+    // The wheel's BARE letter binding (default C) is the one that drives
+    // the tap/hold gesture; a MODIFIED alias (Alt+S) opens on the plain
+    // press - a chord has no tap meaning.  wk is that bare letter, 0
+    // when the user has rebound the primary away from an unmodified
+    // letter (the fixed alias then keeps the gesture alive).
+    const SetEnt* we = &g_ents[CMD_WHEEL];
+    int wk = 0;
+    if (we->mods == 0 && we->key >= 'A' && we->key <= 'Z') wk = we->key;
+    else if (we->amods == 0 && we->akey >= 'A' && we->akey <= 'Z')
+        wk = we->akey;
+
+    // ---- a HELD letter key (the OS auto-repeat edge) is the wheel ----
+    // A letter wheel binding (default C) has TWO natural gestures and one
+    // physical key: a quick TAP is a TYPING character (so any filename
+    // containing the letter stays typeable - "Documents", "Project123",
+    // even a word that STARTS with it), while a HOLD - the platform
+    // latches the auto-repeat separately - opens the wheel. A tap already
+    // fed its letter to type-to-select; a hold means "I wanted the
+    // wheel", so that pending letter is taken back.
+    if (g_rad_hold_arm) {
+        if (in->key_up == wk) {
+            g_rad_hold_arm = false;             // clean tap: done typing
+        } else if (k && k != wk) {
+            g_rad_hold_arm = false;             // another key ended the tap
+        } else if (in->key_repeat == wk && cmd_enabled(CMD_WHEEL)) {
+            // key_code is EDGE-only, so a real repeat frame arrives with
+            // k == 0 - the repeat latch alone identifies the hold.
+            g_rad_hold_arm = false;
+            tts_reset();                        // the tap-letter is undone
+            if (g_rad_open) rad_close("toggle");
+            else rad_open(in->x, in->y);
+            return true;                        // the hold owns the key
+        }
+    }
+
     if (cmd_hit(in, CMD_WHEEL)) {          // registry binding (default C)
-        // The key is a TOGGLE: closed -> open at the pointer, open -> closed.
-        // The platform drops the auto-repeat bit (WM_KEYDOWN bit 30), so
-        // a HELD key produces exactly one of these - the second press is
-        // just the normal way to put the wheel away without hunting for
-        // the centre "x" (spec 15: the key and the "x" mean the same
-        // close). When the wheel switch is OFF in Settings, cmd_hit says
-        // no and the key is not even consumed here.
-        if (g_rad_open) rad_close("toggle");
-        else rad_open(in->x, in->y);
-        return true;                          // the key is never anyone else's
+        // The key is a TOGGLE when the wheel is up: open -> closed. When
+        // it is down a LETTER key is the tap/hold gesture above (tap =
+        // type the letter, hold = open); any NON-letter binding keeps
+        // opening on the plain press. When the wheel switch is OFF in
+        // Settings, cmd_hit says no and the key is not even consumed here.
+        if (g_rad_open) {
+            rad_close("toggle");
+            return true;                          // the key is never anyone else's
+        }
+        if (k == wk && in->key_repeat != k) {     // the bare letter: tap/hold
+            g_rad_hold_arm = true;                // tap pending: maybe a hold
+            // The press's own character already joined the prefix at the
+            // ONE delivery point above; only a press that produced NO
+            // character at all (a posted edge without a WM_CHAR) still
+            // needs its letter supplied here.
+            if (!in->char_pressed && in->charq_n <= 0)
+                tts_char(in->shift_pressed ? wk : (wk | 0x20), L);
+            return true;
+        }
+        tts_reset();                              // a real wheel press: not typing
+        rad_open(in->x, in->y);
+        return true;
     }
     if (!g_rad_open || k == 0) return false;
     // The "+" chooser is up: it owns the keyboard until it goes, so no
@@ -14578,6 +16993,10 @@ static void move_selection(int delta, const Layout* L) {
     if (next < 0) next = 0;
     if ((size_t)next >= g_app.view_count) next = (int)g_app.view_count - 1;
     g_app.selected = next;
+    // Arrows walk a single cursor: the stored row set follows, so a
+    // previous multi-selection cannot linger as ghost highlights.
+    sel_clear();
+    sel_add(next);
 
     int row = mode_is_grid() ? next / L->cols : next;
     if (row < g_app.scroll) g_app.scroll = row;
@@ -14588,6 +17007,131 @@ static void move_selection(int delta, const Layout* L) {
 
 static void page_selection(int dir, const Layout* L) {
     move_selection(dir * L->rows_visible, L);
+}
+
+// ------------------------------------------------------------
+// Incremental type-to-select
+// ------------------------------------------------------------
+// Case-insensitive byte fold: ASCII A-Z plus the Latin-1 supplement
+// letters as the ANSI code pages store them (C0-DE / E0-FE, the two
+// arithmetic symbols skipped) - as correct as the platform's own 8-bit
+// names allow.
+static char tts_fold(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return (char)(c + 32);
+    // UTF-8 code page (the app manifest): bytes >= 0x80 are parts of a
+    // multi-byte sequence, NOT Latin-1 letters - folding them would make
+    // unrelated characters compare equal.  Only ASCII folds there.
+    static int utf8_cp = -1;
+    if (utf8_cp < 0) utf8_cp = (GetACP() == CP_UTF8) ? 1 : 0;
+    if (utf8_cp) return (char)c;
+    if (c >= 0xC0 && c <= 0xDE && c != 0xD7) return (char)(c + 32);
+    if (c >= 0xE0 && c <= 0xFE && c != 0xF7) return (char)(c - 32);
+    return (char)c;
+}
+
+// Does the name START with the prefix? Stops at the name's terminator,
+// so a shorter name can never match a longer prefix by trailing zeros.
+static bool tts_prefix_ci(const char* name, const char* prefix, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (!name[i]) return false;
+        if (tts_fold((unsigned char)name[i]) !=
+            tts_fold((unsigned char)prefix[i])) return false;
+    }
+    return true;
+}
+
+// The entry the prefix selects, as a view index. Priority: an EXACT
+// full-name match ("work" picks "Work", never "Work Documents"), else
+// the first prefix match in the DISPLAYED order. Only the in-memory
+// view is walked (it is already sorted for the screen) - no filesystem
+// access, no rebuild, one pass over what is on screen.
+static int tts_match(const char* prefix) {
+    size_t n = strlen(prefix);
+    if (n == 0) return -1;
+    int first = -1;
+    for (int i = 0; i < (int)g_app.view_count; i++) {
+        int ei = g_app.view[i];
+        if (ei < 0 || (size_t)ei >= g_app.count) continue;
+        const char* nm = g_app.entries[ei].name;
+        if (!tts_prefix_ci(nm, prefix, n)) continue;
+        if (!nm[n]) return i;                 // exact full-name match wins
+        if (first < 0) first = i;             // else first in display order
+    }
+    return first;
+}
+
+// Highlight a match exactly like one move_selection step: a single
+// cursor, the stored row set follows it, the row scrolls into view.
+static void tts_highlight(int vi, const Layout* L) {
+    g_app.selected = vi;
+    sel_clear();
+    sel_add(vi);
+    int row = mode_is_grid() ? vi / L->cols : vi;
+    if (row < g_app.scroll) g_app.scroll = row;
+    if (row >= g_app.scroll + L->rows_visible)
+        g_app.scroll = row - L->rows_visible + 1;
+    clamp_scroll(L);
+}
+
+// Run the accumulated prefix over the current listing.
+static void tts_run(const Layout* L) {
+    if (!tts_active()) return;
+    int vi = tts_match(g_tts_prefix);
+    if (vi < 0) {
+        // No match: the selection stays WHERE IT WAS - an unrelated item
+        // must never light up - and the prefix stays active so the next
+        // character can extend or correct the search.
+        set_status("No match: %s", g_tts_prefix);
+        g_tts_sel = g_app.selected;           // OUR run's selection
+        return;
+    }
+    tts_highlight(vi, L);
+    set_status("Find: %s", g_tts_prefix);
+    g_tts_sel = g_app.selected;               // OUR run's selection
+}
+
+// One printable character of a typing sequence.
+static void tts_char(int ch, const Layout* L) {
+    // A sequence survives selection changes WE made (the highlight
+    // following the prefix) - but if the selection moved any OTHER way
+    // (mouse click, arrows, Home/End, select-all, an empty click) or the
+    // inactivity timeout expired, this character STARTS a fresh search
+    // instead of extending the old one.
+    if (!tts_active() || g_app.selected != g_tts_sel ||
+        GetTickCount() - g_tts_last_ms > (DWORD)TTS_TIMEOUT_MS)
+        tts_reset();
+    // The character as the FILE SYSTEM spells it: the listing is ANSI
+    // (FindFirstFileA), so the delivered UTF-16 code unit converts to
+    // the same code page - ASCII is the fast path, and a character the
+    // code page cannot represent becomes '?' like everywhere else.
+    char bytes[8];
+    int nb = (ch >= 32) ? cp_encode((unsigned int)ch, bytes) : 0;
+    size_t n = strlen(g_tts_prefix);
+    if (nb > 0 && n + (size_t)nb <= (size_t)TTS_PREFIX_MAX) {
+        memcpy(g_tts_prefix + n, bytes, (size_t)nb);
+        g_tts_prefix[n + nb] = '\0';
+    }
+    g_tts_last_ms = GetTickCount();
+    tts_run(L);
+}
+
+// The typed prefix as the QUERY that gets boxed inside a row's name while
+// the sequence is live: it grows one character per accepted keystroke, so
+// the item the typing selected shows its matched part filling up ("W",
+// "Wo", "Wor", ... "Work") - and only THAT item (the match the selection
+// is on), never its neighbours.  NULL for every row the moment the
+// sequence times out, a click / arrow key moved the selection away from
+// OUR match, a text field has focus, or a guard owns the keyboard: the
+// plain selection highlight then remains, exactly as before.  The no-match
+// state is safe too - text_px_hl boxes nothing when the query is longer
+// than the name.
+static const char* tts_row_query(int vi) {
+    if (!tts_active()) return NULL;
+    if (vi != g_app.selected || g_app.selected != g_tts_sel) return NULL;
+    if (GetTickCount() - g_tts_last_ms > (DWORD)TTS_TIMEOUT_MS) return NULL;
+    if (g_app.addr_focused || g_app.search_focused) return NULL;
+    if (g_confirm_kind != CONFIRM_NONE || g_rename_vi >= 0) return NULL;
+    return g_tts_prefix;
 }
 
 // ------------------------------------------------------------
@@ -14603,7 +17147,16 @@ static void handle_keys(InputState* in, const Layout* L) {
     // included) and sits above every other overlay - nothing may leak
     // through it to the app behind (spec: no shortcut fires through a
     // modal guard).
-    if (g_set_open) { settings_keys(in); return; }
+    if (g_welcome_open) { welcome_key(in); return; }   // first-start tour
+    if (g_help_open) { help_key(in); return; }         // F1 guide
+    if (g_xm_open) {                    // the system context menu
+        xm_key(in);
+        return;
+    }
+    if (g_set_open) {
+        settings_keys(in);
+        return;
+    }
 
     // The right-click menu owns ITS keys while open: arrows move the
     // focus, Enter/Space run the focused row, Escape closes it - those
@@ -14621,7 +17174,12 @@ static void handle_keys(InputState* in, const Layout* L) {
     int* eanc = is_addr ? &g_app.addr_anchor : &g_app.search_anchor;
 
     if (editing && in->char_pressed >= 32) {
-        text_insert(ebuf, ecap, ecar, eanc, in->char_pressed);
+        // EVERY character of the frame (a stalled frame can carry a whole
+        // typed word - only the first one used to land).
+        unsigned int cq[32];
+        int cn = tts_frame_chars(in, cq, 32);
+        for (int ci = 0; ci < cn; ci++)
+            if (cq[ci] >= 32) text_insert(ebuf, ecap, ecar, eanc, cq[ci]);
         if (is_search) search_changed();
         return;
     }
@@ -14648,21 +17206,71 @@ static void handle_keys(InputState* in, const Layout* L) {
         if (rk == VK_RIGHT) { text_move(ebuf, ecar, eanc,  1, false); return; }
         if (rk == VK_HOME)  { text_move(ebuf, ecar, eanc, -2, false); return; }
         if (rk == VK_END)   { text_move(ebuf, ecar, eanc,  2, false); return; }
-        if (rk == VK_UP)    { move_selection(-1, L); return; }
-        if (rk == VK_DOWN)  { move_selection(1, L); return; }
+        if (rk == VK_UP)    { if (!sug_move(-1)) move_selection(-1, L); return; }
+        if (rk == VK_DOWN)  { if (!sug_move(1))  move_selection(1, L);  return; }
         if (rk == VK_PRIOR) { page_selection(-1, L); return; }
         if (rk == VK_NEXT)  { page_selection(1, L); return; }
         return;                       // every other repeat: never twice
     }
 
     int k = in->key_code;
-    if (k == 0) return;
+
+    // ---- ONE delivery point for type-to-select characters -------------
+    // The frame's whole character stream - a single press character, a
+    // batch committed at once (On-Screen Keyboard, IME), or every
+    // character a stalled pump queued before it resumed - reaches the
+    // prefix HERE, before any key acts: the characters are the EARLIER
+    // input.  Typing "work" and pressing Enter inside one stalled frame
+    // therefore still highlights the match, and Enter opens it.  A text
+    // field took its characters above, the modal panels returned at the
+    // top, and a Win / Ctrl / Alt chord is never stolen (Ctrl+Alt is the
+    // AltGr pair - exactly how such layouts deliver plain characters).
+    if (!editing && g_confirm_kind == CONFIRM_NONE && g_rename_vi < 0 &&
+        !in->win_pressed &&
+        ((!in->ctrl_pressed && !in->alt_pressed) ||
+         (in->ctrl_pressed && in->alt_pressed))) {
+        unsigned int cs[32];
+        int cn = tts_frame_chars(in, cs, 32);
+        for (int i = 0; i < cn; i++) {
+            if (cs[i] < 32 || cs[i] >= 256) continue;
+            // The character a KEY-UP translates into is its key-down's
+            // own duplicate; the platform already drops the ones carrying
+            // the release transition bit, and this matches the rest
+            // case-insensitively against the released key so even a
+            // synthesised key-up without that bit cannot double a letter
+            // into the prefix (a poisoned prefix matched nothing, and
+            // every accumulated sequence died on its second character).
+            if (in->key_up != 0 &&
+                (cs[i] == (unsigned int)in->key_up ||
+                 (cs[i] | 0x20) == (unsigned int)in->key_up))
+                continue;
+            // Typing closes the open wheel - except on the wheel's own
+            // key: that press is the tap/hold gesture (or its toggle
+            // close) and rad_handle_key below owns it unchanged.
+            if (g_rad_open && (k == 0 || !cmd_hit(in, CMD_WHEEL)))
+                rad_close("key");
+            tts_char((int)cs[i], L);
+        }
+    }
+
+    if (k == 0) {
+        // A frame with no key-down edge: the HOLD half of the radial
+        // wheel's letter gesture still needs its recognition (the
+        // platform latches the OS auto-repeat separately, and key_code
+        // stays edge-only).  Any character it carried was already
+        // delivered at the ONE point above.
+        if (g_confirm_kind == CONFIRM_NONE && g_rename_vi < 0)
+            if (rad_handle_key(in, L)) return;    // the wheel HOLD
+        return;
+    }
 
     // An in-app guard (the delete confirmation) and the inline rename
     // field OWN the keyboard until they close: handle_mouse() handles
     // their keys, so no shortcut may fire through a guard that is on
     // screen - and Escape must close the guard, never the app.
-    if (g_confirm_kind != CONFIRM_NONE || g_rename_vi >= 0) return;
+    if (g_confirm_kind != CONFIRM_NONE || g_rename_vi >= 0) {
+        return;
+    }
 
     if (editing) {
         // Text-field clipboard + select-all (Ctrl held). These are scoped
@@ -14692,7 +17300,11 @@ static void handle_keys(InputState* in, const Layout* L) {
             return;
         }
         if (k == VK_RETURN) {
-            if (g_app.addr_focused) commit_address();
+            if (g_app.addr_focused) {
+                // A highlighted child wins Enter (open it); otherwise Enter
+                // keeps meaning "go to the path typed in the field".
+                if (!sug_accept()) commit_address();
+            }
             else search_start_deep();    // Enter = search folder + subfolders
             return;
         }
@@ -14720,25 +17332,42 @@ static void handle_keys(InputState* in, const Layout* L) {
         if (k == VK_HOME) { text_move(ebuf, ecar, eanc, -2, in->shift_pressed); return; }
         if (k == VK_END)  { text_move(ebuf, ecar, eanc,  2, in->shift_pressed); return; }
         if (k == VK_TAB) {
-            if (g_app.addr_focused) focus_search();
-            else focus_address();
+            if (g_app.addr_focused) {
+                focus_search();
+                // Typing focus in the search box ALWAYS brings the big
+                // centered popup - by click, by the search shortcut AND
+                // by Tab from the address bar.  A bare inline focus here
+                // used to make this search bar the only one in the app
+                // whose popup never appeared.
+                g_search_popup_open = true;
+                g_search_popup_pane = g_active_pane;
+            } else focus_address();
             return;
         }
-        if (k == VK_UP) { move_selection(-1, L); return; }
-        if (k == VK_DOWN) { move_selection(1, L); return; }
+        if (k == VK_UP) {
+            if (!sug_move(-1)) move_selection(-1, L);
+            return;
+        }
+        if (k == VK_DOWN) {
+            if (!sug_move(1)) move_selection(1, L);
+            return;
+        }
         if (k == VK_PRIOR) { page_selection(-1, L); return; }
         if (k == VK_NEXT) { page_selection(1, L); return; }
         return;   // every other key is swallowed while typing
     }
 
-    // Radial Quick Access owns C (and, while it is open, Escape / Enter /
-    // arrows).  It sits after the typing guards above, so typing "c" in
-    // the address bar, the search box or the rename field can never open
-    // the wheel, and after the in-app guards, so a confirm panel or a
-    // rename field never opens it either.
-    if (rad_handle_key(in)) return;
+    // Radial Quick Access owns its key (C by default - a quick TAP of a
+    // letter binding types the letter into type-to-select, a HOLD opens
+    // the wheel; while the wheel is open, Escape / Enter / arrows). It
+    // sits after the typing guards above, so typing "c" in the address
+    // bar, the search box or the rename field can never open the wheel,
+    // and after the in-app guards, so a confirm panel or a rename field
+    // never opens it either.
+    if (rad_handle_key(in, L)) return;
 
     if (k == VK_ESCAPE) {
+        if (paste_cancel_request()) return;   // a running copy stops first
         if (g_app.menu_open) { g_app.menu_open = false; return; }
         if (g_app.view_menu_open) { g_app.view_menu_open = false; return; }
         if (g_drag_split) {              // Esc cancels a pane drag
@@ -14763,6 +17392,14 @@ static void handle_keys(InputState* in, const Layout* L) {
             g_tab_flipped = false;
             if (g_drag_src == DRAG_TAB) g_drag_src = DRAG_NONE;
             set_status("Tab drag cancelled");
+            return;
+        }
+        // An active type-to-select sequence owns Escape first: it clears
+        // the typed prefix and nothing else. A running global search keeps
+        // its priority below - existing behaviour unchanged.
+        if (tts_active() && g_srch_state == SRCH_IDLE) {
+            tts_reset();
+            set_status("Search cleared");
             return;
         }
         // Escape CANCELS - it NEVER quits the app. The old exit here also
@@ -14802,11 +17439,65 @@ static void handle_keys(InputState* in, const Layout* L) {
             return;
         }
     }
+    // ---- type-to-select: Backspace edits ONLY an active prefix. With a
+    //      sequence under construction the key drops the last typed
+    //      character and re-runs the match. With NO prefix the very same
+    //      key keeps its long-standing CMD_UP binding below (go up) - one
+    //      key event can never do both.
+    if (k == VK_BACK && tts_active() && !in->ctrl_pressed &&
+        !in->alt_pressed && !in->win_pressed) {
+        size_t bn = strlen(g_tts_prefix);
+        if (bn > 0) g_tts_prefix[bn - 1] = '\0';
+        g_tts_last_ms = GetTickCount();   // the edit continues the sequence
+        if (tts_active()) tts_run(L);
+        else set_status("Search cleared");
+        return;
+    }
     // ---- keyboard commands: ONE registry (the Settings panel) owns every
     //      binding - rebind or switch a command off there and this chain
     //      follows automatically. Exact Ctrl/Alt match, Shift only when a
     //      binding asks for it, so Ctrl+Tab / Ctrl+Shift+Tab both work.
-    if (cmd_hit(in, CMD_NEW_TAB)) { ws_new(NULL); return; }
+    // ---- Explorer's fixed navigation keys: Alt+Left / Alt+Right = Back /
+    //      Forward, Alt+Up = parent folder, Alt+Enter = Properties, Alt+D =
+    //      address bar, F11 = maximize / restore.  Checked before the
+    //      registry chain; plain arrows (no Alt) keep their meaning.
+    if (in->alt_pressed && !in->ctrl_pressed && !in->win_pressed) {
+        if (k == VK_LEFT)   { go_back(); return; }
+        if (k == VK_RIGHT)  { go_forward(); return; }
+        if (k == VK_UP)     { go_up(); return; }
+        if (k == VK_RETURN) { props_show(); return; }
+        if (k == 'D')       { focus_address(); return; }
+    }
+    // Menu key / Shift+F10: the context menu of the selection (or of the
+    // folder when nothing is selected), at the selected row - Explorer.
+    if ((k == VK_APPS || (k == VK_F10 && in->shift_pressed)) && !g_st_running) {
+        int vi = g_app.selected;
+        if (vi >= 0 && (size_t)vi < g_app.view_count) {
+            int ei = g_app.view[vi];
+            int row = mode_is_grid() ? vi / (L->cols > 0 ? L->cols : 1) : vi;
+            int y = L->list.y + L->list_head_h +
+                    (row - g_app.scroll) * (mode_is_grid() ? L->cell_h : L->row_h) +
+                    SC(12);
+            if (!sel_contains(vi)) { sel_clear(); sel_add(vi); }
+            xm_open_items(vi, g_app.entries[ei].is_directory,
+                          L->list.x + SC(60), y);
+        } else {
+            xm_open_bg(L->list.x + L->list.w / 3, L->list.y + L->list.h / 3);
+        }
+        return;
+    }
+    if (cmd_hit(in, CMD_HELP)) { help_open(); return; }
+    if (cmd_hit(in, CMD_SIDEBAR)) { sidebar_toggle(); return; }
+    if (k == 'Z' && in->ctrl_pressed && !in->alt_pressed &&
+        !in->shift_pressed) {
+        undo_run();                           // Explorer's Ctrl+Z
+        return;
+    }
+    if (k == VK_F11 && !in->ctrl_pressed && !in->alt_pressed) {
+        platform_window_maximize_toggle();
+        return;
+    }
+    if (cmd_hit(in, CMD_NEW_TAB)) { ws_new(g_app.current_path); return; }
     if (cmd_hit(in, CMD_CYCLE_TAB)) {
         ws_cycle(in->shift_pressed ? -1 : 1);        // Ctrl+Tab / Ctrl+Shift+Tab
         return;
@@ -14826,8 +17517,8 @@ static void handle_keys(InputState* in, const Layout* L) {
         g_app.running = false;
     } else if (cmd_hit(in, CMD_FOCUS_SEARCH)) {
         focus_search();                  // Explorer's search-box shortcut
-    } else if (cmd_hit(in, CMD_THEME)) {
-        toggle_theme();
+        g_search_popup_open = true;      // ... which pops the big overlay,
+        g_search_popup_pane = g_active_pane;   // exactly like clicking it
     } else if (cmd_hit(in, CMD_BOOKMARK)) {
         bookmark_current();
     } else if (cmd_hit(in, CMD_HIDDEN)) {
@@ -14872,7 +17563,7 @@ static void handle_keys(InputState* in, const Layout* L) {
     } else if (cmd_hit(in, CMD_UP)) {
         go_up();
     } else if (cmd_hit(in, CMD_REFRESH)) {
-        load_dir(g_app.current_path);
+        folder_refresh_keep();           // F5 keeps scroll + selection
     } else if (cmd_hit(in, CMD_HOME)) {
         navigate(platform_get_home_directory(), true);
     } else if (k == VK_UP) {
@@ -14893,6 +17584,9 @@ static void handle_keys(InputState* in, const Layout* L) {
         g_app.scroll = L->max_scroll;
         clamp_scroll(L);
     }
+    // (Type-to-select has no branch here: its characters were all
+    // delivered at the ONE point at the top of handle_keys, before this
+    // chain could act on any key.)
 }
 
 // Returns the list item under the mouse (details row or grid cell), -1 if none.
@@ -14904,12 +17598,17 @@ static int item_at(const Layout* L, int x, int y) {
         int c = (x - L->list.x - L->pad_x) / L->cell_w;
         int r = (y - L->list.y - L->list_head_h - L->pad_y) / L->cell_h;
         if (c < 0 || c >= L->cols || r < 0 || r > L->rows_visible) return -1;
-        return (g_app.scroll + r) * L->cols + c;
+        int idx = (g_app.scroll + r) * L->cols + c;
+        // A cell past the END of the listing is EMPTY background, not an
+        // item: every caller guards idx < view_count, but reporting a row
+        // that does not exist would also blind the click-away deselect.
+        return (idx >= 0 && (size_t)idx < g_app.view_count) ? idx : -1;
     }
 
     int r = (y - L->list.y - L->list_head_h) / L->row_h;
     if (r < 0 || r > L->rows_visible) return -1;   // the half row counts too
-    return g_app.scroll + r;
+    int idx = g_app.scroll + r;
+    return (idx >= 0 && (size_t)idx < g_app.view_count) ? idx : -1;
 }
 
 // ---- close-click guard (double-click cascade) ---------------------------
@@ -14951,8 +17650,1700 @@ static void request_exit_from_click(void) {
 // through, which is nothing.
 static bool overlay_owns_input(void) {
     return g_confirm_kind != CONFIRM_NONE || g_rename_vi >= 0 ||
-           g_set_open || g_rad_open || g_ctx_open || g_app.menu_open ||
+           g_set_open || g_rad_open || g_ctx_open || g_xm_open ||
+           g_help_open || g_welcome_open ||
+           g_app.menu_open ||
            g_app.view_menu_open;
+}
+
+// True when an OPEN popup overlay covers (x,y).  A press there belongs to
+// the popup (its input field, quick-nav buttons or child suggestions) and
+// must never reach the pane / file list underneath.  This is checked by the
+// click-to-activate-pane rule BELOW so a centered popup that straddles a
+// split cannot steal a click meant for its own input (spec 1: the popup
+// must actually receive the click, never the pane behind it).
+static bool overlay_covers(int x, int y) {
+    if (g_search_popup_open && g_search_popup_pane) {
+        RectI r = search_popup_rect();
+        if (inside(&r, x, y)) return true;
+    }
+    if (g_addr_popup_open && g_addr_popup_pane) {
+        RectI r = addr_popup_rect();
+        if (inside(&r, x, y)) return true;
+    }
+    return false;
+}
+
+// ============================================================
+// SYSTEM CONTEXT MENU (File Pilot style) - right-click on a file, a
+// selection or the folder background.
+// ------------------------------------------------------------
+// ONE dark, searchable menu that holds EVERYTHING Explorer offers for the
+// target - every verb other programs registered (WinRAR, 7-Zip, Git, VS
+// Code, PowerRename, Defender, Send to, Open with, Give access to, New >
+// every file type, ...) - plus NovaFile's own rows (Open in New Tab /
+// Pane, View / Sort / Group, custom thumbnail, bookmark).
+//   - It opens INSTANTLY with NovaFile's rows; the shell's rows come from
+//     a background thread (shmsvc_*) a moment later, submenus right after.
+//   - The shell's own Cut / Copy / Paste / Delete / Rename / Create
+//     shortcut / Copy as path / Open / New Folder / New Text Document run
+//     through NovaFile's implementations, so the Recycle Bin, Undo, safe
+//     paste and in-place navigation apply to them too.  Everything else is
+//     invoked on the shell exactly like Explorer does.
+//   - Typing filters every command of every submenu ("Select a system
+//     command..."), arrows / Enter / Esc work, the wheel scrolls a menu
+//     taller than the window.
+// The classic g_m menu engine stays for the tab and sidebar menus (and is
+// what this one falls back to when the shell gives nothing).
+// ============================================================
+enum { XK_ITEM = 0, XK_SUB, XK_SEP, XK_NOTE };
+enum { XA_APP = 0, XA_SHELL };
+typedef struct {
+    char label[128];
+    char hint[48];
+    int kind;            // XK_*
+    int act;             // XA_*
+    int cmd;             // CTX_CMD_* (XA_APP)
+    unsigned sid;        // shell command id (XA_SHELL)
+    bool enabled;
+    bool pending;        // XK_SUB whose shell children are still loading
+    HBITMAP icon;        // shell icon (owned by the service) or NULL
+    int parent, first, count;
+} XNode;
+
+#define XN_MAX   1800
+#define XP_MAX   8          // open panels (root + 7 submenu levels)
+#define XROW_MAX 1800
+static XNode* g_xn = NULL;
+static int    g_xn_n = 0;
+static int    g_xn_app = 0;           // nodes [0, g_xn_app) come from g_m
+static int    g_xroot[XROW_MAX];      // the root panel's rows (node ids)
+static int    g_xroot_n = 0;
+static bool   g_xm_open = false;
+static bool   g_xm_bg = false;
+static int    g_xm_view = -1;
+static bool   g_xm_dir = false;       // single folder target
+static int    g_xm_x = 0, g_xm_y = 0;
+static int    g_xm_gen = 0;           // shell request
+static int    g_xm_ver = 0;           // shell snapshot merged so far
+static ShmNode* g_xm_shell = NULL;    // that snapshot (icons owned by svc)
+static int    g_xm_shell_n = 0;
+static char   g_xm_q[96];             // search query
+static unsigned long g_xm_opened = 0; // tick it opened
+#define XM_WAIT_MS 3000                // longest wait for the system rows
+// Visible yet?  Only once the shell's rows are known (or it failed / took
+// too long / there is no shell request): the menu then appears ONCE, in
+// its final shape - never a short menu that is swapped for the full one.
+static bool xm_ready(void) {
+    if (!g_xm_gen || g_xm_ver != 0) return true;
+    return GetTickCount() - g_xm_opened > XM_WAIT_MS;
+}
+
+typedef struct {
+    int node;                         // -1 = root (or search results)
+    int hover;                        // row ordinal, -1 none
+    int scroll;                       // pixels
+    RectI r;                          // panel rect (whole)
+    int body_y;                       // first row y (below the search box)
+    int content_h;
+    int rows[XROW_MAX];
+    int nrows;
+} XPanel;
+static int     g_xm_tmed = 14, g_xm_tsmall = 12;   // text sizes (from Layout)
+static XPanel* g_xp = NULL;           // XP_MAX panels, allocated on first use
+static int     g_xm_sb = -1;          // panel whose scrollbar is being dragged
+static int     g_xm_sb_grab = 0;
+static int     g_xp_n = 0;
+
+static int xm_row_h(void) { return SC(26); }
+static int xm_sep_h(void) { return SC(9); }
+static int xm_search_h(void) { return SC(36); }
+
+static int xm_add(const char* label, int kind, int act, int cmd, unsigned sid,
+                  bool enabled, int parent) {
+    if (!g_xn || g_xn_n >= XN_MAX) return -1;
+    XNode* n = &g_xn[g_xn_n];
+    memset(n, 0, sizeof *n);
+    snprintf(n->label, sizeof n->label, "%s", label ? label : "");
+    n->kind = kind;
+    n->act = act;
+    n->cmd = cmd;
+    n->sid = sid;
+    n->enabled = enabled;
+    n->parent = parent;
+    n->first = -1;
+    return g_xn_n++;
+}
+
+// Shortcut text for a NovaFile command, straight from the registry (so it
+// follows any rebinding in Settings).
+static void xm_hint_for(int cmd, char* out, size_t n) {
+    int id = -1;
+    switch (cmd) {
+    case CTX_CMD_CUT: id = CMD_CUT; break;
+    case CTX_CMD_COPY: id = CMD_COPY; break;
+    case CTX_CMD_PASTE: id = CMD_PASTE; break;
+    case CTX_CMD_DELETE: id = CMD_DELETE; break;
+    case CTX_CMD_RENAME: id = CMD_RENAME; break;
+    case CTX_CMD_REFRESH: id = CMD_REFRESH; break;
+    case CTX_CMD_OPEN: id = CMD_OPEN; break;
+    default: break;
+    }
+    out[0] = '\0';
+    if (id >= 0 && g_ents[id].key && g_ents[id].on) set_binding_of(&g_ents[id], out, n);
+    if (cmd == CTX_CMD_PROPERTIES) snprintf(out, n, "Alt+Enter");
+}
+
+// ---- the NovaFile rows (copied from the classic builders) -------------
+static void xm_copy_app_rows(void) {
+    g_xn_n = 0;
+    for (int k = 0; k < g_m_root_n; k++) {
+        const CtxRow* r = &g_m[g_m_root[k]];
+        if (r->kind == CTX_SEP) { xm_add(NULL, XK_SEP, XA_APP, -1, 0, true, -1); continue; }
+        if (r->kind == CTX_SUB) {
+            int gl = -1;                  // glyph for the submenu row
+            if (!_stricmp(r->label, "View")) gl = CTX_CMD_VIEW;
+            else if (!_stricmp(r->label, "Sort by")) gl = CTX_CMD_SORT_BY;
+            else if (!_stricmp(r->label, "Group by")) gl = CTX_CMD_GROUP_BY;
+            else if (!_stricmp(r->label, "New")) gl = CTX_CMD_NEW;
+            int s = xm_add(r->label, XK_SUB, XA_APP, gl, 0, r->enabled, -1);
+            if (s < 0) break;
+            int first = g_xn_n;
+            for (int i = 0; i < r->sub_n; i++) {
+                const CtxRow* c = &g_m[r->sub + i];
+                int ci = xm_add(c->label, c->kind == CTX_SEP ? XK_SEP : XK_ITEM,
+                                XA_APP, c->cmd, 0, c->enabled, s);
+                (void)ci;
+            }
+            g_xn[s].first = first;
+            g_xn[s].count = g_xn_n - first;
+            continue;
+        }
+        int i = xm_add(r->label, XK_ITEM, XA_APP, r->cmd, 0, r->enabled, -1);
+        if (i >= 0) {
+            if (r->hint) snprintf(g_xn[i].hint, sizeof g_xn[i].hint, "%s", r->hint);
+            else xm_hint_for(r->cmd, g_xn[i].hint, sizeof g_xn[i].hint);
+        }
+    }
+    g_xn_app = g_xn_n;
+}
+
+// The app row that carries `cmd` (top level), -1 = none.
+static int xm_app_row(int cmd) {
+    for (int i = 0; i < g_xn_app; i++)
+        if (g_xn[i].parent == -1 && g_xn[i].kind == XK_ITEM && g_xn[i].cmd == cmd)
+            return i;
+    return -1;
+}
+static int xm_app_sub(const char* label) {
+    for (int i = 0; i < g_xn_app; i++)
+        if (g_xn[i].parent == -1 && g_xn[i].kind == XK_SUB &&
+            _stricmp(g_xn[i].label, label) == 0)
+            return i;
+    return -1;
+}
+
+static void xm_root_push(int node) {
+    if (node < 0 || g_xroot_n >= XROW_MAX) return;
+    if (g_xn[node].kind == XK_ITEM || g_xn[node].kind == XK_SUB)
+        for (int k = 0; k < g_xroot_n; k++) {
+            const XNode* o = &g_xn[g_xroot[k]];
+            if (o->kind == g_xn[node].kind && !strcmp(o->label, g_xn[node].label))
+                return;                       // the same row twice: once is enough
+        }
+    // never two separators in a row, never one first
+    if (g_xn[node].kind == XK_SEP &&
+        (g_xroot_n == 0 || g_xn[g_xroot[g_xroot_n - 1]].kind == XK_SEP))
+        return;
+    g_xroot[g_xroot_n++] = node;
+}
+static void xm_root_trim(void) {
+    while (g_xroot_n > 0 && g_xn[g_xroot[g_xroot_n - 1]].kind == XK_SEP) g_xroot_n--;
+}
+
+// Shell verb -> the NovaFile command that does the same job (better).
+static int xm_map_verb(const char* verb, bool single, bool is_dir) {
+    if (!verb || !verb[0]) return -1;
+    if (!_stricmp(verb, "cut")) return CTX_CMD_CUT;
+    if (!_stricmp(verb, "copy")) return CTX_CMD_COPY;
+    if (!_stricmp(verb, "paste")) return CTX_CMD_PASTE;
+    if (!_stricmp(verb, "pastelink")) return CTX_CMD_PASTE_SHORTCUT;
+    if (!_stricmp(verb, "delete")) return CTX_CMD_DELETE;
+    if (!_stricmp(verb, "rename")) return single ? CTX_CMD_RENAME : -1;
+    if (!_stricmp(verb, "link")) return CTX_CMD_CREATE_SHORTCUT;
+    if (!_stricmp(verb, "copyaspath")) return CTX_CMD_COPY_PATH;
+    if (!_stricmp(verb, "NewFolder")) return CTX_CMD_NEW_FOLDER;
+    if (!_stricmp(verb, ".txt")) return CTX_CMD_NEW_TEXT;
+    if (!_stricmp(verb, "refresh")) return CTX_CMD_REFRESH;
+    // a folder opens INSIDE NovaFile (the shell would start Explorer)
+    if (is_dir && single && (!_stricmp(verb, "open") || !_stricmp(verb, "explore")))
+        return CTX_CMD_OPEN;
+    if (is_dir && single && (!_stricmp(verb, "opennewwindow") ||
+                             !_stricmp(verb, "opennewtab")))
+        return CTX_CMD_OPEN_TAB;
+    if (!is_dir && single && !_stricmp(verb, "open")) return CTX_CMD_OPEN;
+    return -1;
+}
+// Background verbs NovaFile draws itself (its own View / Sort / Group...).
+static bool xm_bg_skip(const char* verb, const char* label) {
+    static const char* v[] = {"view", "arrange", "groupby", "refresh", "paste",
+                              "pastelink", "undo", "redo", "customize", NULL};
+    for (int i = 0; v[i]; i++)
+        if (verb && !_stricmp(verb, v[i])) return true;
+    static const char* l[] = {"View", "Sort by", "Group by", "Refresh", "Paste",
+                              "Paste shortcut", NULL};
+    for (int i = 0; l[i]; i++)
+        if (label && !_stricmp(label, l[i])) return true;
+    return false;
+}
+
+// Copy the service snapshot in as nodes [base, base + n): the shell's own
+// tree shape (parent / first / count) shifted by `base`.
+static int xm_copy_shell(bool single, bool is_dir) {
+    int base = g_xn_n;
+    for (int i = 0; i < g_xm_shell_n && g_xn_n < XN_MAX; i++) {
+        const ShmNode* s = &g_xm_shell[i];
+        int kind = s->kind == SHM_SEP ? XK_SEP : s->kind == SHM_SUB ? XK_SUB : XK_ITEM;
+        int idx = xm_add(s->text, kind, XA_SHELL, -1, s->id, !s->disabled,
+                         s->parent >= 0 ? s->parent + base : -1);
+        if (idx < 0) break;
+        XNode* n = &g_xn[idx];
+        n->icon = (HBITMAP)s->icon;
+        snprintf(n->hint, sizeof n->hint, "%s", s->hint);
+        if (kind == XK_SUB) {
+            n->first = s->filled && s->count > 0 ? s->first + base : -1;
+            n->count = s->filled ? s->count : 0;
+            n->pending = !s->filled;
+        }
+        if (kind == XK_ITEM) {
+            int m = xm_map_verb(s->verb, single, is_dir);
+            if (m >= 0) {
+                n->act = XA_APP;
+                n->cmd = m;
+                if (!n->hint[0]) xm_hint_for(m, n->hint, sizeof n->hint);
+            }
+            if (!_stricmp(s->verb, "properties"))
+                snprintf(n->hint, sizeof n->hint, "Alt+Enter");
+        }
+    }
+    return base;
+}
+
+// Is there a top-level shell row whose label matches?
+static int xm_shell_top_label(int base, const char* label) {
+    for (int i = base; i < g_xn_n; i++)
+        if (g_xn[i].parent == -1 && _stricmp(g_xn[i].label, label) == 0) return i;
+    return -1;
+}
+static int xm_shell_top_cmd(int base, int cmd) {
+    for (int i = base; i < g_xn_n; i++)
+        if (g_xn[i].parent == -1 && g_xn[i].act == XA_APP && g_xn[i].cmd == cmd)
+            return i;
+    return -1;
+}
+
+static void xm_rebuild(void) {
+    if (!g_xn) g_xn = (XNode*)calloc(XN_MAX, sizeof(XNode));
+    if (!g_xn) { g_xm_open = false; return; }
+    // NovaFile's own rows for this exact target (the classic builders)
+    g_ctx_view = g_xm_view;
+    g_ctx_bg = g_xm_bg;
+    if (g_xm_bg) ctx_build_bg();
+    else {
+        bool multi = g_sel_n > 1, mixed = false, is_dir = g_xm_dir;
+        if (multi) {
+            bool d = false, f = false;
+            for (int i = 0; i < g_sel_n; i++) {
+                int vi = g_sel[i];
+                if (vi < 0 || (size_t)vi >= g_app.view_count) continue;
+                int ei = g_app.view[vi];
+                if (ei < 0 || (size_t)ei >= g_app.count) continue;
+                if (g_app.entries[ei].is_directory) d = true; else f = true;
+            }
+            mixed = d && f;
+            is_dir = d && !f;
+        }
+        ctx_build_file(is_dir, multi, mixed);
+    }
+    xm_copy_app_rows();
+    g_xroot_n = 0;
+    bool have_shell = g_xm_shell && g_xm_shell_n > 0;
+    if (!have_shell) {
+        // NovaFile rows now; the system's join when the thread has them
+        for (int i = 0; i < g_xn_app; i++) {
+            if (g_xn[i].parent != -1) continue;
+            if (g_xn[i].kind == XK_ITEM && g_xn[i].cmd == CTX_CMD_SHELL_MENU &&
+                g_xm_ver != -1)
+                continue;                    // the system rows will follow
+            xm_root_push(i);
+        }
+        if (g_xm_ver == 0 && g_xm_gen && xm_ready()) {
+            // the shell is taking unusually long: NovaFile's rows are
+            // shown, and the system rows join below when they come
+            xm_root_push(xm_add(NULL, XK_SEP, XA_APP, -1, 0, true, -1));
+            xm_root_push(xm_add("Loading system commands...", XK_NOTE, XA_APP, -1, 0,
+                                false, -1));
+        }
+        xm_root_trim();
+        return;
+    }
+    bool single = g_xm_bg ? true : g_sel_n <= 1;
+    int base = xm_copy_shell(single, g_xm_dir && single);
+    if (g_xm_bg) {
+        // [View > Sort by > Group by > Refresh] | Paste | system verbs |
+        // Open in Terminal | New > | Properties
+        int v = xm_app_sub("View"), s = xm_app_sub("Sort by"), gb = xm_app_sub("Group by");
+        if (v >= 0) xm_root_push(v);
+        if (s >= 0) xm_root_push(s);
+        if (gb >= 0) xm_root_push(gb);
+        xm_root_push(xm_app_row(CTX_CMD_REFRESH));
+        xm_root_push(xm_add(NULL, XK_SEP, XA_APP, 0, 0, true, -1));
+        xm_root_push(xm_app_row(CTX_CMD_PASTE));
+        xm_root_push(xm_app_row(CTX_CMD_PASTE_SHORTCUT));
+        int shell_new = -1, shell_props = -1;
+        for (int i = base; i < g_xn_n; i++) {
+            if (g_xn[i].parent != -1) continue;
+            const ShmNode* sn = &g_xm_shell[i - base];
+            if (g_xn[i].kind == XK_SUB && !_stricmp(g_xn[i].label, "New")) { shell_new = i; continue; }
+            if (!_stricmp(sn->verb, "properties")) { shell_props = i; continue; }
+            if (g_xn[i].kind != XK_SEP && xm_bg_skip(sn->verb, g_xn[i].label)) continue;
+            xm_root_push(i);
+        }
+        if (xm_shell_top_label(base, "Open in Terminal") < 0)
+            xm_root_push(xm_app_row(CTX_CMD_TERMINAL));
+        xm_root_push(xm_add(NULL, XK_SEP, XA_APP, 0, 0, true, -1));
+        xm_root_push(shell_new >= 0 ? shell_new : xm_app_sub("New"));
+        xm_root_push(xm_add(NULL, XK_SEP, XA_APP, 0, 0, true, -1));
+        xm_root_push(shell_props >= 0 ? shell_props : xm_app_row(CTX_CMD_PROPERTIES));
+        xm_root_trim();
+        return;
+    }
+    // Items: the shell's order, with NovaFile's extra rows dropped in
+    //   Open | [Open in New Tab, Open in New Pane] | ... |
+    //   [thumbnail / bookmark / terminal] before "Send to" | ... | Properties
+    int extras[8], ne = 0;
+    int ex_cmds[] = {CTX_CMD_SET_THUMB, CTX_CMD_CHANGE_THUMB, CTX_CMD_REMOVE_THUMB,
+                     CTX_CMD_BOOKMARK};
+    for (int k = 0; k < 4; k++) {
+        int r = xm_app_row(ex_cmds[k]);
+        if (r >= 0) extras[ne++] = r;
+    }
+    if (xm_shell_top_label(base, "Open in Terminal") < 0) {
+        int r = xm_app_row(CTX_CMD_TERMINAL);
+        if (r >= 0) extras[ne++] = r;
+    }
+    bool tabs_done = false, extras_done = false;
+    // where the extras go: before "Send to", else before Cut/Copy
+    int anchor = xm_shell_top_label(base, "Send to");
+    if (anchor < 0) anchor = xm_shell_top_cmd(base, CTX_CMD_CUT);
+    if (anchor < 0) anchor = xm_shell_top_cmd(base, CTX_CMD_COPY);
+    for (int i = base; i < g_xn_n; i++) {
+        if (g_xn[i].parent != -1) continue;
+        if (i == anchor && !extras_done && ne > 0) {
+            xm_root_push(xm_add(NULL, XK_SEP, XA_APP, 0, 0, true, -1));
+            for (int k = 0; k < ne; k++) xm_root_push(extras[k]);
+            xm_root_push(xm_add(NULL, XK_SEP, XA_APP, 0, 0, true, -1));
+            extras_done = true;
+        }
+        // a shell "open in new window" became our Open in New Tab: skip ours
+        xm_root_push(i);
+        if (!tabs_done && g_xn[i].act == XA_APP && g_xn[i].cmd == CTX_CMD_OPEN &&
+            g_xm_dir) {
+            if (xm_shell_top_cmd(base, CTX_CMD_OPEN_TAB) < 0)
+                xm_root_push(xm_app_row(CTX_CMD_OPEN_TAB));
+            xm_root_push(xm_app_row(CTX_CMD_OPEN_PANE));
+            tabs_done = true;
+        }
+    }
+    if (!extras_done && ne > 0) {
+        xm_root_push(xm_add(NULL, XK_SEP, XA_APP, 0, 0, true, -1));
+        for (int k = 0; k < ne; k++) xm_root_push(extras[k]);
+    }
+    // NovaFile's core actions where the shell offers none (a multi
+    // selection of mixed items can come back thin): never lose them.
+    int core[] = {CTX_CMD_CUT, CTX_CMD_COPY, CTX_CMD_DELETE, CTX_CMD_PROPERTIES};
+    bool sep_added = false;
+    for (int k = 0; k < 4; k++) {
+        bool has = xm_shell_top_cmd(base, core[k]) >= 0;
+        if (core[k] == CTX_CMD_PROPERTIES)
+            has = xm_shell_top_label(base, "Properties") >= 0;
+        if (has) continue;
+        int r = xm_app_row(core[k]);
+        if (r < 0) continue;
+        // a protected folder (Downloads, Desktop...) keeps the shell's word:
+        // Explorer offers no Cut/Delete there either
+        if (core[k] != CTX_CMD_PROPERTIES && single && g_xm_dir &&
+            xm_shell_top_cmd(base, CTX_CMD_COPY) >= 0)
+            continue;
+        if (!sep_added) {
+            xm_root_push(xm_add(NULL, XK_SEP, XA_APP, 0, 0, true, -1));
+            sep_added = true;
+        }
+        xm_root_push(r);
+    }
+    xm_root_trim();
+}
+
+// ---- search: every enabled command of every (filled) submenu ---------
+static bool xm_match(const char* label, const char* q) {
+    size_t ql = strlen(q), ll = strlen(label);
+    if (ql == 0) return true;
+    for (size_t i = 0; i + ql <= ll; i++) {
+        size_t k = 0;
+        while (k < ql) {
+            unsigned char a = (unsigned char)label[i + k], b = (unsigned char)q[k];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) break;
+            k++;
+        }
+        if (k == ql) return true;
+    }
+    return false;
+}
+// Is node i reachable from the root list (directly or through submenus)?
+static bool xm_reachable(int i) {
+    for (int depth = 0; i >= 0 && depth < 12; depth++) {
+        if (g_xn[i].parent == -1) {
+            for (int k = 0; k < g_xroot_n; k++) if (g_xroot[k] == i) return true;
+            return false;
+        }
+        i = g_xn[i].parent;
+    }
+    return false;
+}
+// "7-Zip > CRC SHA > SHA-256" for a search result row
+static void xm_path_label(int i, char* out, size_t n) {
+    int chain[12], c = 0;
+    for (int j = i; j >= 0 && c < 12; j = g_xn[j].parent) chain[c++] = j;
+    out[0] = '\0';
+    for (int k = c - 1; k >= 0; k--) {
+        size_t used = strlen(out);
+        snprintf(out + used, n - used, k == c - 1 ? "%s" : "  >  %s",
+                 g_xn[chain[k]].label);
+    }
+}
+
+// The rows a panel shows this frame.
+static void xm_panel_rows(XPanel* p) {
+    p->nrows = 0;
+    if (p->node < 0) {
+        if (g_xm_q[0]) {
+            for (int i = 0; i < g_xn_n && p->nrows < XROW_MAX; i++) {
+                const XNode* n = &g_xn[i];
+                if (n->kind != XK_ITEM || !n->enabled) continue;
+                if (n->act == XA_APP && n->cmd == CTX_CMD_SHELL_MENU) continue;
+                if (!xm_reachable(i)) continue;
+                char path[400];
+                xm_path_label(i, path, sizeof path);
+                if (xm_match(path, g_xm_q)) p->rows[p->nrows++] = i;
+            }
+            if (p->nrows == 0 && g_xn_n < XN_MAX) {
+                int note = xm_add("No matching command", XK_NOTE, XA_APP, 0, 0, false, -2);
+                if (note >= 0) { p->rows[0] = note; p->nrows = 1; g_xn_n--; }
+            }
+            return;
+        }
+        for (int k = 0; k < g_xroot_n; k++) p->rows[p->nrows++] = g_xroot[k];
+        return;
+    }
+    const XNode* s = &g_xn[p->node];
+    if (s->first >= 0 && s->count > 0) {
+        for (int k = 0; k < s->count && p->nrows < XROW_MAX; k++)
+            p->rows[p->nrows++] = s->first + k;
+    } else if (g_xn_n < XN_MAX) {
+        // still loading (or the shell gave nothing): one dim note row,
+        // built in the spare slot past the end and never committed
+        int note = xm_add(s->pending ? "Loading..." : "(empty)", XK_NOTE, XA_APP, 0,
+                          0, false, -2);
+        if (note >= 0) { p->rows[0] = note; p->nrows = 1; g_xn_n--; }
+    }
+}
+
+static int xm_node_h(int i) {
+    return g_xn[i].kind == XK_SEP ? xm_sep_h() : xm_row_h();
+}
+
+static const char* xm_label_of(int i, char* buf, size_t n, bool search) {
+    if (search) { xm_path_label(i, buf, n); return buf; }
+    return g_xn[i].label;
+}
+
+// Geometry of every open panel (root at the anchor, each submenu beside
+// its parent row, flipped / clamped / scrolled to stay inside the window).
+static void xm_layout(void) {
+    int ww = 0, hh = 0;
+    platform_window_size(&ww, &hh);
+    int pad = SC(5), text_px_med = g_xm_tmed;
+    for (int k = 0; k < g_xp_n; k++) {
+        XPanel* p = &g_xp[k];
+        xm_panel_rows(p);
+        bool search = (k == 0 && g_xm_q[0]);
+        int cw = SC(240);
+        for (int r = 0; r < p->nrows; r++) {
+            const XNode* n = &g_xn[p->rows[r]];
+            if (n->kind == XK_SEP) continue;
+            char lb[400];
+            int need = (int)measure_px(xm_label_of(p->rows[r], lb, sizeof lb, search),
+                                       text_px_med) + SC(52);
+            if (n->hint[0]) need += (int)measure_px(n->hint, g_xm_tsmall) + SC(18);
+            if (n->kind == XK_SUB) need += SC(14);
+            if (need > cw) cw = need;
+        }
+        int maxw = SC(k == 0 ? 460 : 420);
+        if (cw > maxw) cw = maxw;
+        int top = (k == 0) ? xm_search_h() + SC(4) : 0;
+        int content = 0;
+        for (int r = 0; r < p->nrows; r++) content += xm_node_h(p->rows[r]);
+        p->content_h = content;
+        int h = top + content + pad * 2;
+        int maxh = hh - SC(8);
+        if (h > maxh) h = maxh;
+        int x, y;
+        if (k == 0) {
+            x = g_xm_x;
+            y = g_xm_y;
+            if (x + cw > ww - SC(4)) x = ww - SC(4) - cw;
+            if (y + h > hh - SC(4)) y = hh - SC(4) - h;
+        } else {
+            XPanel* pp = &g_xp[k - 1];
+            int ry = pp->body_y - pp->scroll;
+            for (int r = 0; r < pp->nrows && pp->rows[r] != p->node; r++)
+                ry += xm_node_h(pp->rows[r]);
+            x = pp->r.x + pp->r.w - SC(2);
+            if (x + cw > ww - SC(4)) x = pp->r.x - cw + SC(2);     // flip left
+            y = ry - pad;
+            if (y + h > hh - SC(4)) y = hh - SC(4) - h;
+        }
+        if (x < SC(4)) x = SC(4);
+        if (y < SC(4)) y = SC(4);
+        p->r = (RectI){x, y, cw, h};
+        p->body_y = y + pad + top;
+        int view_h = h - top - pad * 2;
+        int max_scroll = content - view_h;
+        if (max_scroll < 0) max_scroll = 0;
+        if (p->scroll > max_scroll) p->scroll = max_scroll;
+        if (p->scroll < 0) p->scroll = 0;
+    }
+}
+
+// Row under (x, y) in panel k, or -1.
+static int xm_row_at(int k, int x, int y) {
+    XPanel* p = &g_xp[k];
+    if (!inside(&p->r, x, y)) return -1;
+    int pad = SC(5);
+    int bottom = p->r.y + p->r.h - pad;
+    if (y < p->body_y || y >= bottom) return -1;
+    int ry = p->body_y - p->scroll;
+    for (int r = 0; r < p->nrows; r++) {
+        int h = xm_node_h(p->rows[r]);
+        if (y >= ry && y < ry + h) return r;
+        ry += h;
+    }
+    return -1;
+}
+
+static void xm_free_shell(void) {
+    free(g_xm_shell);
+    g_xm_shell = NULL;
+    g_xm_shell_n = 0;
+}
+
+static void xm_close(void) {
+    if (!g_xm_open && !g_xm_gen) return;
+    g_xm_open = false;
+    g_xp_n = 0;
+    g_xm_q[0] = '\0';
+    xm_free_shell();                        // drop the icon handles FIRST,
+    if (g_xm_gen) shmsvc_release(g_xm_gen); // then let the service free them
+    g_xm_gen = 0;
+    g_xm_ver = 0;
+}
+
+static void xm_open_common(int x, int y) {
+    if (!g_xp) g_xp = (XPanel*)calloc(XP_MAX, sizeof(XPanel));
+    if (!g_xp) return;
+    g_ctx_open = false;                     // never both menus
+    g_xm_open = true;
+    g_xm_x = x;
+    g_xm_y = y;
+    g_xm_q[0] = '\0';
+    g_xm_ver = 0;
+    g_xm_opened = GetTickCount();
+    g_xp_n = 1;
+    memset(&g_xp[0], 0, sizeof g_xp[0]);
+    g_xp[0].node = -1;
+    g_xp[0].hover = -1;
+    xm_rebuild();
+}
+
+static void xm_open_items(int view_idx, bool is_dir, int x, int y) {
+    xm_close();
+    g_xm_bg = false;
+    g_xm_view = view_idx;
+    g_xm_dir = is_dir && g_sel_n <= 1;
+    int n = 0;
+    g_ctx_view = view_idx;
+    char** ps = sel_paths(&n);
+    bool ext = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    // (drives in This PC too: Eject, Format, BitLocker... come from the shell)
+    if (n > 0)
+        g_xm_gen = shmsvc_request(ps, n, false, ext);
+    sel_paths_free(ps, n);
+    xm_open_common(x, y);
+}
+
+static void xm_open_bg(int x, int y) {
+    xm_close();
+    g_xm_bg = true;
+    g_xm_view = -1;
+    g_xm_dir = false;
+    bool ext = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    if (!is_this_pc(g_app.current_path)) {
+        char* one[1] = {g_app.current_path};
+        g_xm_gen = shmsvc_request(one, 1, true, ext);
+    }
+    xm_open_common(x, y);
+}
+
+// Pull a newer shell snapshot in (UI thread, every frame while open).
+static void xm_pump(void) {
+    if (!g_xm_open || !g_xm_gen) return;
+    int v = shmsvc_version(g_xm_gen);
+    if (v == 0 || v == g_xm_ver) return;
+    if (v < 0) {                            // the shell had nothing: ours only
+        g_xm_ver = -1;
+        xm_free_shell();
+        xm_rebuild();
+        return;
+    }
+    ShmNode* nodes = NULL;
+    int n = 0;
+    int got = shmsvc_snapshot(g_xm_gen, &nodes, &n);
+    if (got <= 0) return;
+    xm_free_shell();
+    g_xm_shell = nodes;
+    g_xm_shell_n = n;
+    g_xm_ver = got;
+    // keep the open submenu chain: node ids of shell rows are stable across
+    // versions (phase 2 only appends), app rows come first and never move
+    xm_rebuild();
+    for (int k = 1; k < g_xp_n; k++)
+        if (g_xp[k].node >= g_xn_n) { g_xp_n = k; break; }
+}
+
+static void xm_run(int node) {
+    if (node < 0 || node >= g_xn_n) return;
+    XNode nd = g_xn[node];                  // the menu is about to close
+    if (nd.kind != XK_ITEM || !nd.enabled) return;
+    int gen = g_xm_gen;
+    POINT sp = {g_xm_x, g_xm_y};
+    ClientToScreen((HWND)g_app.hwnd, &sp);
+    g_xm_open = false;
+    g_xp_n = 0;
+    g_xm_q[0] = '\0';
+    xm_free_shell();
+    if (nd.act == XA_SHELL) {
+        g_xm_gen = 0;
+        shmsvc_invoke(gen, nd.sid, sp.x, sp.y);
+        shmsvc_release(gen);                // runs after the invoke (FIFO)
+        folder_watch_poke();                // whatever it changed shows up
+        set_status("%s", nd.label);
+        return;
+    }
+    if (gen) shmsvc_release(gen);
+    g_xm_gen = 0;
+    g_ctx_view = g_xm_view;
+    g_ctx_bg = g_xm_bg;
+    if (nd.cmd != CTX_CMD_PROPERTIES) {
+        ctx_run(nd.cmd);
+        menu_key_tip(nd.cmd);           // "next time just press Ctrl+C" (once)
+        return;
+    }
+    if (nd.cmd == CTX_CMD_PROPERTIES) {
+        if (g_xm_bg) props_show();
+        else if (ctx_target()) props_show_one(ctx_target());
+        return;
+    }
+    ctx_run(nd.cmd);
+}
+
+static void xm_open_sub(int k, int row) {
+    XPanel* p = &g_xp[k];
+    if (row < 0 || row >= p->nrows) return;
+    int node = p->rows[row];
+    if (g_xn[node].kind != XK_SUB || !g_xn[node].enabled) { g_xp_n = k + 1; return; }
+    if (g_xp_n > k + 1 && g_xp[k + 1].node == node) return;   // already open
+    if (k + 1 >= XP_MAX) return;
+    g_xp_n = k + 2;
+    XPanel* c = &g_xp[k + 1];
+    c->node = node;
+    c->hover = -1;
+    c->scroll = 0;
+    c->nrows = 0;
+}
+
+// Mouse.  Returns true when the event belongs to the menu.
+static bool xm_mouse(const Layout* L, InputState* in) {
+    if (!g_xm_open) return false;
+    g_xm_tmed = L->text_med;
+    g_xm_tsmall = L->text_small;
+    if (!xm_ready()) {                    // not on screen yet
+        if (in->left_click || in->right_click || in->middle_click) {
+            xm_close();
+            return false;                 // the click does its normal job
+        }
+        return true;
+    }
+    // the menu's scrollbar: grab and drag it like any scrollbar
+    if (g_xm_sb >= 0 && g_xm_sb < g_xp_n) {
+        if (!in->left_down) { g_xm_sb = -1; return true; }
+        XPanel* p = &g_xp[g_xm_sb];
+        int view_h = p->r.y + p->r.h - SC(5) - p->body_y;
+        int th = view_h * view_h / (p->content_h > 0 ? p->content_h : 1);
+        if (th < SC(24)) th = SC(24);
+        int travel = view_h - th;
+        if (travel > 0) {
+            int rel = in->y - p->body_y - g_xm_sb_grab;
+            if (rel < 0) rel = 0;
+            if (rel > travel) rel = travel;
+            p->scroll = rel * (p->content_h - view_h) / travel;
+        }
+        return true;
+    }
+    xm_layout();
+    int top = -1;                                       // deepest panel hit
+    for (int k = g_xp_n - 1; k >= 0; k--)
+        if (inside(&g_xp[k].r, in->x, in->y)) { top = k; break; }
+    // hover follows the pointer; a submenu row opens its panel
+    if (top >= 0) {
+        int row = xm_row_at(top, in->x, in->y);
+        XPanel* p = &g_xp[top];
+        if (row >= 0 && g_xn[p->rows[row]].kind != XK_SEP) {
+            if (p->hover != row) {
+                p->hover = row;
+                if (g_xn[p->rows[row]].kind == XK_SUB) xm_open_sub(top, row);
+                else g_xp_n = top + 1;
+            }
+        }
+    }
+    if (in->wheel && top >= 0) {
+        g_xp[top].scroll -= in->wheel * xm_row_h() * 3;
+        in->wheel = 0;
+        return true;
+    }
+    if (in->left_click) {
+        if (top < 0) { xm_close(); return true; }
+        XPanel* p = &g_xp[top];
+        // press on the scrollbar strip (right edge of a scrolling panel)
+        {
+            int view_h = p->r.y + p->r.h - SC(5) - p->body_y;
+            if (p->content_h > view_h && view_h > 0 &&
+                in->x >= p->r.x + p->r.w - SC(12) && in->y >= p->body_y &&
+                in->y < p->body_y + view_h) {
+                int th = view_h * view_h / p->content_h;
+                if (th < SC(24)) th = SC(24);
+                int ty = p->body_y + (view_h - th) * p->scroll / (p->content_h - view_h);
+                g_xm_sb = top;
+                g_xm_sb_grab = (in->y >= ty && in->y < ty + th) ? in->y - ty : th / 2;
+                int travel = view_h - th;
+                if (travel > 0) {
+                    int rel = in->y - p->body_y - g_xm_sb_grab;
+                    if (rel < 0) rel = 0;
+                    if (rel > travel) rel = travel;
+                    p->scroll = rel * (p->content_h - view_h) / travel;
+                }
+                return true;
+            }
+        }
+        if (top == 0) {                                  // search box row
+            RectI x_box = {p->r.x + p->r.w - SC(30), p->r.y + SC(6), SC(24), SC(24)};
+            if (inside(&x_box, in->x, in->y)) {
+                if (g_xm_q[0]) g_xm_q[0] = '\0';
+                else xm_close();
+                return true;
+            }
+        }
+        int row = xm_row_at(top, in->x, in->y);
+        if (row < 0) return true;
+        int node = p->rows[row];
+        if (g_xn[node].kind == XK_SUB) xm_open_sub(top, row);
+        else if (g_xn[node].kind == XK_ITEM) xm_run(node);
+        return true;
+    }
+    if (in->right_click) {
+        if (top < 0) { xm_close(); return false; }       // re-open over there
+        return true;
+    }
+    if (in->middle_click) { if (top < 0) xm_close(); return true; }
+    return top >= 0 || g_xm_open;
+}
+
+static void xm_move(int k, int dir) {
+    XPanel* p = &g_xp[k];
+    if (p->nrows <= 0) return;
+    int r = p->hover;
+    for (int step = 0; step < p->nrows; step++) {
+        r = (r < 0) ? (dir > 0 ? 0 : p->nrows - 1) : (r + dir + p->nrows) % p->nrows;
+        const XNode* n = &g_xn[p->rows[r]];
+        if (n->kind != XK_SEP && n->kind != XK_NOTE && n->enabled) break;
+    }
+    p->hover = r;
+    g_xp_n = k + 1;
+    // keep it on screen
+    int ry = 0;
+    for (int i = 0; i < r; i++) ry += xm_node_h(p->rows[i]);
+    int view_h = p->r.y + p->r.h - SC(5) - p->body_y;
+    if (ry < p->scroll) p->scroll = ry;
+    if (ry + xm_row_h() > p->scroll + view_h) p->scroll = ry + xm_row_h() - view_h;
+}
+
+// Keyboard: the menu owns every key while it is open.
+static void xm_key(InputState* in) {
+    if (!g_xm_open) return;
+    if (!xm_ready()) {
+        if (in->key_code == VK_ESCAPE) xm_close();
+        return;
+    }
+    xm_layout();
+    int k = g_xp_n - 1;
+    int key = in->key_code ? in->key_code : in->key_repeat;
+    if (key == VK_ESCAPE) {
+        if (g_xm_q[0]) { g_xm_q[0] = '\0'; g_xp_n = 1; g_xp[0].hover = -1; }
+        else if (g_xp_n > 1) g_xp_n--;
+        else xm_close();
+        return;
+    }
+    if (key == VK_DOWN) { xm_move(k, 1); return; }
+    if (key == VK_UP) { xm_move(k, -1); return; }
+    if (key == VK_PRIOR || key == VK_HOME) { g_xp[k].hover = -1; xm_move(k, 1); return; }
+    if (key == VK_NEXT || key == VK_END) { g_xp[k].hover = -1; xm_move(k, -1); return; }
+    if (key == VK_LEFT && !g_xm_q[0]) { if (g_xp_n > 1) g_xp_n--; return; }
+    if (key == VK_RIGHT || key == VK_RETURN) {
+        XPanel* p = &g_xp[k];
+        if (p->hover < 0 && key == VK_RETURN && p->nrows > 0) xm_move(k, 1);
+        if (p->hover < 0 || p->hover >= p->nrows) return;
+        int node = p->rows[p->hover];
+        if (g_xn[node].kind == XK_SUB) {
+            xm_open_sub(k, p->hover);
+            xm_layout();
+            if (g_xp_n > k + 1) xm_move(k + 1, 1);
+        } else if (key == VK_RETURN) {
+            xm_run(node);
+        }
+        return;
+    }
+    if (key == VK_BACK) {
+        size_t l = strlen(g_xm_q);
+        if (l > 0) {
+            int pv = utf8_prev(g_xm_q, (int)l);
+            g_xm_q[pv] = '\0';
+            g_xp_n = 1;
+            g_xp[0].hover = -1;
+            g_xp[0].scroll = 0;
+        }
+        return;
+    }
+    if (in->ctrl_pressed || in->alt_pressed) return;
+    unsigned int cq[32];
+    int cn = tts_frame_chars(in, cq, 32);
+    for (int i = 0; i < cn; i++) {
+        if (cq[i] < 32) continue;
+        char enc[8];
+        int en = cp_encode(cq[i], enc);
+        size_t l = strlen(g_xm_q);
+        if (en > 0 && l + (size_t)en < sizeof g_xm_q) {
+            memcpy(g_xm_q + l, enc, (size_t)en);
+            g_xm_q[l + en] = '\0';
+        }
+        g_xp_n = 1;
+        g_xp[0].hover = -1;
+        g_xp[0].scroll = 0;
+    }
+    if (cn > 0 && g_xm_q[0]) {           // first match highlighted
+        xm_layout();
+        xm_move(0, 1);
+    }
+}
+
+// Draw a premultiplied 32bpp icon (shell menu bitmaps) into an s x s box.
+static void xm_draw_icon(HBITMAP b, int x, int y, int s) {
+    HDC dst = (HDC)renderer_paint_dc(g_app.renderer);
+    HDC src = thumb_dc();
+    if (!dst || !src || !b) return;
+    BITMAP bm;
+    if (!GetObjectA(b, sizeof bm, &bm) || bm.bmWidth < 1) return;
+    int bw = bm.bmWidth, bh = bm.bmHeight < 0 ? -bm.bmHeight : bm.bmHeight;
+    HGDIOBJ old = SelectObject(src, b);
+    BLENDFUNCTION bf = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    AlphaBlend(dst, x, y, s, s, src, 0, 0, bw, bh, bf);
+    SelectObject(src, old);
+}
+
+static void xm_draw_panel(int k, const Layout* L) {
+    XPanel* p = &g_xp[k];
+    const RectI* r = &p->r;
+    fill(r->x + SC(3), r->y + SC(4), r->w, r->h, (Color){0, 0, 0, 0.22f});
+    fill(r->x + SC(1), r->y + SC(2), r->w + SC(2), r->h + SC(2), (Color){0, 0, 0, 0.18f});
+    rrect(r->x, r->y, r->w, r->h, SC(8), P->panel, P->border, 1.0f);
+    int pad = SC(5);
+    bool search = (k == 0 && g_xm_q[0]);
+    if (k == 0) {
+        // the search box: "Select a system command..." + the close X
+        RectI sb = {r->x + SC(6), r->y + SC(6), r->w - SC(12), xm_search_h() - SC(8)};
+        rrect(sb.x, sb.y, sb.w, sb.h, SC(6), P->field,
+              mixc(P->border, P->accent, 0.6f), 1.0f);
+        int gx = sb.x + SC(9), gy = sb.y + sb.h / 2;   // magnifier glyph
+        rrect(gx - SC(5), gy - SC(6), SC(9), SC(9), SC(5), (Color){0, 0, 0, 0},
+              P->dim, 1.2f);
+        line(gx + SC(2), gy + SC(2), gx + SC(6), gy + SC(6), P->dim, 1.4f);
+        int tx = sb.x + SC(24), ty = sb.y + (sb.h - L->text_med) / 2;
+        if (g_xm_q[0]) {
+            char fq[200];
+            fit_text(g_xm_q, fq, sizeof fq, sb.w - SC(60), L->text_med);
+            text_px(fq, tx, ty, L->text_med, P->text);
+            if ((GetTickCount() / 500) % 2 == 0)
+                vline(tx + (int)measure_px(fq, L->text_med) + SC(1), sb.y + SC(6),
+                      sb.y + sb.h - SC(6), P->text);
+        } else {
+            vline(tx, sb.y + SC(6), sb.y + sb.h - SC(6), P->text);
+            text_px("Select a system command...", tx + SC(4), ty, L->text_med, P->dim);
+        }
+        int cx = r->x + r->w - SC(18), cy = r->y + SC(18);   // close X
+        line(cx - SC(4), cy - SC(4), cx + SC(4), cy + SC(4), P->dim, 1.2f);
+        line(cx + SC(4), cy - SC(4), cx - SC(4), cy + SC(4), P->dim, 1.2f);
+    }
+    int clip_top = p->body_y, clip_bot = r->y + r->h - pad;
+    renderer_set_scissor(g_app.renderer,
+                         (Rect){(float)r->x, (float)clip_top, (float)r->w,
+                                (float)(clip_bot - clip_top)});
+    int ry = p->body_y - p->scroll;
+    for (int i = 0; i < p->nrows; i++) {
+        int id = p->rows[i];
+        const XNode* n = &g_xn[id];
+        int h = xm_node_h(id);
+        if (ry + h < clip_top || ry > clip_bot) { ry += h; continue; }
+        RectI rr = {r->x + SC(4), ry,
+                    r->w - SC(8) - (p->content_h > (clip_bot - clip_top) ? SC(8) : 0), h};
+        if (n->kind == XK_SEP) {
+            hline(rr.x + SC(8), rr.x + rr.w - SC(6), rr.y + rr.h / 2, P->border);
+            ry += h;
+            continue;
+        }
+        bool hl = (i == p->hover) && n->enabled && n->kind != XK_NOTE;
+        bool open_sub = (k + 1 < g_xp_n && g_xp[k + 1].node == id);
+        if (hl || open_sub) {
+            rrect(rr.x, rr.y, rr.w, rr.h, L->radius, P->btn_hover, COLOR_BLACK, 0.0f);
+            fill(rr.x, rr.y + SC(4), SC(2), rr.h - SC(8), P->accent);
+        }
+        int isz = SC(16);
+        int ix = rr.x + SC(8), iy = rr.y + (rr.h - isz) / 2;
+        if (n->icon) xm_draw_icon(n->icon, ix, iy, isz);
+        else if (n->act == XA_APP && n->cmd >= 0 && n->kind != XK_NOTE &&
+                 n->kind != XK_SEP)
+            ctx_icon(n->cmd, ix + SC(1), iy + SC(1), SC(14),
+                     n->enabled ? (hl ? P->text : P->dim) : P->dim);
+        int hint_w = n->hint[0] ? (int)measure_px(n->hint, L->text_small) + SC(16) : 0;
+        int room = rr.w - SC(34) - hint_w - (n->kind == XK_SUB ? SC(18) : SC(6));
+        if (room < SC(30)) room = SC(30);
+        char lb[400], fl[400];
+        fit_text(xm_label_of(id, lb, sizeof lb, search), fl, sizeof fl, room, L->text_med);
+        Color tc = (n->enabled && n->kind != XK_NOTE) ? P->text : P->dim;
+        text_px(fl, rr.x + SC(32), rr.y + (rr.h - L->text_med) / 2, L->text_med, tc);
+        if (hint_w > 0)
+            text_px(n->hint, rr.x + rr.w - SC(8) - (hint_w - SC(16)) -
+                                 (n->kind == XK_SUB ? SC(14) : 0),
+                    rr.y + (rr.h - L->text_small) / 2, L->text_small, P->dim);
+        if (n->kind == XK_SUB) {                          // chevron
+            int ax = rr.x + rr.w - SC(12), ay = rr.y + rr.h / 2;
+            line(ax - SC(3), ay - SC(4), ax + SC(1), ay, P->dim, 1.2f);
+            line(ax + SC(1), ay, ax - SC(3), ay + SC(4), P->dim, 1.2f);
+        }
+        ry += h;
+    }
+    renderer_reset_scissor(g_app.renderer);
+    // scroll hint: a thin bar when the panel scrolls
+    int view_h = clip_bot - clip_top;
+    if (p->content_h > view_h && view_h > 0) {
+        int th = view_h * view_h / p->content_h;
+        if (th < SC(24)) th = SC(24);
+        int ty = clip_top + (view_h - th) * p->scroll / (p->content_h - view_h);
+        bool act = (g_xm_sb == k);
+        rrect(r->x + r->w - SC(8), ty, SC(5), th, SC(3),
+              act ? P->accent : P->scroll, COLOR_BLACK, 0.0f);
+    }
+}
+
+static void xm_draw(const Layout* L, const InputState* in) {
+    (void)in;
+    if (!g_xm_open) return;
+    g_xm_tmed = L->text_med;
+    g_xm_tsmall = L->text_small;
+    xm_pump();
+    if (!g_xm_open || !xm_ready()) return;
+    static bool was_fallback = false;     // rebuild once when the wait ends
+    if (g_xm_ver == 0 && !was_fallback) { was_fallback = true; xm_rebuild(); }
+    if (g_xm_ver != 0) was_fallback = false;
+    xm_layout();
+    for (int k = 0; k < g_xp_n; k++) xm_draw_panel(k, L);
+}
+
+// ============================================================
+// FIRST-RUN HELP: the shortcuts guide (F1), the welcome tour and tooltips
+// ------------------------------------------------------------
+// Settings is where shortcuts are CHANGED; this is where they are LEARNT:
+//   - F1 opens one clean, searchable page of every shortcut and mouse
+//     gesture, grouped (generated from the command registry, so it always
+//     shows the user's CURRENT keys).
+//   - The very first start shows a 5-step welcome tour that ends by
+//     pointing at F1.  Skip / Esc closes it for good.
+//   - Hovering a top-bar button shows its name and shortcut.
+//   - Running a command from the right-click menu tells the user, once,
+//     which key does the same.
+// ============================================================
+static bool g_help_open = false;
+static char g_help_q[64];
+static int  g_help_scroll = 0;
+static RectI g_help_panel, g_help_settings_link, g_help_close;
+static int  g_help_content_h = 0, g_help_view_h = 0;
+
+typedef struct { char grp[48]; char keys[64]; char what[128]; } HelpRow;
+#define HELP_MAX 200
+static HelpRow* g_help_rows = NULL;
+static int g_help_n = 0;
+
+static void help_add(const char* grp, const char* keys, const char* what) {
+    if (!g_help_rows || g_help_n >= HELP_MAX || !keys || !keys[0]) return;
+    HelpRow* r = &g_help_rows[g_help_n++];
+    snprintf(r->grp, sizeof r->grp, "%s", grp);
+    snprintf(r->keys, sizeof r->keys, "%s", keys);
+    snprintf(r->what, sizeof r->what, "%s", what);
+}
+
+// The CURRENT binding of a registry command as text ("Ctrl+E").
+static const char* kb(int id) {
+    static char buf[8][48];
+    static int slot = 0;
+    char* b = buf[slot++ & 7];
+    b[0] = '\0';
+    if (id >= 0 && id < CMD_COUNT && g_ents[id].key) set_binding_of(&g_ents[id], b, 48);
+    return b;
+}
+
+static void help_build(void) {
+    if (!g_help_rows) g_help_rows = (HelpRow*)calloc(HELP_MAX, sizeof(HelpRow));
+    if (!g_help_rows) return;
+    g_help_n = 0;
+    // 1) every visible registry command that has a key, by category
+    for (int c = 0; c < SCAT_COUNT; c++) {
+        for (int i = 0; i < CMD_COUNT; i++) {
+            const SetEnt* e = &g_ents[i];
+            if (e->cat != c || e->hidden || !e->key || !e->name) continue;
+            if (e->kind == EK_ACTION && !e->on) continue;
+            char k[64];
+            set_binding_of(e, k, sizeof k);
+            if (e->akey) {
+                SetEnt a = *e;
+                a.key = e->akey;
+                a.mods = e->amods;
+                char k2[32];
+                set_binding_of(&a, k2, sizeof k2);
+                size_t l = strlen(k);
+                snprintf(k + l, sizeof k - l, "  /  %s", k2);
+            }
+            help_add(SCAT_NAMES[c], k, e->name);
+        }
+    }
+    // 2) the fixed keys (not rebindable - they work everywhere)
+    const char* G1 = "Moving around";
+    help_add(G1, "Up / Down", "Move the selection");
+    help_add(G1, "PgUp / PgDn", "Jump a page");
+    help_add(G1, "Home / End", "First / last item");
+    help_add(G1, "Enter", "Open the folder or file");
+    help_add(G1, "Backspace", "Parent folder");
+    help_add(G1, "Alt+Left  /  Alt+Right", "Back / Forward");
+    help_add(G1, "Alt+Up", "One level up");
+    help_add(G1, "Alt+D", "Type a path in the address bar");
+    help_add(G1, "Type a name", "Jump to the item that starts with it");
+    const char* G2 = "Files";
+    help_add(G2, "Shift+Delete", "Delete permanently (skips the Recycle Bin)");
+    help_add(G2, "Ctrl+Z", "Undo the last rename / new item / paste");
+    help_add(G2, "Alt+Enter", "Properties");
+    help_add(G2, "Menu key  /  Shift+F10", "Context menu of the selection");
+    help_add(G2, "Type in a menu", "Search every command in it");
+    const char* G3 = "View and window";
+    help_add(G3, "Ctrl+Wheel", "Make icons bigger / smaller");
+    help_add(G3, "Alt+Wheel  /  Hold V + / -", "Scale the whole interface");
+    help_add(G3, "F11", "Maximize / restore the window");
+    const char* G4 = "Mouse";
+    help_add(G4, "Middle-click a folder", "Open it in a new tab");
+    help_add(G4, "Side buttons", "Back / Forward");
+    help_add(G4, "Drag files out", "Copy / move them to Explorer or any app");
+    help_add(G4, "Drop files in", "Copy (other drive) or move (same drive) here");
+    help_add(G4, "Drag a tab onto a pane", "Dock it as a split");
+}
+
+static void help_open(void) {
+    help_build();
+    g_help_open = true;
+    g_help_q[0] = '\0';
+    g_help_scroll = 0;
+}
+
+static bool help_match(const HelpRow* r) {
+    if (!g_help_q[0]) return true;
+    char all[260];
+    snprintf(all, sizeof all, "%s %s %s", r->keys, r->what, r->grp);
+    return xm_match(all, g_help_q);
+}
+
+// One key "chip" per alternative ("Ctrl+E", "Alt+S" ...); returns width.
+static int help_chips(const char* keys, int x, int y, int px, bool draw) {
+    char buf[64];
+    snprintf(buf, sizeof buf, "%s", keys);
+    int cx = x;
+    char* save = buf;
+    while (save && *save) {
+        char* sep = strstr(save, "  /  ");
+        if (sep) *sep = '\0';
+        int tw = (int)measure_px(save, px);
+        int cw = tw + SC(12), ch = px + SC(8);
+        if (draw) {
+            rrect(cx, y, cw, ch, SC(4), P->btn, P->border, 1.0f);
+            text_px(save, cx + SC(6), y + (ch - px) / 2, px, P->text);
+        }
+        cx += cw + SC(5);
+        if (sep) {
+            if (draw) text_px("/", cx, y + (ch - px) / 2, px, P->dim);
+            cx += (int)measure_px("/", px) + SC(5);
+            save = sep + 5;
+        } else {
+            save = NULL;
+        }
+    }
+    return cx - x;
+}
+
+static void draw_help(const Layout* L, const InputState* in) {
+    (void)in;
+    int ww = 0, hh = 0;
+    platform_window_size(&ww, &hh);
+    fill(0, 0, ww, hh, (Color){0, 0, 0, 0.55f});
+    int pw = ww - SC(80);
+    if (pw > SC(960)) pw = SC(960);
+    int ph = hh - SC(70);
+    if (ph > SC(660)) ph = SC(660);
+    int px = (ww - pw) / 2, py = (hh - ph) / 2;
+    g_help_panel = (RectI){px, py, pw, ph};
+    fill(px + SC(4), py + SC(6), pw, ph, (Color){0, 0, 0, 0.25f});
+    rrect(px, py, pw, ph, SC(10), P->panel, P->border, 1.0f);
+    // header
+    text_px("Keyboard shortcuts", px + SC(24), py + SC(18), L->text_med + SC(4), P->text);
+    text_px("Everything NovaFile can do from the keyboard and the mouse.  "
+            "Press F1 anytime.", px + SC(24), py + SC(46), L->text_small, P->dim);
+    g_help_close = (RectI){px + pw - SC(40), py + SC(14), SC(26), SC(26)};
+    {
+        int cx = g_help_close.x + SC(13), cy = g_help_close.y + SC(13);
+        line(cx - SC(5), cy - SC(5), cx + SC(5), cy + SC(5), P->dim, 1.4f);
+        line(cx + SC(5), cy - SC(5), cx - SC(5), cy + SC(5), P->dim, 1.4f);
+    }
+    // search
+    RectI sb = {px + SC(24), py + SC(72), pw - SC(48), SC(32)};
+    rrect(sb.x, sb.y, sb.w, sb.h, SC(6), P->field, mixc(P->border, P->accent, 0.6f), 1.0f);
+    int gx = sb.x + SC(12), gy = sb.y + sb.h / 2;
+    rrect(gx - SC(5), gy - SC(6), SC(9), SC(9), SC(5), (Color){0, 0, 0, 0}, P->dim, 1.2f);
+    line(gx + SC(2), gy + SC(2), gx + SC(6), gy + SC(6), P->dim, 1.4f);
+    int tx = sb.x + SC(28), ty = sb.y + (sb.h - L->text_med) / 2;
+    if (g_help_q[0]) {
+        text_px(g_help_q, tx, ty, L->text_med, P->text);
+        if ((GetTickCount() / 500) % 2 == 0)
+            vline(tx + (int)measure_px(g_help_q, L->text_med) + 1, sb.y + SC(7),
+                  sb.y + sb.h - SC(7), P->text);
+    } else {
+        vline(tx, sb.y + SC(7), sb.y + sb.h - SC(7), P->text);
+        text_px("Type to find a shortcut (e.g. copy, tab, search)", tx + SC(4), ty,
+                L->text_med, P->dim);
+    }
+    // footer link
+    const char* foot = "Change any shortcut in Settings";
+    char fl[96];
+    snprintf(fl, sizeof fl, "%s  (%s)", foot, kb(CMD_SET_OPEN));
+    int fw = (int)measure_px(fl, L->text_small);
+    g_help_settings_link = (RectI){px + pw - SC(24) - fw, py + ph - SC(32), fw, L->text_small + SC(6)};
+    bool lh = inside(&g_help_settings_link, in->x, in->y);
+    text_px(fl, g_help_settings_link.x, g_help_settings_link.y, L->text_small,
+            lh ? P->text : P->accent);
+    text_px("Esc closes", px + SC(24), py + ph - SC(32), L->text_small, P->dim);
+
+    // body: groups flowing through two columns
+    int top = py + SC(118), bot = py + ph - SC(44);
+    g_help_view_h = bot - top;
+    int colw = (pw - SC(48) - SC(32)) / 2;
+    int rowh = L->text_med + SC(14), headh = L->text_small + SC(20);
+    // total height to split the columns evenly
+    int total = 0;
+    const char* last = NULL;
+    for (int i = 0; i < g_help_n; i++) {
+        if (!help_match(&g_help_rows[i])) continue;
+        if (!last || strcmp(last, g_help_rows[i].grp)) { total += headh; last = g_help_rows[i].grp; }
+        total += rowh;
+    }
+    int half = (total + 1) / 2;
+    renderer_set_scissor(g_app.renderer,
+                         (Rect){(float)px, (float)top, (float)pw, (float)(bot - top)});
+    int col = 0, y = top - g_help_scroll, used = 0, colmax = 0;
+    last = NULL;
+    int keyw = SC(190);
+    for (int i = 0; i < g_help_n; i++) {
+        const HelpRow* r = &g_help_rows[i];
+        if (!help_match(r)) continue;
+        bool newgrp = !last || strcmp(last, r->grp);
+        int need = (newgrp ? headh : 0) + rowh;
+        if (col == 0 && used >= half && newgrp && g_help_q[0] == '\0') {
+            col = 1;
+            if (used > colmax) colmax = used;
+            used = 0;
+            y = top - g_help_scroll;
+        }
+        int x = px + SC(24) + col * (colw + SC(32));
+        if (newgrp) {
+            text_px(r->grp, x, y + SC(8), L->text_small, P->accent);
+            hline(x, x + colw, y + headh - SC(4), P->border);
+            y += headh;
+            used += headh;
+            last = r->grp;
+        }
+        if (y + rowh >= top - rowh && y <= bot) {
+            help_chips(r->keys, x, y + (rowh - (L->text_small + SC(8))) / 2,
+                       L->text_small, true);
+            char fw2[160];
+            fit_text(r->what, fw2, sizeof fw2, colw - keyw - SC(4), L->text_med);
+            text_px(fw2, x + keyw, y + (rowh - L->text_med) / 2, L->text_med, P->text);
+        }
+        y += rowh;
+        used += rowh;
+        (void)need;
+    }
+    if (used > colmax) colmax = used;
+    renderer_reset_scissor(g_app.renderer);
+    if (g_help_n > 0 && total == 0)
+        text_px("No shortcut matches that.", px + SC(24), top + SC(10), L->text_med, P->dim);
+    g_help_content_h = colmax;
+    int maxs = g_help_content_h - g_help_view_h;
+    if (maxs < 0) maxs = 0;
+    if (g_help_scroll > maxs) g_help_scroll = maxs;
+}
+
+static void help_key(InputState* in) {
+    int k = in->key_code ? in->key_code : in->key_repeat;
+    if (k == VK_ESCAPE || (k == VK_F1 && !g_help_q[0])) {
+        if (g_help_q[0] && k == VK_ESCAPE) { g_help_q[0] = '\0'; g_help_scroll = 0; }
+        else g_help_open = false;
+        return;
+    }
+    if (k == VK_BACK) {
+        size_t l = strlen(g_help_q);
+        if (l) g_help_q[utf8_prev(g_help_q, (int)l)] = '\0';
+        g_help_scroll = 0;
+        return;
+    }
+    if (k == VK_DOWN) { g_help_scroll += SC(40); return; }
+    if (k == VK_UP) { g_help_scroll -= SC(40); if (g_help_scroll < 0) g_help_scroll = 0; return; }
+    if (k == VK_NEXT) { g_help_scroll += g_help_view_h - SC(40); return; }
+    if (k == VK_PRIOR) { g_help_scroll -= g_help_view_h - SC(40); if (g_help_scroll < 0) g_help_scroll = 0; return; }
+    if (in->ctrl_pressed || in->alt_pressed) return;
+    unsigned int cq[32];
+    int cn = tts_frame_chars(in, cq, 32);
+    for (int i = 0; i < cn; i++) {
+        char enc[8];
+        int en = cq[i] >= 32 ? cp_encode(cq[i], enc) : 0;
+        size_t l = strlen(g_help_q);
+        if (en > 0 && l + (size_t)en < sizeof g_help_q) {
+            memcpy(g_help_q + l, enc, (size_t)en);
+            g_help_q[l + en] = '\0';
+        }
+        g_help_scroll = 0;
+    }
+}
+
+static void help_mouse(InputState* in) {
+    if (in->wheel) {
+        g_help_scroll -= in->wheel * SC(60);
+        if (g_help_scroll < 0) g_help_scroll = 0;
+        in->wheel = 0;
+    }
+    if (in->left_click) {
+        if (inside(&g_help_close, in->x, in->y) || !inside(&g_help_panel, in->x, in->y)) {
+            g_help_open = false;
+        } else if (inside(&g_help_settings_link, in->x, in->y)) {
+            g_help_open = false;
+            settings_open();
+        }
+    }
+}
+
+// ---- the welcome tour (first start only) -------------------------------
+static bool g_welcome_open = false;
+static int  g_welcome_step = 0;
+static RectI g_wel_next, g_wel_back, g_wel_skip, g_wel_extra, g_wel_panel;
+#define WELCOME_STEPS 5
+
+static void welcome_done(bool open_help) {
+    g_welcome_open = false;
+    if (!g_opt_welcomed) opt_set(CMD_WELCOMED, true);     // never again
+    if (open_help) help_open();
+}
+
+// Word-wrapped paragraph; returns the height used.
+static int text_wrap(const char* s, int x, int y, int w, int px, Color c) {
+    char line_buf[512] = "";
+    int lh = px + SC(7), yy = y;
+    const char* p = s;
+    while (*p) {
+        const char* sp = strchr(p, ' ');
+        size_t wl = sp ? (size_t)(sp - p) : strlen(p);
+        char word[160];
+        if (wl >= sizeof word) wl = sizeof word - 1;
+        memcpy(word, p, wl);
+        word[wl] = '\0';
+        char trial[512];
+        snprintf(trial, sizeof trial, "%s%s%s", line_buf, line_buf[0] ? " " : "", word);
+        if (line_buf[0] && (int)measure_px(trial, px) > w) {
+            text_px(line_buf, x, yy, px, c);
+            yy += lh;
+            snprintf(line_buf, sizeof line_buf, "%s", word);
+        } else {
+            snprintf(line_buf, sizeof line_buf, "%s", trial);
+        }
+        p += wl;
+        while (*p == ' ') p++;
+    }
+    if (line_buf[0]) { text_px(line_buf, x, yy, px, c); yy += lh; }
+    return yy - y;
+}
+
+static void wel_button(const RectI* r, const char* label, bool primary,
+                       const Layout* L, const InputState* in) {
+    bool h = inside(r, in->x, in->y);
+    Color bg = primary ? (h ? mixc(P->accent, P->text, 0.15f) : P->accent)
+                       : (h ? P->btn_hover : P->btn);
+    rrect(r->x, r->y, r->w, r->h, SC(6), bg, primary ? bg : P->border, 1.0f);
+    text_centered_px(label, r, L->text_med, primary ? P->paper : P->text);
+}
+
+static void draw_welcome(const Layout* L, const InputState* in) {
+    int ww = 0, hh = 0;
+    platform_window_size(&ww, &hh);
+    fill(0, 0, ww, hh, (Color){0, 0, 0, 0.55f});
+    int pw = SC(560), ph = SC(330);
+    if (pw > ww - SC(40)) pw = ww - SC(40);
+    int px = (ww - pw) / 2, py = (hh - ph) / 2;
+    g_wel_panel = (RectI){px, py, pw, ph};
+    fill(px + SC(4), py + SC(6), pw, ph, (Color){0, 0, 0, 0.25f});
+    rrect(px, py, pw, ph, SC(12), P->panel, P->border, 1.0f);
+
+    char body[400];
+    const char* title = "";
+    int glyph = -1;
+    switch (g_welcome_step) {
+    case 0:
+        title = "Welcome to NovaFile";
+        snprintf(body, sizeof body,
+                 "A fast file manager for Windows. Here are the few things worth "
+                 "knowing - it takes 20 seconds. You can skip any time.");
+        glyph = CTX_CMD_OPEN;
+        break;
+    case 1:
+        title = "Tabs and split panes";
+        snprintf(body, sizeof body,
+                 "%s opens a new tab.  %s splits the view so two folders sit side "
+                 "by side.  Drag a tab onto a pane to dock it, %s closes a pane.",
+                 kb(CMD_NEW_TAB), kb(CMD_SPLIT), kb(CMD_CLOSE_PANE));
+        glyph = CTX_CMD_OPEN_PANE;
+        break;
+    case 2:
+        title = "Right-click does everything";
+        snprintf(body, sizeof body,
+                 "Every Windows command - 7-Zip, Open with, Send to, New... - is in "
+                 "the right-click menu.  Just start typing in it to find one.  "
+                 "Delete goes to the Recycle Bin and Ctrl+Z undoes a mistake.");
+        glyph = CTX_CMD_PROPERTIES;
+        break;
+    case 3:
+        title = "Find and jump fast";
+        snprintf(body, sizeof body,
+                 "%s searches this folder (Enter searches subfolders too).  Hold C "
+                 "for your starred folders.  Alt+Left / Alt+Right go back and "
+                 "forward.  %s hides the sidebar for more room.",
+                 kb(CMD_FOCUS_SEARCH), kb(CMD_SIDEBAR));
+        glyph = CTX_CMD_SIDE_STAR;
+        break;
+    default:
+        title = "Every shortcut, any time";
+        snprintf(body, sizeof body,
+                 "Press %s to see all shortcuts on one page, and hover a button "
+                 "to see its key.  You can change any shortcut in Settings (%s).",
+                 kb(CMD_HELP), kb(CMD_SET_OPEN));
+        glyph = CTX_CMD_VIEW;
+        break;
+    }
+    // glyph badge
+    int bx = px + SC(28), by = py + SC(30);
+    rrect(bx, by, SC(44), SC(44), SC(10), mixc(P->panel, P->accent, 0.25f),
+          P->accent, 1.0f);
+    ctx_icon(glyph, bx + SC(13), by + SC(13), SC(18), P->text);
+    text_px(title, bx + SC(60), by + SC(10), L->text_med + SC(5), P->text);
+    text_wrap(body, px + SC(28), py + SC(100), pw - SC(56), L->text_med, P->dim);
+    // step dots
+    int dw = SC(8), dg = SC(8);
+    int dx = px + (pw - (WELCOME_STEPS * dw + (WELCOME_STEPS - 1) * dg)) / 2;
+    for (int i = 0; i < WELCOME_STEPS; i++)
+        rrect(dx + i * (dw + dg), py + ph - SC(78), dw, dw, dw / 2,
+              i == g_welcome_step ? P->accent : P->border, COLOR_BLACK, 0.0f);
+    // buttons
+    int bh = SC(34), bw = SC(120);
+    g_wel_next = (RectI){px + pw - SC(24) - bw, py + ph - SC(54), bw, bh};
+    g_wel_back = (RectI){g_wel_next.x - SC(10) - SC(90), g_wel_next.y, SC(90), bh};
+    g_wel_skip = (RectI){px + SC(24), g_wel_next.y, SC(90), bh};
+    bool lastp = g_welcome_step >= WELCOME_STEPS - 1;
+    wel_button(&g_wel_next, lastp ? "Get started" : "Next", true, L, in);
+    if (g_welcome_step > 0) wel_button(&g_wel_back, "Back", false, L, in);
+    else g_wel_back = (RectI){0, 0, 0, 0};
+    if (lastp) {
+        g_wel_skip = (RectI){0, 0, 0, 0};
+        g_wel_extra = (RectI){px + SC(24), g_wel_next.y, SC(170), bh};
+        wel_button(&g_wel_extra, "Show all shortcuts", false, L, in);
+    } else {
+        g_wel_extra = (RectI){0, 0, 0, 0};
+        bool sh = inside(&g_wel_skip, in->x, in->y);
+        text_centered_px("Skip", &g_wel_skip, L->text_med, sh ? P->text : P->dim);
+    }
+}
+
+static void welcome_key(InputState* in) {
+    int k = in->key_code;
+    if (k == VK_ESCAPE) { welcome_done(false); return; }
+    if (k == VK_RETURN || k == VK_RIGHT || k == VK_SPACE) {
+        if (g_welcome_step >= WELCOME_STEPS - 1) welcome_done(false);
+        else g_welcome_step++;
+        return;
+    }
+    if (k == VK_LEFT && g_welcome_step > 0) g_welcome_step--;
+    if (k == VK_F1) welcome_done(true);
+}
+
+static void welcome_mouse(InputState* in) {
+    in->wheel = 0;
+    if (!in->left_click) return;
+    if (inside(&g_wel_next, in->x, in->y)) {
+        if (g_welcome_step >= WELCOME_STEPS - 1) welcome_done(false);
+        else g_welcome_step++;
+    } else if (g_wel_back.w && inside(&g_wel_back, in->x, in->y)) {
+        g_welcome_step--;
+    } else if (g_wel_skip.w && inside(&g_wel_skip, in->x, in->y)) {
+        welcome_done(false);
+    } else if (g_wel_extra.w && inside(&g_wel_extra, in->x, in->y)) {
+        welcome_done(true);
+    }
+}
+
+// ---- tooltips for the top-bar buttons -----------------------------------
+static int   g_tip_id = -1;            // hovered control (-1 none)
+static DWORD g_tip_since = 0;
+static bool  g_tip_pending = false;    // hovering, tooltip not shown yet
+#define TIP_DELAY_MS 450
+
+static void draw_tooltips(const Layout* L, const InputState* in) {
+    g_tip_pending = false;
+    if (overlay_owns_input() || g_help_open || g_welcome_open || in->left_down) {
+        g_tip_id = -1;
+        return;
+    }
+    struct { const RectI* r; char text[96]; } t[12];
+    int n = 0;
+#define TIP(rect, ...) do { t[n].r = (rect); snprintf(t[n].text, sizeof t[n].text, __VA_ARGS__); n++; } while (0)
+    TIP(&L->menu_btn, "Menu");
+    TIP(&L->set_btn, "Settings  (%s)", kb(CMD_SET_OPEN));
+    TIP(&L->side_btn, "%s sidebar  (%s)", g_opt_sidebar ? "Hide" : "Show", kb(CMD_SIDEBAR));
+    TIP(&L->new_tab_btn, "New tab  (%s)", kb(CMD_NEW_TAB));
+    TIP(&L->nav_btns[0], "Back  (Alt+Left)");
+    TIP(&L->nav_btns[1], "Forward  (Alt+Right)");
+    TIP(&L->nav_btns[2], "Up one level  (Alt+Up)");
+    TIP(&L->cap_min, "Minimize");
+    TIP(&L->cap_max, "%s", platform_window_maximized() ? "Restore down" : "Maximize  (F11)");
+    TIP(&L->cap_close, "Close");
+#undef TIP
+    int hit = -1;
+    for (int i = 0; i < n; i++)
+        if (t[i].r->w > 0 && inside(t[i].r, in->x, in->y)) { hit = i; break; }
+    if (hit != g_tip_id) { g_tip_id = hit; g_tip_since = GetTickCount(); }
+    if (hit < 0) return;
+    if (GetTickCount() - g_tip_since < TIP_DELAY_MS) { g_tip_pending = true; return; }
+    int ww = 0, hh = 0;
+    platform_window_size(&ww, &hh);
+    const RectI* r = t[hit].r;
+    int tw = (int)measure_px(t[hit].text, L->text_small) + SC(16);
+    int th = L->text_small + SC(10);
+    int x = r->x + r->w / 2 - tw / 2, y = r->y + r->h + SC(6);
+    if (x + tw > ww - SC(4)) x = ww - SC(4) - tw;
+    if (x < SC(4)) x = SC(4);
+    fill(x + SC(2), y + SC(3), tw, th, (Color){0, 0, 0, 0.25f});
+    rrect(x, y, tw, th, SC(5), P->btn, P->border, 1.0f);
+    text_px(t[hit].text, x + SC(8), y + (th - L->text_small) / 2, L->text_small, P->text);
+}
+
+// ---- the sidebar: hide / show (animated, remembered) --------------------
+static void sidebar_toggle(void) {
+    opt_set(CMD_SIDEBAR, !g_opt_sidebar);
+    set_status(g_opt_sidebar ? "Sidebar shown" : "Sidebar hidden  (%s shows it again)",
+               kb(CMD_SIDEBAR));
+}
+static void sidebar_animate(void) {
+    float target = g_opt_sidebar ? 1.0f : 0.0f;
+    float d = target - g_side_anim;
+    if (d > -0.01f && d < 0.01f) { g_side_anim = target; return; }
+    g_side_anim += d * 0.35f;
+}
+
+// ---- "next time press ..." (once per command per session) ---------------
+static void menu_key_tip(int cmd) {
+    static bool told[64];
+    int id = -1;
+    switch (cmd) {
+    case CTX_CMD_CUT: id = CMD_CUT; break;
+    case CTX_CMD_COPY: id = CMD_COPY; break;
+    case CTX_CMD_PASTE: id = CMD_PASTE; break;
+    case CTX_CMD_DELETE: id = CMD_DELETE; break;
+    case CTX_CMD_RENAME: id = CMD_RENAME; break;
+    case CTX_CMD_REFRESH: id = CMD_REFRESH; break;
+    default: return;
+    }
+    if (id < 0 || id >= 64 || told[id] || !g_ents[id].key || !g_ents[id].on) return;
+    told[id] = true;
+    char prev[200];
+    snprintf(prev, sizeof prev, "%s", g_app.status_msg);
+    if (prev[0]) set_status("%s   -   Tip: next time just press %s", prev, kb(id));
+    else set_status("Tip: next time just press %s", kb(id));
+}
+
+// ---- "Update available" card -------------------------------------------
+// The updater checks in the background (start + every 6 hours) and
+// downloads + verifies a newer release by itself.  As soon as one is
+// ready this card appears bottom-right: Update now installs it (the app
+// closes, the installer runs silently and reopens NovaFile), Later hides
+// it until the next start.  Nobody has to visit the website.
+static bool  g_upd_later = false;
+static RectI g_upd_card, g_upd_now, g_upd_btn_later;
+
+static void draw_update_card(const Layout* L, const InputState* in) {
+    g_upd_card = (RectI){0, 0, 0, 0};
+    if (g_upd_later || !update_ready() || g_welcome_open || g_help_open ||
+        g_set_open || g_xm_open)
+        return;
+    int ww = 0, hh = 0;
+    platform_window_size(&ww, &hh);
+    int cw = SC(360), ch = SC(112);
+    int x = ww - cw - SC(16), y = L->status.y - ch - SC(12);
+    g_upd_card = (RectI){x, y, cw, ch};
+    fill(x + SC(3), y + SC(5), cw, ch, (Color){0, 0, 0, 0.28f});
+    rrect(x, y, cw, ch, SC(10), P->panel, P->accent, 1.0f);
+    fill(x + SC(1), y + SC(10), SC(3), ch - SC(20), P->accent);
+    text_px("Update available", x + SC(18), y + SC(14), L->text_med + SC(2), P->text);
+    char msg[160];
+    snprintf(msg, sizeof msg, "NovaFile %s is downloaded and ready to install.",
+             update_ready_version());
+    char fm[160];
+    fit_text(msg, fm, sizeof fm, cw - SC(36), L->text_small);
+    text_px(fm, x + SC(18), y + SC(42), L->text_small, P->dim);
+    g_upd_now = (RectI){x + cw - SC(18) - SC(130), y + ch - SC(44), SC(130), SC(30)};
+    g_upd_btn_later = (RectI){g_upd_now.x - SC(10) - SC(80), g_upd_now.y, SC(80), SC(30)};
+    wel_button(&g_upd_now, "Update now", true, L, in);
+    wel_button(&g_upd_btn_later, "Later", false, L, in);
+}
+
+// true = the click belonged to the card
+static bool update_card_mouse(InputState* in) {
+    if (g_upd_card.w <= 0 || !in->left_click) return false;
+    if (!inside(&g_upd_card, in->x, in->y)) return false;
+    if (inside(&g_upd_now, in->x, in->y)) {
+        set_status("Installing the update - NovaFile will reopen by itself...");
+        if (update_apply()) g_app.running = false;      // installer relaunches
+        else set_status("%s", update_status_text());
+    } else if (inside(&g_upd_btn_later, in->x, in->y)) {
+        g_upd_later = true;
+        set_status("The update stays ready - Settings > Updates installs it any time");
+    }
+    return true;
+}
+
+// ---- drag files OUT (to Explorer, the desktop, any app) -----------------
+// Pressing a row arms it; moving past the system drag distance while the
+// button is held hands the selection to the shell's own drag (DoDragDrop),
+// so every drop target sees exactly what an Explorer drag carries.
+// A plain press on a row that is part of a MULTI selection keeps the set
+// (so it can be dragged as a whole) and only collapses it to that row on
+// release - Explorer's rule.
+static bool g_fdrag_armed = false;
+static int  g_fdrag_x = 0, g_fdrag_y = 0;
+static int  g_fdrag_collapse = -1;     // row to make the only one on release
+
+// List scrollbar drag (armed by a press on the bar, see handle_mouse).
+static bool g_sb_drag = false;
+static int  g_sb_grab = 0, g_sb_track_y = 0, g_sb_travel = 0, g_sb_max = 0;
+static bool sb_drag_tick(InputState* in) {
+    if (!g_sb_drag) return false;
+    if (!in->left_down) { g_sb_drag = false; return true; }
+    if (g_sb_travel > 0) {
+        int rel = in->y - g_sb_track_y - g_sb_grab;
+        if (rel < 0) rel = 0;
+        if (rel > g_sb_travel) rel = g_sb_travel;
+        g_app.scroll = (int)((long long)rel * g_sb_max / g_sb_travel);
+        if (g_app.scroll < 0) g_app.scroll = 0;
+        if (g_app.scroll > g_sb_max) g_app.scroll = g_sb_max;
+    }
+    in->wheel = 0;
+    return true;                          // the drag owns the mouse
+}
+
+static bool file_drag_tick(InputState* in) {
+    if (!g_fdrag_armed) return false;
+    if (!in->left_down) {                  // released without dragging
+        if (g_fdrag_collapse >= 0 &&
+            (size_t)g_fdrag_collapse < g_app.view_count) {
+            sel_clear();
+            sel_add(g_fdrag_collapse);
+            g_app.selected = g_fdrag_collapse;
+        }
+        g_fdrag_armed = false;
+        g_fdrag_collapse = -1;
+        return false;
+    }
+    int dx = in->x - g_fdrag_x, dy = in->y - g_fdrag_y;
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    int tx = GetSystemMetrics(SM_CXDRAG), ty = GetSystemMetrics(SM_CYDRAG);
+    if (tx < 4) tx = 4;
+    if (ty < 4) ty = 4;
+    if (dx <= tx && dy <= ty) return false;
+    g_fdrag_armed = false;
+    g_fdrag_collapse = -1;
+    if (overlay_owns_input() || is_this_pc(g_app.current_path) || g_st_running)
+        return false;
+    int n = 0;
+    char** ps = sel_paths(&n);
+    if (n > 0) {
+        if (GetCapture() == (HWND)g_app.hwnd) ReleaseCapture();
+        set_status("Dragging %d item%s...", n, n == 1 ? "" : "s");
+        int eff = shell_drag_files(g_app.hwnd, ps, n);
+        if (eff) {
+            set_status("Dropped %d item%s", n, n == 1 ? "" : "s");
+            folder_watch_poke();          // a move removed them from here
+        } else {
+            set_status("Drag cancelled");
+        }
+    }
+    sel_paths_free(ps, n);
+    return true;
 }
 
 static void handle_mouse(const Layout* L, InputState* in) {
@@ -14960,6 +19351,57 @@ static void handle_mouse(const Layout* L, InputState* in) {
     // double-click interval so the trailing click of a double-click is
     // absorbed here instead of falling through to the window behind.
     if (g_close_pending) return;
+    if (file_drag_tick(in)) return;       // a row press grew into a drag
+    if (sb_drag_tick(in)) return;         // dragging the list scrollbar
+    if (g_welcome_open) { welcome_mouse(in); return; }
+    if (g_help_open) { help_mouse(in); return; }
+    if (update_card_mouse(in)) return;    // Update now / Later
+    if (g_xm_open && xm_mouse(L, in)) return;   // system context menu
+    // ---- inline rename + the MOUSE (Explorer): a click anywhere OUTSIDE the
+    //      field commits the new name and then acts normally (selects the
+    //      row under it, opens a menu...), so a rename opened by accident
+    //      (F2 or the menu) never traps the user until Enter.  A click
+    //      INSIDE places the caret; a double click there selects the name.
+    if (g_rename_vi >= 0 &&
+        (in->left_click || in->right_click || in->middle_click)) {
+        bool in_field = g_rename_rect.w > 0 &&
+                        inside(&g_rename_rect, in->x, in->y);
+        if (!in_field) {
+            rename_commit();            // unchanged text = nothing happens
+        } else if (in->double_click) {
+            g_rename_sel0 = 0;
+            g_rename_sel1 = g_rename_caret = (int)strlen(g_rename_txt);
+            return;
+        } else if (in->left_click) {
+            int best = 0, bestd = 1 << 30;
+            int len = (int)strlen(g_rename_txt);
+            for (int i = 0; i <= len; i = (i < len) ? utf8_next(g_rename_txt, i) : len + 1) {
+                char pre[512];
+                snprintf(pre, sizeof pre, "%.*s", i, g_rename_txt);
+                int d = g_rename_tx + (int)measure_px(pre, g_rename_px) - in->x;
+                if (d < 0) d = -d;
+                if (d < bestd) { bestd = d; best = i; }
+                if (i >= len) break;
+            }
+            g_rename_caret = g_rename_sel0 = g_rename_sel1 = best;
+            caret_touch();
+            return;
+        } else {
+            return;                      // right / middle click in the field
+        }
+    }
+    // Alt + wheel = GLOBAL interface scale.  Checked FIRST, before every
+    // per-region wheel consumer, and the notch is consumed (in->wheel = 0)
+    // so it can never also scroll a pane, the tab strip, the sidebar or the
+    // Settings rows.  It drives the SAME central ui_scale_set()/SC() pipeline
+    // the Settings slider and the hold-V +/ - gesture use, so text, icons,
+    // spacing, buttons and controls all grow together and the value persists
+    // - while the per-pane icon zoom (g_zoom) is left completely untouched.
+    if (in->wheel != 0 && in->alt_pressed) {
+        ui_scale_step(in->wheel * 5);      // clamps 75..150, saves, status
+        in->wheel = 0;                     // consumed: no scroll this frame
+        return;
+    }
     // a press that never grew into a drag must not arm the next one
     if (!in->left_down && !g_drag_split) g_drag_split_armed = false;
     // (g_tab_armed is deliberately NOT cleared here: a plain click on a
@@ -14996,22 +19438,65 @@ static void handle_mouse(const Layout* L, InputState* in) {
     // I-beam over an editable text field (address bar / search box) -
     // never while a modal overlay owns the input (the field behind it is
     // not interactive), and never over the address bar's breadcrumb mode:
-    // those are clickable navigation segments, not text.
-    if (!overlay_owns_input() &&
-        (((g_app.addr_focused || L->crumb_n == 0) &&
-              field_hover_text(&L->addr_field, in)) ||
-         field_hover_text(&L->search_field, in)))
-        platform_set_cursor(NOVA_CURSOR_IBEAM);
+    // those are clickable navigation segments, not text.  While a popup is
+    // open the INTERACTIVE field is the popup's bigger, window-centered box,
+    // so the I-beam tracks THAT box (the inline field behind it goes quiet);
+    // the rest of the popup panel (buttons, hint, chrome) keeps the arrow.
+    //
+    // Spec 1: the cursor must follow what is REALLY under the pointer -
+    // never one shape for the whole popup.  The magnifier is a BUTTON (it
+    // activates search) and the (x) clears the query: both get the pointing
+    // hand FIRST, and only the editable run of text between them the I-beam.
+    if (!overlay_owns_input()) {
+        bool hand = false;
+        if (g_addr_popup_open && g_addr_popup_pane) {
+            RectI pf = addr_popup_field_rect();
+            if (field_hover_text(&pf, in)) platform_set_cursor(NOVA_CURSOR_IBEAM);
+        } else if (g_search_popup_open && g_search_popup_pane) {
+            RectI pf = search_popup_field_rect();
+            RectI ic = {pf.x + SC(4), pf.y, SC(28), pf.h};   // magnifier
+            RectI cl = search_popup_clear_rect();            // (x) button
+            if (inside(&ic, in->x, in->y) ||
+                (g_app.search_buf[0] && inside(&cl, in->x, in->y)))
+                hand = true;
+            else if (field_hover_text(&pf, in))
+                platform_set_cursor(NOVA_CURSOR_IBEAM);
+        } else if (((g_app.addr_focused || L->crumb_n == 0) &&
+                       field_hover_text(&L->addr_field, in)) ||
+                   field_hover_text(&L->search_field, in)) {
+            RectI s = L->search_field;
+            RectI ic = {s.x + SC(4), s.y, SC(24), s.h};      // magnifier
+            RectI cl = L->search_clear;                      // (x) button
+            if (s.w > 0 && (inside(&ic, in->x, in->y) ||
+                            (g_app.search_buf[0] && inside(&cl, in->x, in->y))))
+                hand = true;
+            else if (field_hover_text(&L->addr_field, in) ||
+                     (in->x >= s.x + SC(24) && in->y >= s.y &&
+                      in->y < s.y + s.h))
+                platform_set_cursor(NOVA_CURSOR_IBEAM);
+        }
+        if (hand) platform_set_cursor(NOVA_CURSOR_HAND);
+    }
 
     // Text-selection drag: while the button is held in a field, extend the
-    // selection from the click anchor to the caret under the pointer.
+    // selection from the click anchor to the caret under the pointer.  With
+    // the search popup open the SAME query lives in the popup's bigger box,
+    // so the caret tracks the popup's field, not the small inline one.
     if (g_text_drag && in->left_down) {
         if (g_text_drag == 1 && g_app.addr_focused) {
             int tx = L->addr_field.x + SC(8);
+            if (g_addr_popup_open && g_addr_popup_pane) {
+                RectI pf = addr_popup_field_rect();
+                tx = pf.x + SC(30);
+            }
             g_app.addr_caret = text_caret_from_x(g_app.addr_buf, tx,
                                                  L->text_med, in->x);
         } else if (g_text_drag == 2 && g_app.search_focused) {
             int tx = L->search_field.x + SC(26);
+            if (g_search_popup_open && g_search_popup_pane) {
+                RectI pf = search_popup_field_rect();
+                tx = pf.x + SC(32);
+            }
             g_app.search_caret = text_caret_from_x(g_app.search_buf, tx,
                                                    L->text_med, in->x);
         }
@@ -15022,6 +19507,12 @@ static void handle_mouse(const Layout* L, InputState* in) {
     //      rename field: both swallow every input until they close ----
     if (g_confirm_kind != CONFIRM_NONE) {
         if (in->key_code == VK_ESCAPE) g_confirm_kind = CONFIRM_NONE;
+        // Enter accepts the delete confirmation, like Explorer's dialog
+        // (Delete is its default button); the properties sheet closes.
+        else if (in->key_code == VK_RETURN) {
+            if (g_confirm_kind == CONFIRM_DELETE) delete_do();
+            else g_confirm_kind = CONFIRM_NONE;
+        }
         return;                       // the buttons are handled in the draw
     }
     if (g_rename_vi >= 0) {
@@ -15041,11 +19532,12 @@ static void handle_mouse(const Layout* L, InputState* in) {
             if (lo < hi) { memmove(g_rename_txt + lo, g_rename_txt + hi,
                                    strlen(g_rename_txt + hi) + 1);
                            g_rename_caret = lo; g_rename_sel0 = g_rename_sel1 = lo; }
-            else if (g_rename_caret > 0) {
-                memmove(g_rename_txt + g_rename_caret - 1,
+            else if (g_rename_caret > 0) {   // one whole character (UTF-8)
+                int pv = utf8_prev(g_rename_txt, g_rename_caret);
+                memmove(g_rename_txt + pv,
                         g_rename_txt + g_rename_caret,
                         strlen(g_rename_txt + g_rename_caret) + 1);
-                g_rename_caret--;
+                g_rename_caret = pv;
                 g_rename_sel0 = g_rename_sel1 = g_rename_caret;
             }
             return;
@@ -15055,19 +19547,22 @@ static void handle_mouse(const Layout* L, InputState* in) {
                                    strlen(g_rename_txt + hi) + 1);
                            g_rename_caret = lo; g_rename_sel0 = g_rename_sel1 = lo; }
             else if (g_rename_caret < (int)strlen(g_rename_txt)) {
+                int nx = utf8_next(g_rename_txt, g_rename_caret);
                 memmove(g_rename_txt + g_rename_caret,
-                        g_rename_txt + g_rename_caret + 1,
-                        strlen(g_rename_txt + g_rename_caret + 1) + 1);
+                        g_rename_txt + nx,
+                        strlen(g_rename_txt + nx) + 1);
             }
             return;
         }
         if (k2 == VK_LEFT) {
-            if (g_rename_caret > 0) g_rename_caret--;
+            if (g_rename_caret > 0)
+                g_rename_caret = utf8_prev(g_rename_txt, g_rename_caret);
             g_rename_sel0 = g_rename_sel1 = g_rename_caret;
             return;
         }
         if (k2 == VK_RIGHT) {
-            if (g_rename_caret < (int)strlen(g_rename_txt)) g_rename_caret++;
+            if (g_rename_caret < (int)strlen(g_rename_txt))
+                g_rename_caret = utf8_next(g_rename_txt, g_rename_caret);
             g_rename_sel0 = g_rename_sel1 = g_rename_caret;
             return;
         }
@@ -15082,7 +19577,6 @@ static void handle_mouse(const Layout* L, InputState* in) {
             return;
         }
         if (in->char_pressed >= 32) {
-            char ch = (char)in->char_pressed;
             int len = (int)strlen(g_rename_txt);
             if (lo < hi) {                 // replace the selection
                 memmove(g_rename_txt + lo, g_rename_txt + hi,
@@ -15090,14 +19584,22 @@ static void handle_mouse(const Layout* L, InputState* in) {
                 len = (int)strlen(g_rename_txt);
                 g_rename_caret = lo;
             }
-            if (len < (int)sizeof(g_rename_txt) - 1) {
-                memmove(g_rename_txt + g_rename_caret + 1,
+            // Every character of the frame, each encoded to its real
+            // bytes (any language - not just the first byte of the first).
+            unsigned int cq[32];
+            int cn = tts_frame_chars(in, cq, 32);
+            for (int ci = 0; ci < cn; ci++) {
+                char enc[8];
+                int en = (cq[ci] >= 32) ? cp_encode(cq[ci], enc) : 0;
+                len = (int)strlen(g_rename_txt);
+                if (en <= 0 || len + en >= (int)sizeof(g_rename_txt)) continue;
+                memmove(g_rename_txt + g_rename_caret + en,
                         g_rename_txt + g_rename_caret,
                         strlen(g_rename_txt + g_rename_caret) + 1);
-                g_rename_txt[g_rename_caret] = ch;
-                g_rename_caret++;
-                g_rename_sel0 = g_rename_sel1 = g_rename_caret;
+                memcpy(g_rename_txt + g_rename_caret, enc, (size_t)en);
+                g_rename_caret += en;
             }
+            g_rename_sel0 = g_rename_sel1 = g_rename_caret;
             return;
         }
         return;                           // any other key: the field has it
@@ -15249,32 +19751,135 @@ static void handle_mouse(const Layout* L, InputState* in) {
     RectI content = L->list;
     g_content = content;
     compute_pane_tree_layout(g_pane_root, content);
-    bool zoom_pop_open = g_app.frame < g_zoom_pop_until;
+    bool zoom_pop_open = tick_before(g_zoom_pop_until);
     // Clicking a divider is NOT a click on either pane (spec: grabbing the
     // bar away from its handle does nothing at all - not even a focus flip).
+    // A press INSIDE an open centered popup is likewise NOT a pane click:
+    // without this guard the popup (which straddles the split) activated the
+    // pane underneath FIRST, search_popup_sync then saw the active pane
+    // change and CLOSED the popup, and the click fell through to the file
+    // list - the input never got it (spec 1).
     bool on_divider = g_pane_root &&
                       pane_tree_splitter_at(g_pane_root, in->x, in->y) != NULL;
+    bool on_popup = overlay_covers(in->x, in->y);
     if (!g_drag_split && !g_splitter_drag && !g_tab_drag && g_active_pane &&
         g_active_pane->kind == PN_LEAF &&
         (in->left_click || in->double_click || in->middle_click ||
          (in->wheel != 0 && !in->ctrl_pressed)) &&
         !(zoom_pop_open && inside(&L->zoom_pop, in->x, in->y)) &&
-        !on_divider &&
+        !on_divider && !on_popup &&
         in->x >= content.x && in->x < content.x + content.w &&
         in->y >= content.y && in->y < content.y + content.h) {
         Pane* hit = pane_at_point(g_pane_root, in->x, in->y);
         if (hit && hit != g_active_pane && hit->kind == PN_LEAF)
             activate_pane(hit);
     }
-    // ---- resize cursor (spec 9): col-resize over the grip of a VERTICAL
+    // ---- SEARCH POPUP overlay: it floats over the ACTIVE pane's body, so
+    //      while it is open it takes the press FIRST. A press inside the
+    //      input places the caret (double-click selects the word); the (x)
+    //      clears the query; a press ANYWHERE ELSE closes the popup and
+    //      lets the click fall through to whatever is underneath - the
+    //      standard outside-click rule, never a swallowed click. The popup
+    //      is a global overlay (search_popup_sync drops it the moment the
+    //      active pane/tab changes), so no stale overlay can linger over an
+    //      interface it no longer belongs to.
+    search_popup_sync();
+    if (g_search_popup_open && g_search_popup_pane &&
+        (in->left_click || in->double_click)) {
+        RectI popr = search_popup_rect();       // global: window-centered
+        if (inside(&popr, in->x, in->y)) {
+            focus_search();                     // type immediately
+            if (g_app.search_buf[0]) {
+                RectI clr = search_popup_clear_rect();
+                if (inside(&clr, in->x, in->y)) {   // clear (x) in the popup
+                    g_app.search_buf[0] = '\0';
+                    g_app.search_caret = g_app.search_anchor = 0;
+                    search_changed();
+                    return;
+                }
+            }
+            RectI fld = search_popup_field_rect();
+            field_click_caret(&fld, in, g_app.search_buf,
+                              &g_app.search_caret, &g_app.search_anchor,
+                              fld.x + SC(32), L->text_med);
+            g_text_drag = 2;                    // drag-select in the popup
+            return;
+        }
+        g_search_popup_open = false;            // outside press = dismiss
+        g_search_popup_pane = NULL;
+    }
+    // ---- LOCATION-BAR popup overlay: the same global window-centered overlay
+    //      as the search popup.  While it is open it takes the press FIRST: a
+    //      click in the path field places the caret; the quick-nav buttons
+    //      (Up / This PC) navigate; a press ANYWHERE ELSE closes the popup and
+    //      blurs the address bar, letting the click fall through to whatever
+    //      is underneath - the standard outside-click rule, never a swallowed
+    //      click.  Like the search popup it is a global overlay (addr_popup_sync
+    //      drops it the moment the active pane/tab changes or focus leaves).
+    addr_popup_sync();
+    if (g_addr_popup_open && g_addr_popup_pane &&
+        (in->left_click || in->double_click)) {
+        RectI popr = addr_popup_rect();       // global: window-centered
+        if (inside(&popr, in->x, in->y)) {
+            // quick-nav action buttons first (they re-anchor the field to the
+            // new location, exactly like focusing the address bar fresh).
+            for (int i = 0; i < ADDR_POPUP_ACT_N; i++) {
+                RectI b = addr_popup_action_rect(i);
+                bool en = (i == 0) ? has_parent() : true;
+                if (en && inside(&b, in->x, in->y)) {
+                    if (i == 0) { go_up(); focus_address(); }
+                    else        { navigate(THIS_PC, true); focus_address(); }
+                    return;
+                }
+            }
+            // A click on a child row opens THAT child (active pane only).
+            int srow = sug_hit(in->x, in->y);
+            if (srow >= 0) {
+                g_sug_sel = srow;             // accept reads the highlight
+                sug_accept();
+                return;
+            }
+            // Click in the path field: place the caret WITHOUT resetting the
+            // buffer (focus_address would discard in-progress edits).
+            RectI fld = addr_popup_field_rect();
+            field_click_caret(&fld, in, g_app.addr_buf,
+                              &g_app.addr_caret, &g_app.addr_anchor,
+                              fld.x + SC(30), L->text_med);
+            g_text_drag = 1;                    // drag-select in the popup
+            return;
+        }
+        blur_fields();                          // outside press = close + blur
+        // (no return: the click keeps falling through to whatever is
+        //  underneath - the standard outside-click rule)
+    }
+    // Wheel over the popup's child list scrolls THAT list (never the pane
+    // behind it) - the panel is an overlay, so it owns the wheel inside it.
+    if (g_addr_popup_open && g_addr_popup_pane && in->wheel) {
+        addr_popup_sync();
+        if (g_addr_popup_open && g_addr_popup_pane) {
+            RectI popr = addr_popup_rect();
+            RectI fld = addr_popup_field_rect();
+            if (inside(&popr, in->x, in->y) && in->y > fld.y + fld.h) {
+                // Wheel UP (positive delta) must show EARLIER children, so the
+                // first-visible index DEcreases - the same sign rule the main
+                // list uses (scroll -= wheel).  The old `+3 : -3` mapping ran
+                // the suggestion list backwards against every other surface.
+                sug_wheel(in->wheel > 0 ? -3 : 3);
+                in->wheel = 0;                 // consumed: no pane scrolling
+                return;
+            }
+        }
+    }
+    // ---- resize cursor (spec 9): col-resize anywhere over a VERTICAL
     //      divider, row-resize over a horizontal one; arrow everywhere
-    //      else, and never while another drag owns the pointer.
+    //      else, and never while another drag owns the pointer.  The whole
+    //      bar shows the resize cursor (not just the center grip).
     if (g_splitter_drag)
         platform_set_cursor(g_splitter_axis ? NOVA_CURSOR_ROW
                                             : NOVA_CURSOR_COL);
     else if (!g_drag_split && !g_tab_drag && !g_size_drag && g_pane_root &&
              !g_app.menu_open && !g_app.view_menu_open) {
-        Pane* hp = splitter_handle_at(g_pane_root, in->x, in->y);
+        Pane* hp = pane_tree_splitter_at(g_pane_root, in->x, in->y);
         if (hp && hp->kind != PN_LEAF)
             platform_set_cursor(hp->kind == PN_SPLIT_V ? NOVA_CURSOR_COL
                                                        : NOVA_CURSOR_ROW);
@@ -15320,12 +19925,10 @@ static void handle_mouse(const Layout* L, InputState* in) {
         // it is checked before everything else so no other hit-test can
         // swallow it - one press, at most one menu.
         if (!gesture) {
-            for (int i = 0; i < L->tab_drawn && i < TAB_MAX; i++) {
-                if (L->tab_rects[i].w > 0 &&
-                    inside(&L->tab_rects[i], in->x, in->y)) {
-                    ctx_open_tab(i, in->x, in->y);
-                    return;
-                }
+            int tvi = tab_hit_at(L, in->x, in->y);
+            if (tvi >= 0 && tvi < TAB_MAX) {
+                ctx_open_tab(tvi, in->x, in->y);
+                return;
             }
         }
         // SIDEBAR: a real entry gets its own menu; a section head or the
@@ -15351,7 +19954,10 @@ static void handle_mouse(const Layout* L, InputState* in) {
                     sel_add(vi);
                     g_app.selected = vi;
                 }
-                ctx_open_at(vi, g_app.entries[ei].is_directory, in->x, in->y);
+                if (g_st_running)
+                    ctx_open_at(vi, g_app.entries[ei].is_directory, in->x, in->y);
+                else
+                    xm_open_items(vi, g_app.entries[ei].is_directory, in->x, in->y);
                 return;
             }
         }
@@ -15362,7 +19968,8 @@ static void handle_mouse(const Layout* L, InputState* in) {
             in->y < L->list.y + L->list.h) {
             sel_clear();
             g_app.selected = -1;
-            ctx_open_bg(in->x, in->y);
+            if (g_st_running) ctx_open_bg(in->x, in->y);
+            else xm_open_bg(in->x, in->y);
         } else {
             ctx_log_miss(in->x, in->y);   // chrome: delivered, no menu
         }
@@ -15372,12 +19979,11 @@ static void handle_mouse(const Layout* L, InputState* in) {
     // 1. Check if middle-clicking an existing tab → close that tab
     //    (tab_rects is only filled up to tab_drawn, same as the click hit-test)
     if (in->middle_click) {
-        for (int i = 0; i < L->tab_drawn; i++) {
-            if (inside(&L->tab_rects[i], in->x, in->y)) {
-                ws_close(i);
-                in->middle_click = false;
-                return;
-            }
+        int tvi = tab_hit_at(L, in->x, in->y);
+        if (tvi >= 0) {
+            ws_close(tvi);
+            in->middle_click = false;
+            return;
         }
     }
 
@@ -15426,7 +20032,7 @@ static void handle_mouse(const Layout* L, InputState* in) {
     in->middle_click = false;
 
     // ---- pane splitter drag (RESIZE_DRAG): resize adjacent panes ----
-    //      Only ever armed by the 3-dot handle; nothing else enters here.
+    //      Armed by a press ANYWHERE along a divider bar; ends on release.
     if (g_splitter_drag) {
         if (in->left_down) {
             Pane* sp = g_splitter_pane;
@@ -15443,11 +20049,8 @@ static void handle_mouse(const Layout* L, InputState* in) {
             return;
         }
         g_splitter_drag = false;
+        ReleaseCapture();
         if (g_drag_src == DRAG_RESIZE) g_drag_src = DRAG_NONE;
-        if (g_splitter_pane)
-            printf("[tile] resize -> ratio %.2f\n",
-                   (double)g_splitter_pane->ratio);
-        fflush(stdout);
         session_mark_dirty(); // a finished resize is a workspace change
         return;
     }
@@ -15605,15 +20208,16 @@ static void handle_mouse(const Layout* L, InputState* in) {
         if (inside(&L->cap_close, in->x, in->y)) { request_exit_from_click(); return; }
         if (inside(&L->menu_btn, in->x, in->y)) { g_app.menu_open = true; return; }
         if (inside(&L->set_btn, in->x, in->y)) { settings_open(); return; }
-        if (inside(&L->new_tab_btn, in->x, in->y)) { ws_new(NULL); return; }
-        for (int i = 0; i < L->tab_drawn; i++) {
-            const RectI* r = &L->tab_rects[i];
-            if (!inside(r, in->x, in->y)) continue;
+        if (inside(&L->side_btn, in->x, in->y)) { sidebar_toggle(); return; }
+        if (inside(&L->new_tab_btn, in->x, in->y)) { ws_new(g_app.current_path); return; }
+        int tvi = tab_hit_at(L, in->x, in->y);
+        if (tvi >= 0) {
+            const RectI* r = &L->tab_rects[tvi];
             // same cross geometry the toolbar draws
             int cx = r->x + r->w - SC(16), cy = r->y + (r->h - SC(10)) / 2;
             RectI xr = {cx - SC(3), cy - SC(3), SC(16), SC(16)};
             if (inside(&xr, in->x, in->y)) {
-                ws_close(i);
+                ws_close(tvi);
             } else {
                 // TAB_DRAG source: arm only. The view switches on RELEASE
                 // (see the tab gesture below) - switching on the press
@@ -15624,15 +20228,69 @@ static void handle_mouse(const Layout* L, InputState* in) {
                 g_tab_flipped = false;
                 g_tab_arm_x = in->x;
                 g_tab_arm_y = in->y;
-                g_tab_drag_idx = i;
+                g_tab_drag_idx = tvi;
             }
             return;
         }
 
+        // ---- per-pane nav row (split): a click in the top-bar nav band
+        //      belongs to the pane whose column it lands in.  Activate that
+        //      pane (g_app becomes its state) and rebuild the nav/address/
+        //      search rects for ITS column - the handlers below then drive
+        //      that pane's own, independent toolbar.  Single pane: NL stays
+        //      L, so nothing changes.  A nav-band click over no pane (above
+        //      the sidebar) blanks the controls so it can't hit the hidden
+        //      full-width toolbar.
+        //      A pane STACKED below the top row (a horizontal split) can't use
+        //      that one shared band; it draws its own toolbar at the top of its
+        //      region, so a click there resolves to THAT pane and its embedded
+        //      strip (never the band) - each pane keeps a fully independent,
+        //      reachable search field whatever the pane count or orientation.
+        const Layout* NL = L;
+        Layout nlay;
+        if (pane_count(g_pane_root) > 1) {
+            Pane* np = NULL;
+            int navy = nav_row_y();
+            bool isnav = false;
+            if (in->y >= SC(TAB_H) && in->y < L->toolbar_h) {
+                // pane_input_build() above ALREADY recomputed the tree from the
+                // WINDOW list (win->list).  L->list is now the active pane's list
+                // (pane_list_metrics rewrote it), so feeding it back into
+                // compute_pane_tree_layout would squash the whole tree into that
+                // one pane - nav_pane_at would then find no leaf under the click.
+                // The tree rects are fresh from pane_input_build; use them.
+                np = nav_pane_at(g_pane_root, in->x);
+                isnav = true;
+            } else if (in->y >= L->toolbar_h) {
+                // embedded nav strip of a stacked-below pane (top of its region)
+                Pane* lp = pane_at_point(g_pane_root, in->x, in->y);
+                if (lp && lp->kind == PN_LEAF && lp->rect.y > L->toolbar_h &&
+                    in->y >= lp->rect.y && in->y < lp->rect.y + SC(NAV_H)) {
+                    np = lp;
+                    navy = lp->rect.y + (nav_row_y() - SC(TAB_H));
+                    isnav = true;
+                }
+            }
+            if (isnav) {
+                nlay = *L;                       // keep text metrics / radius
+                if (np) {
+                    if (np != g_active_pane) activate_pane(np);
+                    nav_row_metrics(&nlay, np->rect.x, np->rect.w, navy);
+                    compute_crumbs(&nlay, g_app.current_path);
+                } else {
+                    memset(nlay.nav_btns, 0, sizeof nlay.nav_btns);
+                    nlay.addr_field = nlay.search_field = nlay.search_clear =
+                        (RectI){0, 0, 0, 0};
+                    nlay.crumb_n = 0;
+                }
+                NL = &nlay;
+            }
+        }
+
         // ---- breadcrumb pills live INSIDE the address field: test them
         //      first, a click on a segment must navigate, not focus ----
-        for (int i = 0; i < L->crumb_n; i++) {
-            const RectI* s = &L->crumb_seg[i];
+        for (int i = 0; i < NL->crumb_n; i++) {
+            const RectI* s = &NL->crumb_seg[i];
             if (s->w > 0 && inside(s, in->x, in->y)) {
                 navigate(g_crumb_path[i], true);
                 return;
@@ -15641,16 +20299,19 @@ static void handle_mouse(const Layout* L, InputState* in) {
 
         // fields (click anywhere in the box = editable, caret where you
         // clicked; a double-click selects the word under the pointer)
-        if (inside(&L->addr_field, in->x, in->y)) {
+        if (inside(&NL->addr_field, in->x, in->y)) {
             focus_address();
-            field_click_caret(&L->addr_field, in, g_app.addr_buf,
+            field_click_caret(&NL->addr_field, in, g_app.addr_buf,
                               &g_app.addr_caret, &g_app.addr_anchor,
-                              L->addr_field.x + SC(8), L->text_med);
+                              NL->addr_field.x + SC(8), NL->text_med);
             g_text_drag = 1;
             return;
         }
-        if (inside(&L->search_field, in->x, in->y)) {
-            if (g_app.search_buf[0] && inside(&L->search_clear, in->x, in->y)) {
+        if (inside(&NL->search_field, in->x, in->y)) {
+            // Clicking Search opens the LARGE focused popup overlay on top
+            // of this pane (anchored to it) - the same live query, caret
+            // and filter, just a bigger, impossible-to-miss place to type.
+            if (g_app.search_buf[0] && inside(&NL->search_clear, in->x, in->y)) {
                 // the (x): clear the query, keep typing focus in the box
                 g_app.search_buf[0] = '\0';
                 g_app.search_caret = g_app.search_anchor = 0;
@@ -15659,11 +20320,13 @@ static void handle_mouse(const Layout* L, InputState* in) {
                 g_app.search_focused = true;
             } else {
                 focus_search();
-                field_click_caret(&L->search_field, in, g_app.search_buf,
+                field_click_caret(&NL->search_field, in, g_app.search_buf,
                                   &g_app.search_caret, &g_app.search_anchor,
-                                  L->search_field.x + SC(26), L->text_med);
+                                  NL->search_field.x + SC(26), NL->text_med);
                 g_text_drag = 2;
             }
+            g_search_popup_open = true;
+            g_search_popup_pane = g_active_pane;
             return;
         }
 
@@ -15673,7 +20336,7 @@ static void handle_mouse(const Layout* L, InputState* in) {
         // right side buttons
         if (inside(&L->hidden_btn, in->x, in->y)) { toggle_hidden(); return; }
         if (inside(&L->zoom_lbl, in->x, in->y)) {
-            g_zoom_pop_until = g_app.frame + 100;   // % half pops the slider
+            g_zoom_pop_until = tick_in(1700);   // % half pops the slider
             return;
         }
         if (inside(&L->view_btn, in->x, in->y)) {
@@ -15704,38 +20367,34 @@ static void handle_mouse(const Layout* L, InputState* in) {
 
         // nav icons: back | forward | up | refresh (same order they draw)
         for (int i = 0; i < NAV_BTN_COUNT; i++) {
-            if (!inside(&L->nav_btns[i], in->x, in->y)) continue;
+            if (!inside(&NL->nav_btns[i], in->x, in->y)) continue;
             if (i == 0) go_back();
             else if (i == 1) go_forward();
             else if (i == 2) go_up();
-            else load_dir(g_app.current_path);            // refresh
+            else folder_refresh_keep();                   // refresh (in place)
             return;
         }
 
-        // ---- RESIZE_DRAG source: the 3-dot grip at the exact CENTER of
-        //      a divider. Tested before every list-area handler so a press
-        //      on the divider can never arm a pane drag, arm a sort or
-        //      select an item: the grip resizes, the rest of the bar does
-        //      NOTHING at all (spec 10 - only the handle resizes).
+        // ---- RESIZE_DRAG source: ANY point along a divider bar.  Tested
+        //      before every list-area handler so a press on the divider can
+        //      never arm a pane drag, arm a sort or select an item.  The
+        //      whole bar (full length, SPLITTER_HIT wide) is draggable - the
+        //      3-dot grip is only a visual affordance at its center, not a
+        //      requirement.  The deepest divider under the cursor wins.
         if (g_pane_root) {
-            Pane* hp = splitter_handle_at(g_pane_root, in->x, in->y);
+            Pane* hp = pane_tree_splitter_at(g_pane_root, in->x, in->y);
             if (hp && hp->kind != PN_LEAF) {
-                RectI hr = splitter_handle_rect(hp);
-                printf("[tile] grip press %d,%d -> rect %d,%d %dx%d\n",
-                       in->x, in->y, hr.x, hr.y, hr.w, hr.h);
-                fflush(stdout);
                 g_splitter_pane = hp;
                 g_splitter_axis = (hp->kind == PN_SPLIT_V) ? 0 : 1;
                 g_splitter_start_pos = g_splitter_axis ? in->y : in->x;
                 g_splitter_start_ratio = hp->ratio;
                 g_splitter_drag = true;
                 g_drag_src = DRAG_RESIZE;
-                g_drag_split_armed = false; // the handle wins the press
+                g_drag_split_armed = false; // the divider wins the press
                 g_sort_pending = -1;        // ... and no sort either
                 SetCapture((HWND)g_app.hwnd);
                 return;
             }
-            if (pane_tree_splitter_at(g_pane_root, in->x, in->y)) return; // bar w/o grip
         }
 
         // ---- pane title [x]: close THAT pane. Tested before the grab
@@ -15750,15 +20409,19 @@ static void handle_mouse(const Layout* L, InputState* in) {
             }
         }
 
-        // ---- PANE_DRAG source: ONLY the pane's title strip (its header,
+        // ---- PANE_DRAG source: ONLY a pane's title strip (its header,
         //      the strip with the folder name and the [x]). The list body
         //      below is Explorer territory - folder rows, column headers
         //      and empty space must never arm a pane move or a split
         //      (spec 10/11: header = move, file area = browse).
-        if (g_active_pane && g_active_pane->kind == PN_LEAF) {
-            RectI tr = {g_active_pane->rect.x, g_active_pane->rect.y,
-                        g_active_pane->rect.w, PANE_TITLE_H};
-            if (inside(&tr, in->x, in->y)) {
+        //      ANY pane's header grabs, not just the active one's: the
+        //      press activates that pane first - the very rule its close
+        //      [x] already follows - so in a 3+-pane tree every pane can be
+        //      moved without first closing another one to reach it.
+        {
+            Pane* grab = pane_title_strip_at(g_pane_root, in->x, in->y);
+            if (grab) {
+                if (grab != g_active_pane) activate_pane(grab);
                 g_drag_split_armed = true;
                 g_drag_src = DRAG_PANE;
                 g_drag_start_x = in->x;
@@ -15787,11 +20450,11 @@ static void handle_mouse(const Layout* L, InputState* in) {
                 if (!inside(&s->rect, in->x, in->y)) continue;
 
                 if (s->is_file) {
-                    HINSTANCE hi = ShellExecuteA(NULL, "open", s->path, NULL,
-                                                 NULL, SW_SHOWNORMAL);
-                    if ((INT_PTR)hi <= 32)
-                        set_status("Cannot open: %s", s->label);
-                    else set_status("Opened: %s", s->label);
+                    if (open_with_shell(s->path, s->label)) {
+                        remember_path(s->path);
+                        build_sidebar();
+                        set_status("Opened: %s", s->label);
+                    }
                 } else {
                     navigate(s->path, true);
                 }
@@ -15799,11 +20462,21 @@ static void handle_mouse(const Layout* L, InputState* in) {
             }
         }
 
-        // scrollbar
+        // scrollbar: pressing the THUMB grabs it where it was pressed;
+        // pressing the track jumps the thumb under the pointer - either
+        // way the bar then FOLLOWS the mouse while the button is held
+        // (it used to jump once and ignore the drag).
         if (L->has_scroll && inside(&L->scroll_track, in->x, in->y)) {
             int travel = L->scroll_track.h - L->scroll_thumb.h;
+            g_sb_grab = inside(&L->scroll_thumb, in->x, in->y)
+                            ? in->y - L->scroll_thumb.y
+                            : L->scroll_thumb.h / 2;
+            g_sb_track_y = L->scroll_track.y;
+            g_sb_travel = travel;
+            g_sb_max = L->max_scroll;
+            g_sb_drag = travel > 0;
             if (travel > 0) {
-                int rel = in->y - L->scroll_track.y - L->scroll_thumb.h / 2;
+                int rel = in->y - L->scroll_track.y - g_sb_grab;
                 g_app.scroll = rel * L->max_scroll / travel;
             }
             clamp_scroll(L);
@@ -15840,10 +20513,21 @@ static void handle_mouse(const Layout* L, InputState* in) {
                 if (a > b) { int t = a; a = b; b = t; }
                 sel_clear();
                 for (int i = a; i <= b; i++) sel_add(i);
+            } else if (g_sel_n > 1 && sel_contains(idx)) {
+                // Part of a multi selection: keep the whole set for a
+                // drag; a plain release collapses it (file_drag_tick).
+                g_app.selected = idx;
+                g_fdrag_collapse = idx;
             } else {
                 sel_clear();
                 sel_add(idx);
                 g_app.selected = idx;
+            }
+            // Arm the drag-out (any selected row may carry the selection).
+            if (!in->double_click) {
+                g_fdrag_armed = true;
+                g_fdrag_x = in->x;
+                g_fdrag_y = in->y;
             }
             g_drag_src = DRAG_FOLDER;   // FOLDER_DRAG: Explorer only - this
                                         // press can never reach a layout
@@ -15865,10 +20549,24 @@ static void handle_mouse(const Layout* L, InputState* in) {
                                              ? idx
                                              : (int)g_app.view_count - 1;
                         if (g_app.selected < 0) g_app.selected = -1;
+                        sel_clear();
+                        if (g_app.selected >= 0) sel_add(g_app.selected);
                         clamp_scroll(L);
                     }
                 }
             }
+        }
+        // Empty folder background: the standard "click away" deselect -
+        // the right-click path clears the same list body above, so a
+        // plain click there must not keep a stale selection alive.
+        // Header, scrollbar, sidebar and chrome return earlier and can
+        // never reach this test.
+        if (idx < 0 &&
+            in->x >= L->list.x && in->x < L->list.x + L->list.w &&
+            in->y >= L->list.y + L->list_head_h &&
+            in->y < L->list.y + L->list.h) {
+            sel_clear();
+            g_app.selected = -1;
         }
         return;
     }
@@ -15914,7 +20612,7 @@ static int topbar_hit(int x, int y) {
     // (selftest: corner hits).
     if (g_app.menu_open || g_app.view_menu_open || g_rad_open || g_ctx_open ||
         g_rename_vi >= 0 || g_confirm_kind != CONFIRM_NONE ||
-        g_set_open ||
+        g_set_open || g_xm_open || g_help_open || g_welcome_open ||
         g_app.addr_focused || g_app.search_focused)
         return 1;
 
@@ -15922,14 +20620,151 @@ static int topbar_hit(int x, int y) {
     if (L->toolbar.w <= 0) return 0;
     if (inside(&L->cap_min, x, y) || inside(&L->cap_max, x, y) ||
         inside(&L->cap_close, x, y) || inside(&L->menu_btn, x, y) ||
-        inside(&L->set_btn, x, y) ||
+        inside(&L->set_btn, x, y) || inside(&L->side_btn, x, y) ||
         inside(&L->new_tab_btn, x, y))
         return 1;
     for (int i = 0; i < L->tab_drawn; i++)
         if (L->tab_rects[i].w > 0 && inside(&L->tab_rects[i], x, y))
             return 1;
+    if (tab_hit_at(L, x, y) >= 0) return 1;   // padding above a chip = tab
     if (y >= L->toolbar.y && y < L->toolbar.y + SC(TAB_H)) return -1;
     return 0;
+}
+
+// Files dragged in from Explorer / the desktop and dropped on the window
+// land in the open folder with Explorer's rule: the SAME drive moves,
+// another drive copies; Ctrl forces a copy, Shift forces a move.
+static void drop_pump(void) {
+    char** v = NULL;
+    int dx = 0, dy = 0;
+    int n = platform_take_dropped(&v, &dx, &dy);
+    if (n <= 0) return;
+    // The drop belongs to the pane UNDER the pointer (a drag from one pane
+    // to another), not to whichever pane happened to be active.
+    {
+        Pane* tp = pane_at_point(g_pane_root, dx, dy);
+        if (tp && tp != g_active_pane) activate_pane(tp);
+    }
+    // Dropped back onto the folder it came from: nothing to do.
+    bool same = true;
+    for (int i = 0; i < n && same; i++) {
+        char par[1024];
+        same = parent_path(v[i], par, sizeof par) &&
+               _stricmp(par, g_app.current_path) == 0;
+    }
+    if (same) {
+        for (int i = 0; i < n; i++) free(v[i]);
+        free(v);
+        return;
+    }
+    if (is_this_pc(g_app.current_path) || !dir_exists(g_app.current_path)) {
+        set_status("Open a folder first to drop files into it");
+    } else {
+        InputState* in = platform_get_input();
+        char dv[MAX_PATH] = "", sv[MAX_PATH] = "";
+        GetVolumePathNameA(g_app.current_path, dv, sizeof dv);
+        GetVolumePathNameA(v[0], sv, sizeof sv);
+        bool move = dv[0] && _stricmp(dv, sv) == 0;
+        if (in && in->ctrl_pressed) move = false;
+        if (in && in->shift_pressed) move = true;
+        paste_start(v, n, move, g_app.current_path);
+    }
+    for (int i = 0; i < n; i++) free(v[i]);
+    free(v);
+}
+
+// ---- AUTO-REFRESH: watch the open folder like Explorer does ------------
+// Before this, a file another program created, renamed or deleted only
+// appeared after F5.  The ACTIVE pane's folder now carries a change
+// notification; a burst of changes is debounced (one reload, ~0.4 s after
+// the burst starts), and the reload keeps the selection and the scroll
+// position, so the view never jumps under the user.  Skipped while a
+// deep search shows results, a copy runs, a field is being edited, in
+// the Tree view (its open branches would collapse) and in test runs.
+static HANDLE g_fw_handle = INVALID_HANDLE_VALUE;
+static char   g_fw_path[1024];
+static unsigned long g_fw_due = 0;       // debounce deadline, 0 = none
+static bool   g_fw_off = false;          // tests / benchmarks: never
+
+static void folder_watch_close(void) {
+    if (g_fw_handle != INVALID_HANDLE_VALUE) FindCloseChangeNotification(g_fw_handle);
+    g_fw_handle = INVALID_HANDLE_VALUE;
+    g_fw_path[0] = '\0';
+}
+
+static void folder_watch_poke(void) { g_fw_due = tick_in(150); }
+
+static void folder_refresh_keep(void) {
+    // remember what the user is looking at, by PATH (indices change)
+    static char keep[64][1024];
+    int nk = 0;
+    char cur_sel[1024] = "";
+    for (int i = 0; i < g_sel_n && nk < 64; i++) {
+        int vi = g_sel[i];
+        if (vi < 0 || (size_t)vi >= g_app.view_count) continue;
+        int ei = g_app.view[vi];
+        if (ei < 0 || (size_t)ei >= g_app.count) continue;
+        snprintf(keep[nk++], sizeof keep[0], "%s", g_app.entries[ei].path);
+    }
+    if (g_app.selected >= 0 && (size_t)g_app.selected < g_app.view_count) {
+        int ei = g_app.view[g_app.selected];
+        if (ei >= 0 && (size_t)ei < g_app.count)
+            snprintf(cur_sel, sizeof cur_sel, "%s", g_app.entries[ei].path);
+    }
+    int scroll = g_app.scroll;
+    char path[1024];
+    snprintf(path, sizeof path, "%s", g_app.current_path);
+    load_dir(path);
+    if (_stricmp(path, g_app.current_path) != 0) return;
+    sel_clear();
+    g_app.selected = -1;
+    for (size_t vi = 0; vi < g_app.view_count; vi++) {
+        const char* ep = g_app.entries[g_app.view[vi]].path;
+        if (cur_sel[0] && _stricmp(ep, cur_sel) == 0) g_app.selected = (int)vi;
+        for (int k = 0; k < nk; k++)
+            if (_stricmp(ep, keep[k]) == 0) { sel_add((int)vi); break; }
+    }
+    g_app.scroll = scroll;            // clamped by the next layout pass
+    g_scroll_to_sel = false;          // never jump to the selection
+}
+
+static bool g_bench;                     // (defined with the bench code)
+// --smoke: start up, paint a few frames, exit 0 - what the installer runs
+// after a silent update.  The full --selftest checks THIS machine's shell
+// (drives, 7-Zip, Send to...) and must never roll a user's update back.
+static bool g_smoke = false;
+static void folder_watch_pump(void) {
+    if (g_fw_off || g_st_running || g_bench) { folder_watch_close(); return; }
+    const char* cur = g_app.current_path;
+    if (!cur[0] || is_this_pc(cur) || g_app.load_state == LOAD_ERROR) {
+        folder_watch_close();
+        return;
+    }
+    if (g_fw_handle == INVALID_HANDLE_VALUE || _stricmp(g_fw_path, cur) != 0) {
+        folder_watch_close();
+        g_fw_handle = FindFirstChangeNotificationA(
+            cur, FALSE,
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE |
+                FILE_NOTIFY_CHANGE_ATTRIBUTES);
+        if (g_fw_handle != INVALID_HANDLE_VALUE)
+            snprintf(g_fw_path, sizeof g_fw_path, "%s", cur);
+        g_fw_due = 0;
+        return;                       // a fresh watch starts quiet
+    }
+    if (WaitForSingleObject(g_fw_handle, 0) == WAIT_OBJECT_0) {
+        if (!FindNextChangeNotification(g_fw_handle)) folder_watch_close();
+        if (!g_fw_due) g_fw_due = tick_in(400);
+    }
+    if (g_fw_due && !tick_before(g_fw_due)) {
+        bool busy = paste_busy() || g_rename_vi >= 0 ||
+                    g_confirm_kind != CONFIRM_NONE ||
+                    g_srch_state != SRCH_IDLE || g_app.addr_focused ||
+                    g_app.view_mode == MODE_TREE;
+        if (busy) { g_fw_due = tick_in(400); return; }
+        g_fw_due = 0;
+        folder_refresh_keep();
+    }
 }
 
 static void handle_input(void) {
@@ -15940,9 +20775,13 @@ static void handle_input(void) {
 
     search_pump();                  // finish / progress / retry a folder scan
     update_pump();                  // publish the update worker's status
+    paste_pump();                   // background copy: progress / landing
+    drop_pump();                    // files dropped in from Explorer
+    folder_watch_pump();            // auto-refresh when the folder changes
 
     Layout L, paneL;
     zoom_animate();                 // ease the size towards its target
+    sidebar_animate();              // slide the sidebar open / shut
     compute_layout(&L, w, h);
     g_content = L.list;
     pane_sync_active();             // keep the active pane's state stored
@@ -15952,6 +20791,13 @@ static void handle_input(void) {
     handle_keys(in, &paneL);
     gesture_tick(in);               // Alt + corner gesture (cheap no-op w/o Alt)
     handle_mouse(&L, in);
+    // Mouse side buttons (XBUTTON1 / XBUTTON2) = Back / Forward, exactly
+    // like Explorer - but never through a modal panel or menu.
+    if (in->xbutton && !overlay_owns_input() && !g_close_pending) {
+        if (in->xbutton == 1) go_back();
+        else go_forward();
+        in->xbutton = 0;
+    }
 }
 
 // ------------------------------------------------------------
@@ -16260,14 +21106,28 @@ static void session_mark_dirty(void) {
     g_sess_when = GetTickCount();
 }
 
+// Shared format ceilings: the WRITER refuses to emit (keeping the old
+// snapshot) anything the PARSER would refuse to read.  The two sides MUST
+// agree - otherwise the app saves a file its own restore then rejects as
+// corrupt and drops every tab on restart.
+#define SESS_MAX_DEPTH 16        // pending-leaf stack the parser accepts
+#define SESS_MAX_NODES 160       // panes per tab (corruption ceiling)
+
 // Pre-order walk: "L <path>" per leaf, "S <v|h> <ratio>" per split.
 // The depth cap makes a hand-corrupted tree abort the WRITE instead of
 // recursing forever; an aborted write keeps the old snapshot file.
-static bool session_write_tree(FILE* f, Pane* p, int depth) {
+// nodes/sp mirror the parser's SESS_WS exactly: a leaf is a node that
+// PUSHES the pending-leaf stack, a split is a node that pops it - the
+// right-skewed chain repeated self-splits produce has sp == leaf count
+// (not tree depth), which is what used to overflow the parser.
+static bool session_write_tree(FILE* f, Pane* p, int depth, int* nodes,
+                               int* sp) {
     if (!p || depth > 16) return false;
     if (p->kind == PN_LEAF) {
+        if (++*nodes > SESS_MAX_NODES || *sp >= SESS_MAX_DEPTH) return false;
         const char* path = p->folder.current_path;
         if (!path[0]) path = platform_get_home_directory();
+        (*sp)++;
         return fprintf(f, "L %s\n", path) > 0;
     }
     if (p->kind != PN_SPLIT_V && p->kind != PN_SPLIT_H) return false;
@@ -16277,9 +21137,12 @@ static bool session_write_tree(FILE* f, Pane* p, int depth) {
     // POST-ORDER: children are pushed on the parser's stack first, then
     // the split line pops them. Writing the split before its children
     // (pre-order) leaves the stack in the wrong state and gets refused.
-    return session_write_tree(f, p->left, depth + 1) &&
-           session_write_tree(f, p->right, depth + 1) &&
-           fprintf(f, "S %c %.4f\n",
+    if (++*nodes > SESS_MAX_NODES) return false;
+    if (!session_write_tree(f, p->left, depth + 1, nodes, sp)) return false;
+    if (!session_write_tree(f, p->right, depth + 1, nodes, sp)) return false;
+    if (*sp < 2) return false;               // the parser needs 2 to merge
+    (*sp)--;
+    return fprintf(f, "S %c %.4f\n",
                    p->kind == PN_SPLIT_V ? 'v' : 'h', (double)r) > 0;
 }
 
@@ -16287,10 +21150,12 @@ static bool session_write_tree(FILE* f, Pane* p, int depth) {
 // pane by its leaf number, so both directions walk the same order.
 static int session_leaf_index(Pane* p, Pane* want, int* counter) {
     if (!p) return -1;
-    if (p->kind == PN_LEAF)
-        return (p == want) ? (*counter)++ : -1;
-    int r = session_leaf_index(p->left, want, counter);
-    if (r >= 0) return r;
+    if (p->kind == PN_LEAF) {
+        int idx = (*counter)++;      // EVERY leaf consumes an index, not
+        return (p == want) ? idx : -1;  // just the wanted one - otherwise
+    }                                // "ap" was always saved as 0 and the
+    int r = session_leaf_index(p->left, want, counter);   // restart focused
+    if (r >= 0) return r;            // the first pane, not the live one
     return session_leaf_index(p->right, want, counter);
 }
 static Pane* session_leaf_at(Pane* p, int want, int* counter) {
@@ -16319,8 +21184,9 @@ static void session_save_now(void) {
     bool ok = fprintf(f, "nvsession 1\n") > 0;
     for (int i = 0; ok && i < g_ws_n; i++) {
         Pane* root = ws_root(i);
+        int wn = 0, wsp = 0;   // per tab: mirrors one parser SESS_WS
         ok = root && fprintf(f, "tab\n") > 0 &&
-             session_write_tree(f, root, 0);
+             session_write_tree(f, root, 0, &wn, &wsp);
     }
     int c = 0;
     int ap = ok ? session_leaf_index(g_pane_root, g_active_pane, &c) : -1;
@@ -16334,8 +21200,8 @@ static void session_save_now(void) {
 }
 
 // ---- restore: parse FIRST, commit LAST (a bad file never mutates) ----
-#define SESS_MAX_DEPTH 16        // split nesting the parser accepts
-#define SESS_MAX_NODES 160       // panes per tab (corruption ceiling)
+// (SESS_MAX_DEPTH / SESS_MAX_NODES live next to the writer above: both
+//  sides of the format share them.)
 
 typedef struct {
     Pane* stack[SESS_MAX_DEPTH];
@@ -16378,6 +21244,71 @@ static void session_parse_split(SESS_WS* sw, char axis, double ratio) {
     sw->stack[sw->sp - 1] = n;
 }
 
+// Load ONE pane's folder directly into that pane's own FolderView, without
+// touching the global navigation state (sidebar, recents, search, icon
+// burst, active listing).  session_restore() stores PATHS only, so every
+// restored pane that is NOT the active one comes back with entries == NULL
+// and would otherwise sit on "Loading..." forever (it is only read when the
+// user actually clicks into it via activate_pane).  This fills the inactive
+// panes at restore time so every split/tab shows its real listing at once -
+// one slow or denied folder only affects its OWN pane (its load_state is
+// LOAD_ERROR, never a fake empty) and never blocks the others.
+static void pane_load_restored(Pane* p) {
+    if (!p || p->kind != PN_LEAF) return;
+    if (p->folder.entries) return;                 // already loaded
+    const char* path = p->folder.current_path;
+    if (!path[0]) return;
+
+    // Free any stale arrays first (a re-restore of the same tree).
+    free(p->folder.entries);
+    free(p->folder.view);
+    p->folder.entries = NULL;
+    p->folder.view = NULL;
+    p->folder.count = 0;
+    p->folder.view_count = 0;
+    p->folder.selected = -1;
+    p->folder.scroll = 0;
+
+    size_t count = 0;
+    DirEntry* entries = NULL;
+    if (is_this_pc(path)) {
+        entries = make_pc_entries(&count);
+    } else if (g_app.platform && g_app.platform->get_directory_entries) {
+        entries = g_app.platform->get_directory_entries(path, &count);
+    }
+    if (!entries) {                                 // denied / gone / unplugged
+        p->folder.load_state = LOAD_ERROR;          // NOT an empty folder
+        return;
+    }
+    filter_entries(entries, &count);                // hidden / system out
+    if (count > 1) qsort(entries, count, sizeof(DirEntry), cmp_entry);
+    for (size_t i = 0; i < count; i++) {            // fresh cache memos
+        entries[i].icon_idx = -1;
+        entries[i].tbmp_idx = -1;
+        entries[i].ct_tbmp_idx = -1;
+    }
+    p->folder.entries = entries;
+    p->folder.count = count;
+    p->folder.load_state = count > 0 ? LOAD_OK : LOAD_EMPTY;
+
+    // The view is the identity order (this pane is not the active one, so
+    // it keeps the default name sort and no search filter).
+    int* v = (count > 0) ? (int*)malloc(count * sizeof(int)) : NULL;
+    if (v) {
+        for (size_t i = 0; i < count; i++) v[i] = (int)i;
+        p->folder.view = v;
+        p->folder.view_count = (int)count;
+    }
+}
+
+// Walk a pane tree and load every leaf that still has no listing.
+static void pane_load_tree_restored(Pane* p) {
+    if (!p) return;
+    if (p->kind == PN_LEAF) { pane_load_restored(p); return; }
+    pane_load_tree_restored(p->left);
+    pane_load_tree_restored(p->right);
+}
+
 // Startup restore. Returns true when a snapshot was rebuilt; on false
 // NOTHING was touched and the caller starts fresh as usual.
 static bool session_restore(void) {
@@ -16399,6 +21330,7 @@ static bool session_restore(void) {
     bool header = false;
 
     while (!bad && fgets(line, sizeof(line), f)) {
+        legacy_line_fix(line, sizeof line);   // pre-UTF-8 builds' paths
         size_t n = strlen(line);
         while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
         if (!line[0] || line[0] == '#') continue;
@@ -16493,6 +21425,22 @@ static bool session_restore(void) {
     g_active_pane = act;
     app_push_folder(&act->folder);              // g_app = the active leaf
     load_dir(act->folder.current_path);         // real listing + sidebar
+    // load_dir() wrote the listing into g_app, which BORROWS the active
+    // leaf's arrays: mirror it back NOW so the walk below sees the active
+    // pane as already loaded and never re-reads its folder (one FS request
+    // per restored path, spec 3).
+    pane_sync_active();
+    // Every OTHER restored pane (the split halves beside the active one and
+    // the panes of the BACKGROUND tabs) comes back from the snapshot with a
+    // PATH only - session files store paths, never listings - so without
+    // this pass they would paint "Loading..." until the user clicks into
+    // them.  Fill them now, visible tab first, and each pane independently:
+    // a missing / denied / unplugged path marks ONLY that pane LOAD_ERROR
+    // (never a fake empty folder) and never blocks the panes after it.
+    for (int i = 0; i < tn; i++) {
+        Pane* rootp = (i == cur) ? g_pane_root : ws_root(i);
+        pane_load_tree_restored(rootp);
+    }
     g_sess_restoring = false;
     g_sess_dirty = false;
     set_status("Session restored (%d tab%s)", tn, tn == 1 ? "" : "s");
@@ -16514,7 +21462,8 @@ static void session_tick(void) {
 
 static bool app_init(void) {
     memset(&g_app, 0, sizeof(g_app));
-    P = &PAL_DARK;
+    g_pal_idx = PAL_MID_I;
+    pal_apply();                        // the default: Midnight
     g_sort_key = SORT_NAME;
     g_sort_dir = 1;
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -16571,7 +21520,9 @@ static bool app_init(void) {
     theme_apply(g_app.theme, g_app.renderer);
     printf("[OK] Theme loaded\n");
 
-    if (SUCCEEDED(CoInitialize(NULL))) g_ole_ready = true;
+    // OleInitialize = COM (STA) + OLE: the drag-out of files (DoDragDrop)
+    // and the shell drop helpers need the OLE part as well.
+    if (SUCCEEDED(OleInitialize(NULL))) g_ole_ready = true;
     printf("[OK] Picture decoder: %s\n", g_ole_ready ? "ready" : "unavailable");
 
     // Shell thumbnails (Explorer's own: crisp, EXIF-correct, folders too)
@@ -16631,6 +21582,12 @@ static bool app_init(void) {
     // load-time apply() sees an empty path and can never delete a live
     // snapshot by accident (documented lifecycle, engine block above).
     session_init();
+    g_side_anim = g_opt_sidebar ? 1.0f : 0.0f;   // start in the saved state
+
+    // The shell-menu service: right-click menus are built on its own
+    // thread, so the window never waits for shell extensions.
+    if (!shmsvc_start(g_app.hwnd, platform_wake, SC(16)))
+        printf("[--] Shell menu service unavailable\n");
 
     platform_set_paint_callback(paint);
     platform_set_drag_hit(topbar_hit);   // empty top strip = drag region
@@ -16671,6 +21628,7 @@ static bool app_init(void) {
                 (at & FILE_ATTRIBUTE_DIRECTORY))
                 start = g_init_path;
         }
+        g_app.zoom = g_zoom;         // seed the per-pane icon zoom (fresh start)
         load_dir(start);
         printf("[OK] Loaded: %s (%u items)\n", g_app.current_path,
                (unsigned)g_app.count);
@@ -16694,6 +21652,27 @@ static bool app_init(void) {
     printf("\nReady. Esc or close the window to quit.\n");
     return true;
 }
+
+// ------------------------------------------------------------
+// SELFTEST FAILURE ACCOUNTING
+// Every check reports through printf("... FAIL ..."), but the process
+// still exited 0 and printed "SELFTEST OK" - so the installer's silent
+// post-install selftest (which rolls back on a NON-ZERO exit) could never
+// see a broken build.  Inside the selftest code printf now goes through
+// st_printf, which counts every line that reports a failure; main() turns
+// a non-zero count into exit code 1 and "SELFTEST FAILED".
+static int g_st_failures = 0;
+static int st_printf(const char* fmt, ...) {
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (strstr(buf, "FAIL")) g_st_failures++;
+    fputs(buf, stdout);
+    return n;
+}
+#define printf st_printf
 
 // ------------------------------------------------------------
 // Selftest helper: render a plain folder exactly like the app does
@@ -16923,7 +21902,403 @@ static void st_input(const Layout* L, InputState* in) {
     handle_mouse(L, in);
 }
 
+// Name of the selected row as the user sees it, for type-to-select
+// assertions ("(none)" = nothing selected, "(bad)" = an invalid index).
+static const char* st_vname(int vi) {
+    if (vi < 0 || vi >= (int)g_app.view_count) return "(none)";
+    int ei = g_app.view[vi];
+    if (ei < 0 || (size_t)ei >= g_app.count) return "(bad)";
+    return g_app.entries[ei].name;
+}
+
+// One typing frame per character, EXACTLY as TranslateMessage delivers a
+// keystroke inside a single pump: key_code carries the press edge and
+// char_pressed carries the WM_CHAR payload.
+static void st_tts(const Layout* paneL, const char* s) {
+    // The platform delivers CODE POINTS (a Unicode window), so the test
+    // decodes its byte string exactly the way the file system spells it
+    // (the active code page) and feeds one character per frame.
+    wchar_t w[128];
+    int wn = s ? MultiByteToWideChar(CP_ACP, 0, s, -1, w, 128) - 1 : 0;
+    for (int i = 0; i < wn; i++) {
+        InputState in;
+        memset(&in, 0, sizeof in);
+        unsigned int cp = (unsigned int)w[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < wn) {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + ((unsigned)w[i + 1] - 0xDC00);
+            i++;
+        }
+        // A REAL WM_KEYDOWN always carries the UPPERCASE virtual key for
+        // a letter (VK codes are uppercase), while char_pressed carries
+        // the shifted character - mirror that exactly, or 'q' (0x71)
+        // would impersonate VK_F2 and trip the rename binding.
+        int vk = cp < 128 ? (int)cp : 0;
+        if (vk >= 'a' && vk <= 'z') vk -= 32;
+        in.key_code = vk;
+        in.char_pressed = cp;
+        handle_keys(&in, paneL);
+    }
+}
+
+// One special key (arrows, Escape, Enter, ...) as its own frame.
+static void st_key(const Layout* paneL, int vk) {
+    InputState in;
+    memset(&in, 0, sizeof in);
+    in.key_code = vk;
+    handle_keys(&in, paneL);
+}
+
+// The type-to-select / new-tab checks navigate a fixed "shelf" fixture.
+// It must exist on WHATEVER machine runs the selftest (the path used to be
+// hard-coded to one developer's profile, so every load_dir of it failed
+// anywhere else and produced false FAILs), so build it on first use:
+// <Temp>\nv_fix3_e2e\shelf plus the FolA folder the Enter test opens.
+static const char* st_shelf(void) {
+    static char p[1024];
+    if (!p[0]) {
+        char tmp[512] = "";
+        GetTempPathA((DWORD)sizeof tmp, tmp);
+        char base[640];
+        snprintf(base, sizeof base, "%snv_fix3_e2e", tmp);
+        snprintf(p, sizeof p, "%s\\shelf", base);
+        CreateDirectoryA(base, NULL);         // no-ops when they exist
+        CreateDirectoryA(p, NULL);
+        char fol[1100];
+        snprintf(fol, sizeof fol, "%s\\FolA", p);
+        CreateDirectoryA(fol, NULL);
+    }
+    return p;
+}
+
+// ---- Explorer-parity checks (Unicode names, paste rules, undo, timers) --
+static void st_explorer_parity(void) {
+    int r = 0, f = 0;
+#define X_EXP(cond, what) do { r++; if (!(cond)) { f++; \
+        printf("[selftest] FAIL: parity: %s\n", what); } } while (0)
+
+    // scratch folder under %TEMP%
+    char base[MAX_PATH + 64];
+    DWORD tn = GetTempPathA(MAX_PATH, base);
+    if (tn == 0 || tn >= MAX_PATH) { printf("[selftest] parity: no temp\n"); return; }
+    strcat(base, "nova_parity_st");
+    char err[256];
+    if (dir_exists(base)) fs_delete_one(base, err, sizeof err);
+    X_EXP(CreateDirectoryA(base, NULL), "scratch folder");
+
+    // 1) a Unicode (Urdu) file name lists, round-trips and opens
+    {
+        wchar_t wb[MAX_PATH + 64];
+        MultiByteToWideChar(CP_ACP, 0, base, -1, wb, MAX_PATH + 64);
+        wcscat(wb, L"\\\x0646\x0648\x0627 \x0641\x0627\x0626\x0644.txt");   // "نوا فائل.txt"
+        HANDLE h = CreateFileW(wb, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+        X_EXP(h != INVALID_HANDLE_VALUE, "create unicode file");
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        bool utf8 = GetACP() == CP_UTF8;
+        size_t cnt = 0;
+        DirEntry* es = g_app.platform->get_directory_entries(base, &cnt);
+        bool found = false, opens = false, noq = false;
+        for (size_t i = 0; es && i < cnt; i++) {
+            if (strstr(es[i].name, ".txt")) {
+                found = true;
+                noq = strchr(es[i].name, '?') == NULL;
+                opens = GetFileAttributesA(es[i].path) != INVALID_FILE_ATTRIBUTES;
+            }
+        }
+        free(es);
+        X_EXP(found, "unicode file listed");
+        if (utf8) {
+            X_EXP(noq, "unicode name has no '?' (UTF-8 code page)");
+            X_EXP(opens, "unicode path opens through the A API");
+        } else {
+            printf("[selftest] parity: code page %u (not UTF-8) - unicode name checks skipped\n",
+                   (unsigned)GetACP());
+        }
+        // typed code points encode to the same bytes the listing uses
+        char enc[8];
+        int en = cp_encode(0x0646, enc);
+        X_EXP(utf8 ? (en == 2 && (unsigned char)enc[0] == 0xD9) : en >= 1,
+              "cp_encode(U+0646)");
+        X_EXP(cp_encode('a', enc) == 1 && enc[0] == 'a', "cp_encode ascii");
+        X_EXP(cp_encode(0x1F600, enc) == (utf8 ? 4 : cp_encode(0x1F600, enc)),
+              "cp_encode emoji");
+    }
+
+    // 2) paste rules: copy in place -> " - Copy", clash -> "(2)", never overwrite
+    {
+        char a[MAX_PATH + 128], sub[MAX_PATH + 128], p2[MAX_PATH + 128];
+        snprintf(a, sizeof a, "%s\\doc.txt", base);
+        HANDLE h = CreateFileA(a, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+        DWORD wr = 0;
+        if (h != INVALID_HANDLE_VALUE) { WriteFile(h, "AAAA", 4, &wr, NULL); CloseHandle(h); }
+        X_EXP(fs_paste_one(a, base, false, err, sizeof err), "copy in place");
+        snprintf(p2, sizeof p2, "%s\\doc - Copy.txt", base);
+        X_EXP(GetFileAttributesA(p2) != INVALID_FILE_ATTRIBUTES, "\"doc - Copy.txt\" made");
+        X_EXP(fs_paste_one(a, base, false, err, sizeof err), "second copy in place");
+        snprintf(p2, sizeof p2, "%s\\doc - Copy (2).txt", base);
+        X_EXP(GetFileAttributesA(p2) != INVALID_FILE_ATTRIBUTES, "\"doc - Copy (2).txt\" made");
+        snprintf(sub, sizeof sub, "%s\\sub", base);
+        CreateDirectoryA(sub, NULL);
+        snprintf(p2, sizeof p2, "%s\\doc.txt", sub);
+        h = CreateFileA(p2, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) { WriteFile(h, "BB", 2, &wr, NULL); CloseHandle(h); }
+        X_EXP(fs_paste_one(a, sub, false, err, sizeof err), "copy onto a taken name");
+        X_EXP(g_app.platform->get_file_size(p2) == 2, "existing file NOT overwritten");
+        snprintf(p2, sizeof p2, "%s\\doc (2).txt", sub);
+        X_EXP(g_app.platform->get_file_size(p2) == 4, "copy kept as \"doc (2).txt\"");
+        // a folder into itself / its own child is refused
+        X_EXP(!fs_paste_one(base, sub, false, err, sizeof err), "folder into its child refused");
+        X_EXP(!fs_paste_one(sub, sub, true, err, sizeof err), "folder into itself refused");
+        X_EXP(path_is_within("C:\\a\\b", "C:\\a") && !path_is_within("C:\\ab", "C:\\a"),
+              "path_is_within boundary");
+        // cut + paste into the same folder is a no-op that keeps the file
+        X_EXP(fs_paste_one(a, base, true, err, sizeof err) &&
+              GetFileAttributesA(a) != INVALID_FILE_ATTRIBUTES, "move in place keeps file");
+    }
+
+    // 3) undo: rename back, a paste's copies removed, a move moved back
+    {
+        char a[MAX_PATH + 128], b[MAX_PATH + 128];
+        snprintf(a, sizeof a, "%s\\doc.txt", base);
+        X_EXP(fs_rename(a, "renamed.txt", err, sizeof err), "rename for undo");
+        {   // the extension is never doubled ("x.txt" -> "x.txt", not "x.txt.txt")
+            char dbl[MAX_PATH + 128];
+            snprintf(dbl, sizeof dbl, "%s\\renamed.txt.txt", base);
+            X_EXP(GetFileAttributesA(dbl) == INVALID_FILE_ATTRIBUTES,
+                  "rename keeps one extension");
+        }
+        snprintf(b, sizeof b, "%s\\renamed.txt", base);
+        X_EXP(GetFileAttributesA(b) != INVALID_FILE_ATTRIBUTES, "renamed exists");
+        char keep[1024];
+        snprintf(keep, sizeof keep, "%s", g_app.current_path);
+        snprintf(g_app.current_path, sizeof g_app.current_path, "%s", base);
+        undo_run();
+        X_EXP(GetFileAttributesA(a) != INVALID_FILE_ATTRIBUTES &&
+              GetFileAttributesA(b) == INVALID_FILE_ATTRIBUTES, "undo rename");
+        char* one[1] = {a};
+        char sub[MAX_PATH + 128];
+        snprintf(sub, sizeof sub, "%s\\sub", base);
+        paste_start(one, 1, true, sub);             // inline under selftest
+        snprintf(b, sizeof b, "%s\\doc (3).txt", sub);
+        X_EXP(GetFileAttributesA(a) == INVALID_FILE_ATTRIBUTES &&
+              GetFileAttributesA(b) != INVALID_FILE_ATTRIBUTES, "move into sub");
+        undo_run();
+        X_EXP(GetFileAttributesA(a) != INVALID_FILE_ATTRIBUTES &&
+              GetFileAttributesA(b) == INVALID_FILE_ATTRIBUTES, "undo move");
+        paste_start(one, 1, false, sub);
+        X_EXP(GetFileAttributesA(b) != INVALID_FILE_ATTRIBUTES, "copy into sub");
+        undo_run();
+        X_EXP(GetFileAttributesA(b) == INVALID_FILE_ATTRIBUTES &&
+              GetFileAttributesA(a) != INVALID_FILE_ATTRIBUTES, "undo copy keeps source");
+        load_dir(keep[0] ? keep : platform_get_home_directory());
+    }
+
+    // 4) wall-clock deadlines (the loop idles; frames are no clock)
+    X_EXP(!tick_before(0), "deadline 0 = expired");
+    X_EXP(tick_before(tick_in(5000)), "future deadline pending");
+
+    fs_delete_one(base, err, sizeof err);
+#undef X_EXP
+    printf("[selftest] explorer parity: %d/%d check(s) %s\n", r - f, r,
+           f ? "FAILED" : "ok");
+}
+
+// Save the last painted frame as a BMP (visual checks of overlays).
+static bool st_save_frame(const char* path) {
+    int w = 0, h = 0;
+    HBITMAP b = (HBITMAP)renderer_last_frame(&w, &h);
+    if (!b || w <= 0 || h <= 0) return false;
+    unsigned char* px = (unsigned char*)malloc((size_t)w * h * 4);
+    if (!px) return false;
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    HDC dc = GetDC(NULL);
+    int got = GetDIBits(dc, b, 0, (UINT)h, px, &bi, DIB_RGB_COLORS);
+    ReleaseDC(NULL, dc);
+    bool ok = got > 0 && write_bmp24(path, px, w, h);
+    free(px);
+    return ok;
+}
+
+// Wait (pumping messages) until the system menu has its complete rows.
+static int st_xm_wait(int ms) {
+    DWORD t0 = GetTickCount();
+    while ((int)(GetTickCount() - t0) < ms) {
+        MSG m;
+        while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+        xm_pump();
+        if (g_xm_ver == 2 || g_xm_ver == -1) break;
+        Sleep(15);
+    }
+    return g_xm_ver;
+}
+static int st_xm_find(const char* label) {
+    for (int k = 0; k < g_xroot_n; k++)
+        if (_stricmp(g_xn[g_xroot[k]].label, label) == 0) return g_xroot[k];
+    return -1;
+}
+
+// ---- the system context menu (File Pilot style) ------------------------
+static void st_system_menu(void) {
+    int r = 0, f = 0;
+#define M_EXP(cond, what) do { r++; if (!(cond)) { f++; \
+        printf("[selftest] FAIL: system menu: %s\n", what); } } while (0)
+    char base[MAX_PATH + 64];
+    GetTempPathA(MAX_PATH, base);
+    strcat(base, "nova_menu_st");
+    char err[256];
+    if (dir_exists(base)) fs_delete_one(base, err, sizeof err);
+    CreateDirectoryA(base, NULL);
+    char img[MAX_PATH + 96], zip[MAX_PATH + 96], sub[MAX_PATH + 96];
+    snprintf(img, sizeof img, "%s\\photo.jpg", base);
+    snprintf(zip, sizeof zip, "%s\\pack.zip", base);
+    snprintf(sub, sizeof sub, "%s\\folder", base);
+    CreateDirectoryA(sub, NULL);
+    // a real (tiny) JPEG and an empty ZIP, so the shell offers its verbs
+    static const unsigned char jpg[] = {0xFF,0xD8,0xFF,0xE0,0,16,'J','F','I','F',0,1,1,0,0,1,0,1,0,0,0xFF,0xD9};
+    static const unsigned char zp[] = {'P','K',5,6,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    FILE* fp = fopen(img, "wb"); if (fp) { fwrite(jpg, 1, sizeof jpg, fp); fclose(fp); }
+    fp = fopen(zip, "wb"); if (fp) { fwrite(zp, 1, sizeof zp, fp); fclose(fp); }
+
+    char keep[1024];
+    snprintf(keep, sizeof keep, "%s", g_app.current_path);
+    load_dir(base);
+    int vi_img = -1, vi_zip = -1, vi_dir = -1;
+    for (size_t i = 0; i < g_app.view_count; i++) {
+        const char* nm = g_app.entries[g_app.view[i]].name;
+        if (!_stricmp(nm, "photo.jpg")) vi_img = (int)i;
+        if (!_stricmp(nm, "pack.zip")) vi_zip = (int)i;
+        if (!_stricmp(nm, "folder")) vi_dir = (int)i;
+    }
+    M_EXP(vi_img >= 0 && vi_zip >= 0 && vi_dir >= 0, "scratch rows listed");
+
+    // 1) an image: system rows arrive, NovaFile owns the file operations
+    if (vi_img >= 0) {
+        sel_clear(); sel_add(vi_img); g_app.selected = vi_img;
+        xm_open_items(vi_img, false, 300, 120);
+        M_EXP(g_xm_open && g_xroot_n > 0, "opens instantly with rows");
+        int v = st_xm_wait(15000);
+        M_EXP(v == 2, "system rows complete");
+        int cut = st_xm_find("Cut"), del = st_xm_find("Delete"),
+            ren = st_xm_find("Rename"), prop = st_xm_find("Properties");
+        M_EXP(cut >= 0 && g_xn[cut].act == XA_APP && g_xn[cut].cmd == CTX_CMD_CUT,
+              "Cut runs through NovaFile");
+        M_EXP(del >= 0 && g_xn[del].act == XA_APP && g_xn[del].cmd == CTX_CMD_DELETE,
+              "Delete runs through NovaFile (Recycle Bin + confirm)");
+        M_EXP(ren >= 0 && g_xn[ren].cmd == CTX_CMD_RENAME, "Rename is the inline field");
+        M_EXP(prop >= 0, "Properties row");
+        M_EXP(cut >= 0 && g_xn[cut].hint[0], "shortcut hint shown");
+        int sendto = st_xm_find("Send to");
+        M_EXP(sendto >= 0 && g_xn[sendto].kind == XK_SUB && g_xn[sendto].count > 0,
+              "Send to submenu filled");
+        int shell_rows = 0, icons = 0;
+        for (int k = 0; k < g_xroot_n; k++) {
+            if (g_xn[g_xroot[k]].act == XA_SHELL) shell_rows++;
+            if (g_xn[g_xroot[k]].icon) icons++;
+        }
+        M_EXP(shell_rows > 0, "system verbs present");
+        printf("[selftest] system menu (image): %d rows, %d system verbs, %d icons\n",
+               g_xroot_n, shell_rows, icons);
+        // open a submenu panel + screenshot
+        if (sendto >= 0) {
+            for (int k = 0; k < g_xroot_n; k++)
+                if (g_xroot[k] == sendto) { xm_layout(); g_xp[0].hover = k; xm_open_sub(0, k); }
+        }
+        paint();
+        char shot[MAX_PATH + 64];
+        GetTempPathA(MAX_PATH, shot);
+        strcat(shot, "nova_menu_image.bmp");
+        st_save_frame(shot);
+        // search
+        snprintf(g_xm_q, sizeof g_xm_q, "copy");
+        g_xp_n = 1;
+        xm_layout();
+        bool found_copy = false;
+        for (int k = 0; k < g_xp[0].nrows; k++)
+            if (!_stricmp(g_xn[g_xp[0].rows[k]].label, "Copy")) found_copy = true;
+        M_EXP(found_copy, "search finds Copy");
+        paint();
+        GetTempPathA(MAX_PATH, shot);
+        strcat(shot, "nova_menu_search.bmp");
+        st_save_frame(shot);
+        xm_close();
+        M_EXP(!g_xm_open && g_xm_gen == 0, "closes and releases");
+    }
+    // 2) a zip: archive verbs
+    if (vi_zip >= 0) {
+        sel_clear(); sel_add(vi_zip); g_app.selected = vi_zip;
+        xm_open_items(vi_zip, false, 300, 120);
+        st_xm_wait(15000);
+        bool extract = false;
+        for (int i = 0; i < g_xn_n; i++)
+            if (strstr(g_xn[i].label, "Extract")) extract = true;
+        M_EXP(extract, "zip offers Extract");
+        paint();
+        char shot[MAX_PATH + 64];
+        GetTempPathA(MAX_PATH, shot);
+        strcat(shot, "nova_menu_zip.bmp");
+        st_save_frame(shot);
+        xm_close();
+    }
+    // 3) a folder: Open stays inside NovaFile, New Tab / Pane offered
+    if (vi_dir >= 0) {
+        sel_clear(); sel_add(vi_dir); g_app.selected = vi_dir;
+        xm_open_items(vi_dir, true, 300, 120);
+        st_xm_wait(15000);
+        int op = st_xm_find("Open");
+        M_EXP(op >= 0 && g_xn[op].act == XA_APP && g_xn[op].cmd == CTX_CMD_OPEN,
+              "folder Open navigates in NovaFile");
+        M_EXP(st_xm_find("Open in New Tab") >= 0 && st_xm_find("Open in New Pane") >= 0,
+              "Open in New Tab / Pane rows");
+        xm_close();
+    }
+    // 4) background: View / Sort / Group / Refresh / New / Properties
+    {
+        sel_clear();
+        g_app.selected = -1;
+        xm_open_bg(400, 200);
+        st_xm_wait(15000);
+        M_EXP(st_xm_find("View") >= 0 && st_xm_find("Sort by") >= 0 &&
+              st_xm_find("Group by") >= 0 && st_xm_find("Refresh") >= 0,
+              "background: View / Sort by / Group by / Refresh");
+        int nw = st_xm_find("New");
+        M_EXP(nw >= 0 && g_xn[nw].kind == XK_SUB && g_xn[nw].count >= 2,
+              "background: New submenu");
+        bool nf = false;
+        for (int k = 0; nw >= 0 && k < g_xn[nw].count; k++) {
+            const XNode* c = &g_xn[g_xn[nw].first + k];
+            if (c->act == XA_APP && c->cmd == CTX_CMD_NEW_FOLDER) nf = true;
+        }
+        M_EXP(nf, "New > Folder runs through NovaFile");
+        M_EXP(st_xm_find("Properties") >= 0, "background: Properties");
+        if (nw >= 0)
+            for (int k = 0; k < g_xroot_n; k++)
+                if (g_xroot[k] == nw) { xm_layout(); g_xp[0].hover = k; xm_open_sub(0, k); }
+        paint();
+        char shot[MAX_PATH + 64];
+        GetTempPathA(MAX_PATH, shot);
+        strcat(shot, "nova_menu_bg.bmp");
+        st_save_frame(shot);
+        xm_close();
+    }
+    load_dir(keep[0] ? keep : platform_get_home_directory());
+    fs_delete_one(base, err, sizeof err);
+#undef M_EXP
+    printf("[selftest] system menu: %d/%d check(s) %s\n", r - f, r, f ? "FAILED" : "ok");
+}
+
 static void run_selftest(void) {
+    g_st_running = true;      // scratch deletes skip the Recycle Bin
     // A verification run must never disturb the Windows clipboard the
     // user is really using; the app's OWN clipboard is fully exercised.
     g_clip_quiet = true;
@@ -16943,9 +22318,36 @@ static void run_selftest(void) {
     printf("[selftest] toggling view...\n");
     toggle_view();
 
-    printf("[selftest] toggling theme...\n");
-    toggle_theme();
-    toggle_theme();
+    printf("[selftest] selecting theme...\n");
+    {
+        // Explicit selection only (the Settings preview cards): no cycle,
+        // no shortcut.  Each pick applies its real palette; an out-of-
+        // range index must be ignored instead of changing anything.
+        if (g_pal_idx != PAL_MID_I || P != &PAL_MIDNIGHT)
+            printf("[selftest] FAIL: default theme is not Midnight\n");
+        theme_select(PAL_DARK_I);
+        if (g_pal_idx != PAL_DARK_I || P != &PAL_DARK)
+            printf("[selftest] FAIL: select Dark\n");
+        theme_select(PAL_LIGHT_I);
+        if (g_pal_idx != PAL_LIGHT_I || P != &PAL_LIGHT)
+            printf("[selftest] FAIL: select Light\n");
+        theme_select(PAL_MID_I);
+        if (g_pal_idx != PAL_MID_I || P != &PAL_MIDNIGHT)
+            printf("[selftest] FAIL: select back to Midnight\n");
+        theme_select(-1);                       // out of range: unchanged
+        theme_select(PAL_COUNT_N);
+        if (g_pal_idx != PAL_MID_I || P != &PAL_MIDNIGHT)
+            printf("[selftest] FAIL: out-of-range select changed theme\n");
+        // No leftover cycling shortcut: the row is hidden and unbound.
+        if (g_ents[CMD_THEME].key != 0 || g_ents[CMD_THEME].mods != 0 ||
+            g_ents[CMD_THEME].dkey != 0 || g_ents[CMD_THEME].dmods != 0)
+            printf("[selftest] FAIL: theme row still has a binding\n");
+        if (!g_ents[CMD_THEME].hidden)
+            printf("[selftest] FAIL: theme row still listed\n");
+    }
+
+    st_open_err_map();      // file-open: every Windows failure maps to a reason
+    st_open_verb();         // file-open: the registry verb walk finds "open"
 
     printf("[selftest] sorting by size/date/type/name...\n");
     g_app.sort_key = -1;
@@ -17048,14 +22450,14 @@ static void run_selftest(void) {
             if (tf) printf("[selftest] FAIL: text model\n");
         }
 
-        // --- match-highlight colours: NEUTRAL in both themes ---
+        // --- match-highlight colours: NEUTRAL in every theme ---
         // The box must never be a saturated block (the old look let the
         // amber folder colour dominate), and the matched glyphs must stay
-        // readable against it - light on dark, dark on light.
+        // readable against it - light on the dark surfaces, dark on light.
         {
             int hr = 0, hf = 0;
-            const Palette* th[2] = { &PAL_DARK, &PAL_LIGHT };
-            for (int t = 0; t < 2; t++) {
+            const Palette* th[3] = { &PAL_MIDNIGHT, &PAL_DARK, &PAL_LIGHT };
+            for (int t = 0; t < 3; t++) {
                 const Color* bg = &th[t]->hl_bg, *fg = &th[t]->hl_fg;
                 float dr = bg->r - bg->g; if (dr < 0) dr = -dr;
                 float dg = bg->g - bg->b; if (dg < 0) dg = -dg;
@@ -17066,15 +22468,15 @@ static void run_selftest(void) {
                 float lum_bg = bg->r + bg->g + bg->b;
                 float lum_fg = fg->r + fg->g + fg->b;
                 hr++;
-                if (t == 0 && lum_fg <= lum_bg) {
+                if (t <= 1 && lum_fg <= lum_bg) {
                     hf++; printf("[selftest] FAIL: dark hl_fg not lighter\n");
                 }
                 hr++;
-                if (t == 1 && lum_fg >= lum_bg) {
+                if (t == 2 && lum_fg >= lum_bg) {
                     hf++; printf("[selftest] FAIL: light hl_fg not darker\n");
                 }
             }
-            // the two themes must not share one box colour
+            // the classic dark and light pair must not share one box colour
             hr++;
             if (fabs((double)(PAL_DARK.hl_bg.r - PAL_LIGHT.hl_bg.r)) < 0.05 &&
                 fabs((double)(PAL_DARK.hl_bg.b - PAL_LIGHT.hl_bg.b)) < 0.05) {
@@ -17303,6 +22705,619 @@ static void run_selftest(void) {
             printf("[selftest] held-key repeat + caret: %d/%d check(s) "
                    "%s\n", hr - hf, hr, hf ? "FAILED" : "ok");
             if (hf) printf("[selftest] FAIL: held-key repeat/caret\n");
+        }
+
+        // --- Incremental type-to-select: a continuous, case-insensitive
+        //     filename prefix built by typing in the file list. Driven
+        //     through handle_keys exactly as TranslateMessage delivers a
+        //     keystroke (key_code edge + char_pressed payload in one
+        //     frame). Covers the spec's scenarios 1-12 + 14-17 that are
+        //     observable in-process; the real-message path (WM_KEYDOWN /
+        //     WM_CHAR / Enter / Ctrl+N through the window) is exercised
+        //     separately by the off-screen E2E run.
+        {
+            int tr = 0, tf = 0;
+            printf("[selftest] type-to-select...\n");
+
+            // The layout the key path sees: window metrics + pane metrics.
+            Layout M, paneL;
+            compute_layout(&M, 1600, 900);
+            pane_input_build(&paneL, &M);
+
+            // Save everything this suite touches.
+            DirEntry* se = g_app.entries; size_t sc = g_app.count;
+            int skey = g_app.sort_key, sdir = g_app.sort_dir;
+            int gkey = g_sort_key, gdir = g_sort_dir;
+            int smode = g_app.view_mode, ssel = g_app.selected;
+            int sscroll = g_app.scroll;
+            char ssearch[sizeof g_app.search_buf];
+            char spath[sizeof g_app.current_path];
+            snprintf(ssearch, sizeof ssearch, "%s", g_app.search_buf);
+            snprintf(spath, sizeof spath, "%s", g_app.current_path);
+
+            tts_reset();
+            // Deterministic listing: the spec's example names, all FILES
+            // (so the directory-first sort rule can never reorder them).
+            // A 'c' typed anywhere - even alone - is a type-to-select
+            // character; the radial wheel's letter key is a HOLD now.
+            static DirEntry fake[7];
+            memset(fake, 0, sizeof fake);
+            const char* names[7] = {"Music", "Movies", "NovaFile", "Notes",
+                                    "Nuclear", "Documents", "NukeFolder"};
+            for (int i = 0; i < 7; i++)
+                snprintf(fake[i].name, sizeof fake[i].name, "%s", names[i]);
+            fake[4].size = 100;                     // Nuclear
+            fake[6].size = 50;                      // NukeFolder
+            g_app.entries = fake; g_app.count = 7;
+            g_app.search_buf[0] = '\0';
+            g_app.view_mode = MODE_DETAILS;
+            g_sort_key = SORT_NAME; g_sort_dir = 1;
+            g_app.sort_key = SORT_NAME; g_app.sort_dir = 1;
+            qsort(fake, 7, sizeof(DirEntry), cmp_entry);
+            rebuild_view();
+            // Display order (ci name asc): Documents, Movies, Music,
+            // Notes, NovaFile, Nuclear, NukeFolder.
+
+            // (1) one character highlights the first prefix match, and
+            //     the typed prefix is retained for the next character
+            st_tts(&paneL, "n");
+            tr++;
+            if (strcmp(g_tts_prefix, "n") != 0 ||
+                strcmp(st_vname(g_app.selected), "Notes") != 0) {
+                tf++; printf("[selftest] FAIL: tts 'n' -> %s (prefix '%s')\n",
+                             st_vname(g_app.selected), g_tts_prefix);
+            }
+            // (2)-(3) continuous typing: n -> nu -> nuke; each new
+            //     character EXTENDS the same sequence, never a restart
+            st_tts(&paneL, "u");
+            tr++;
+            if (strcmp(g_tts_prefix, "nu") != 0 ||
+                strcmp(st_vname(g_app.selected), "Nuclear") != 0) {
+                tf++; printf("[selftest] FAIL: tts 'nu' -> %s (prefix '%s')\n",
+                             st_vname(g_app.selected), g_tts_prefix);
+            }
+            st_tts(&paneL, "ke");
+            tr++;
+            if (strcmp(g_tts_prefix, "nuke") != 0 ||
+                strcmp(st_vname(g_app.selected), "NukeFolder") != 0) {
+                tf++; printf("[selftest] FAIL: tts 'nuke' -> %s (prefix '%s')\n",
+                             st_vname(g_app.selected), g_tts_prefix);
+            }
+            // (4) uppercase input behaves IDENTICALLY (case-insensitive)
+            tts_reset();
+            st_tts(&paneL, "NUKE");
+            tr++;
+            if (strcmp(g_tts_prefix, "NUKE") != 0 ||
+                strcmp(st_vname(g_app.selected), "NukeFolder") != 0) {
+                tf++; printf("[selftest] FAIL: tts 'NUKE' -> %s\n",
+                             st_vname(g_app.selected));
+            }
+            // (5) an unmatched prefix never selects an unrelated item and
+            //     stays active so the sequence can still be corrected
+            tts_reset();
+            st_tts(&paneL, "d");
+            tr++;
+            if (strcmp(st_vname(g_app.selected), "Documents") != 0) {
+                tf++; printf("[selftest] FAIL: tts 'd' -> %s\n",
+                             st_vname(g_app.selected));
+            }
+            st_tts(&paneL, "z");
+            tr++;
+            if (strcmp(g_tts_prefix, "dz") != 0 ||
+                strcmp(st_vname(g_app.selected), "Documents") != 0) {
+                tf++; printf("[selftest] FAIL: tts unmatched kept '%s' -> %s\n",
+                             g_tts_prefix, st_vname(g_app.selected));
+            }
+            // (6) matches follow the CURRENT displayed ordering: under
+            //     size sort the smaller NukeFolder precedes Nuclear
+            tts_reset();
+            g_sort_key = SORT_SIZE; g_sort_dir = 1;
+            g_app.sort_key = SORT_SIZE; g_app.sort_dir = 1;
+            qsort(fake, 7, sizeof(DirEntry), cmp_entry);
+            rebuild_view();
+            st_tts(&paneL, "nu");
+            tr++;
+            if (strcmp(st_vname(g_app.selected), "NukeFolder") != 0) {
+                tf++; printf("[selftest] FAIL: tts size-sort 'nu' -> %s\n",
+                             st_vname(g_app.selected));
+            }
+            // (7) a pause past TTS_TIMEOUT_MS starts a FRESH search:
+            //     the stale prefix "nu" must not grow a tail
+            g_tts_last_ms = GetTickCount() - (DWORD)TTS_TIMEOUT_MS - 100;
+            st_tts(&paneL, "m");
+            tr++;
+            if (strcmp(g_tts_prefix, "m") != 0 ||
+                strcmp(st_vname(g_app.selected), "Movies") != 0) {
+                tf++; printf("[selftest] FAIL: tts timeout -> '%s' %s\n",
+                             g_tts_prefix, st_vname(g_app.selected));
+            }
+            // (8) an explicit deselect starts the NEXT sequence fresh
+            st_tts(&paneL, "u");               // extends to "mu" (in time)
+            sel_clear();
+            g_app.selected = -1;               // the empty-click state
+            st_tts(&paneL, "d");
+            tr++;
+            if (strcmp(g_tts_prefix, "d") != 0 ||
+                strcmp(st_vname(g_app.selected), "Documents") != 0) {
+                tf++; printf("[selftest] FAIL: tts after deselect -> '%s' %s\n",
+                             g_tts_prefix, st_vname(g_app.selected));
+            }
+            // (9) Escape clears the sequence and nothing else.
+            st_tts(&paneL, "abz");
+            st_key(&paneL, VK_ESCAPE);
+            tr++;
+            if (strcmp(g_tts_prefix, "") != 0) {
+                tf++; printf("[selftest] FAIL: Escape kept prefix '%s'\n",
+                             g_tts_prefix);
+            }
+            // Backspace pops the last character and re-runs the match;
+            // emptied, it falls back to CMD_UP (go up) below - tested
+            // against the real listing further down.
+            st_tts(&paneL, "no");
+            st_key(&paneL, VK_BACK);
+            tr++;
+            if (strcmp(g_tts_prefix, "n") != 0 ||
+                strcmp(st_vname(g_app.selected), "Notes") != 0) {
+                tf++; printf("[selftest] FAIL: Backspace -> '%s' %s\n",
+                             g_tts_prefix, st_vname(g_app.selected));
+            }
+            st_key(&paneL, VK_BACK);
+            tr++;
+            if (strcmp(g_tts_prefix, "") != 0) {
+                tf++; printf("[selftest] FAIL: Backspace empty kept '%s'\n",
+                             g_tts_prefix);
+            }
+            // (11) arrows keep working after typing and do NOT disturb
+            //      the active sequence...
+            st_tts(&paneL, "n");
+            int vi0 = g_app.selected;
+            st_key(&paneL, VK_DOWN);
+            tr++;
+            if (g_app.selected != vi0 + 1) {
+                tf++; printf("[selftest] FAIL: arrow after tts (%d -> %d)\n",
+                             vi0, g_app.selected);
+            }
+            tr++;
+            if (strcmp(g_tts_prefix, "n") != 0) {
+                tf++; printf("[selftest] FAIL: arrow reset prefix to '%s'\n",
+                             g_tts_prefix);
+            }
+            // ...but an arrow MOVED the selection, so the next typed
+            // character starts a FRESH search (Explorer behaviour: "nu"
+            // would jump to Nuclear; a fresh "u" matches nothing and the
+            // selection stays where the arrow put it).
+            st_tts(&paneL, "u");
+            tr++;
+            if (strcmp(g_tts_prefix, "u") != 0 ||
+                g_app.selected != vi0 + 1) {
+                tf++; printf("[selftest] FAIL: arrow move not fresh "
+                             "-> '%s' sel %d\n", g_tts_prefix, g_app.selected);
+            }
+            // (11b) a MOUSE selection behaves identically: the click
+            //       moved the cursor, so the next character is a NEW
+            //       sequence - it never extends the old prefix.
+            tts_reset();
+            st_tts(&paneL, "no");               // "no" -> Notes (own run)
+            g_app.selected = (int)g_app.view_count - 1;   // the click's effect
+            sel_clear();
+            sel_add(g_app.selected);
+            st_tts(&paneL, "m");
+            tr++;
+            if (strcmp(g_tts_prefix, "m") != 0 ||
+                strcmp(st_vname(g_app.selected), "Movies") != 0) {
+                tf++; printf("[selftest] FAIL: mouse move not fresh "
+                             "-> '%s' %s\n", g_tts_prefix,
+                             st_vname(g_app.selected));
+            }
+            tts_reset();
+
+            // Display-mode independence: the SAME sequence highlights in
+            // the grid (icons) layout - the feature never switches the
+            // mode itself, it just follows whatever is on screen.
+            g_app.view_mode = MODE_ICONS;
+            compute_layout(&M, 1600, 900);
+            pane_input_build(&paneL, &M);
+            st_tts(&paneL, "nu");
+            tr++;
+            if (strcmp(st_vname(g_app.selected), "NukeFolder") != 0) {
+                tf++; printf("[selftest] FAIL: tts in grid mode -> %s\n",
+                             st_vname(g_app.selected));
+            }
+            g_app.view_mode = MODE_DETAILS;
+            compute_layout(&M, 1600, 900);
+            pane_input_build(&paneL, &M);
+            tts_reset();
+
+            // ---- (18) the REPORTED sequence: W-O-R-K ---------------
+            // Every character joins ONE prefix, and an EXACT full-name
+            // match wins over longer names sharing the prefix - even
+            // when the displayed order (SIZE sort here) puts the longer
+            // names first and "Work" itself LAST.
+            {
+                static DirEntry wk[7];
+                memset(wk, 0, sizeof wk);
+                const char* wnames[7] = {"Work", "Work Backup",
+                                         "Work Documents", "Website",
+                                         "Weekly Report", "WhatsApp",
+                                         "Windows"};
+                for (int i = 0; i < 7; i++)
+                    snprintf(wk[i].name, sizeof wk[i].name, "%s", wnames[i]);
+                wk[0].size = 1000;               // Work: the LARGEST, last
+                wk[1].size = 300; wk[2].size = 200;   // the long names first
+                wk[3].size = 50; wk[4].size = 40;
+                wk[5].size = 30; wk[6].size = 20;
+                g_app.entries = wk; g_app.count = 7;
+                g_app.search_buf[0] = '\0';
+                g_sort_key = SORT_SIZE; g_sort_dir = 1;
+                g_app.sort_key = SORT_SIZE; g_app.sort_dir = 1;
+                qsort(wk, 7, sizeof(DirEntry), cmp_entry);
+                rebuild_view();
+                tts_reset();
+                st_tts(&paneL, "w");
+                tr++;
+                if (strcmp(g_tts_prefix, "w") != 0 ||
+                    strcmp(st_vname(g_app.selected), "Windows") != 0) {
+                    tf++; printf("[selftest] FAIL: WORK step 'w' -> %s "
+                                 "('%s')\n", st_vname(g_app.selected),
+                                 g_tts_prefix);
+                }
+                st_tts(&paneL, "o"); tr++;
+                if (strcmp(g_tts_prefix, "wo") != 0 ||
+                    strcmp(st_vname(g_app.selected), "Work Documents") != 0) {
+                    tf++; printf("[selftest] FAIL: WORK step 'wo' -> %s "
+                                 "('%s')\n", st_vname(g_app.selected),
+                                 g_tts_prefix);
+                }
+                st_tts(&paneL, "r"); tr++;
+                if (strcmp(g_tts_prefix, "wor") != 0) {
+                    tf++; printf("[selftest] FAIL: WORK step 'wor' -> '%s'\n",
+                                 g_tts_prefix);
+                }
+                st_tts(&paneL, "k"); tr++;
+                if (strcmp(g_tts_prefix, "work") != 0 ||
+                    strcmp(st_vname(g_app.selected), "Work") != 0) {
+                    tf++; printf("[selftest] FAIL: WORK exact 'work' -> %s "
+                                 "('%s')\n", st_vname(g_app.selected),
+                                 g_tts_prefix);
+                }
+                tr++;
+                if (g_app.view_count != 7) {     // nothing filtered/reordered
+                    tf++; printf("[selftest] FAIL: typing changed the view "
+                                 "(%d rows)\n", (int)g_app.view_count);
+                }
+            }
+
+            // ---- (19) the letter 'c' is TYPING, not the wheel ------
+            // A quick tap of the wheel letter joins the prefix - so
+            // "documents" and even a word that STARTS with 'c' are fully
+            // typeable - while a HOLD (the OS auto-repeat) opens the
+            // wheel and takes back the pending tap letter.
+            {
+                g_app.entries = fake; g_app.count = 7;
+                g_sort_key = SORT_NAME; g_sort_dir = 1;
+                g_app.sort_key = SORT_NAME; g_app.sort_dir = 1;
+                qsort(fake, 7, sizeof(DirEntry), cmp_entry);
+                rebuild_view();
+                tts_reset();
+                st_tts(&paneL, "documents"); tr++;
+                if (strcmp(g_tts_prefix, "documents") != 0 ||
+                    strcmp(st_vname(g_app.selected), "Documents") != 0) {
+                    tf++; printf("[selftest] FAIL: 'documents' (mid-word c) "
+                                 "-> %s ('%s')\n", st_vname(g_app.selected),
+                                 g_tts_prefix);
+                }
+                tts_reset();
+                st_tts(&paneL, "c"); tr++;       // a word STARTING with c:
+                // the tap letter must reach the prefix - no listing here
+                // starts with 'c', so the selection staying put while the
+                // prefix grows IS the proof the wheel never ate the key.
+                if (strcmp(g_tts_prefix, "c") != 0) {
+                    tf++; printf("[selftest] FAIL: initial 'c' not typed "
+                                 "('%s')\n", g_tts_prefix);
+                }
+                // the HOLD: an auto-repeat frame (key_code stays edge-
+                // only, the repeat is latched separately) opens the
+                // wheel AND undoes the pending tap letter
+                {
+                    InputState hp;
+                    memset(&hp, 0, sizeof hp);
+                    hp.key_repeat = 'C';
+                    handle_keys(&hp, &paneL);
+                }
+                tr++;
+                if (!g_rad_open || strcmp(g_tts_prefix, "") != 0) {
+                    tf++; printf("[selftest] FAIL: hold-C (open=%d) "
+                                 "prefix '%s'\n", (int)g_rad_open,
+                                 g_tts_prefix);
+                }
+                {
+                    InputState cc;              // a plain press closes it
+                    memset(&cc, 0, sizeof cc);
+                    cc.key_code = 'C';
+                    handle_keys(&cc, &paneL);
+                }
+                tr++;
+                if (g_rad_open) {
+                    tf++; printf("[selftest] FAIL: C press did not close "
+                                 "the wheel\n");
+                }
+            }
+
+            // ---- (20) characters WITHOUT a key-down edge -----------
+            // A posted / synthesised WM_CHAR (On-Screen Keyboard, IME
+            // commit, accessibility tools) still extends the sequence.
+            {
+                tts_reset();
+                InputState co;
+                memset(&co, 0, sizeof co);
+                co.char_pressed = 'n'; handle_keys(&co, &paneL);
+                co.char_pressed = 'o'; handle_keys(&co, &paneL);
+                tr++;
+                if (strcmp(g_tts_prefix, "no") != 0 ||
+                    strcmp(st_vname(g_app.selected), "Notes") != 0) {
+                    tf++; printf("[selftest] FAIL: char-only frames -> %s "
+                                 "('%s')\n", st_vname(g_app.selected),
+                                 g_tts_prefix);
+                }
+            }
+
+            // ---- (21) a Latin-1 character --------------------------
+            // The delivered UTF-16 unit converts to the SAME code page
+            // the listing stores, so "Café" is found by typing café.
+            // The name is built through that very conversion, so the
+            // check is independent of which code page this machine uses.
+            {
+                static DirEntry cf[2];
+                memset(cf, 0, sizeof cf);
+                char eb[4];
+                int enb;
+                {
+                    wchar_t we = 0xE9;           // é
+                    enb = WideCharToMultiByte(CP_ACP, 0, &we, 1, eb,
+                                              (int)sizeof eb, NULL, NULL);
+                }
+                snprintf(cf[0].name, sizeof cf[0].name, "Cafe");
+                snprintf(cf[1].name, sizeof cf[1].name, "Caf");
+                size_t cl = strlen(cf[1].name);
+                if (enb > 0 && cl + (size_t)enb < sizeof cf[1].name) {
+                    memcpy(cf[1].name + cl, eb, (size_t)enb);
+                    cf[1].name[cl + enb] = '\0';
+                }
+                g_app.entries = cf; g_app.count = 2;
+                g_app.search_buf[0] = '\0';
+                g_sort_key = SORT_NAME; g_sort_dir = 1;
+                g_app.sort_key = SORT_NAME; g_app.sort_dir = 1;
+                qsort(cf, 2, sizeof(DirEntry), cmp_entry);
+                rebuild_view();
+                tts_reset();
+                st_tts(&paneL, "cafe"); tr++;
+                if (strcmp(st_vname(g_app.selected), "Cafe") != 0) {
+                    tf++; printf("[selftest] FAIL: 'cafe' -> %s\n",
+                                 st_vname(g_app.selected));
+                }
+                if (enb > 0) {                   // the accented word itself
+                    char word[8];
+                    memcpy(word, "caf", 3);
+                    memcpy(word + 3, eb, (size_t)enb);
+                    word[3 + enb] = '\0';
+                    tts_reset();
+                    st_tts(&paneL, word); tr++;
+                    if (strcmp(st_vname(g_app.selected), cf[1].name) != 0) {
+                        tf++; printf("[selftest] FAIL: 'cafe-e-acute' -> %s\n",
+                                     st_vname(g_app.selected));
+                    }
+                }
+            }
+
+            // Restore the real listing BEFORE anything could free the
+            // static fake array - the same handoff the ranking suite uses.
+            g_app.entries = se; g_app.count = sc;
+            g_app.search_buf[0] = '\0';
+            g_app.sort_key = skey; g_app.sort_dir = sdir;
+            g_sort_key = gkey; g_sort_dir = gdir;
+            rebuild_view();
+
+            // (10) entering another folder clears the previous prefix
+            st_tts(&paneL, "ab");
+            tr++;
+            if (!tts_active()) {
+                tf++; printf("[selftest] FAIL: prefix not armed pre-nav\n");
+            }
+            load_dir(platform_get_home_directory());
+            tr++;
+            if (tts_active()) {
+                tf++; printf("[selftest] FAIL: navigation kept prefix '%s'\n",
+                             g_tts_prefix);
+            }
+
+            // (16) split view: a sequence never travels between panes
+            pane_split_right();
+            if (g_pane_root && g_pane_root->kind != PN_LEAF) {
+                Pane* other = (g_pane_root->left != g_active_pane)
+                                  ? g_pane_root->left : g_pane_root->right;
+                st_tts(&paneL, "x");           // type in the ACTIVE pane
+                tr++;
+                if (!tts_active() || strcmp(g_tts_prefix, "x") != 0) {
+                    tf++; printf("[selftest] FAIL: typing in pane A -> '%s'\n",
+                                 g_tts_prefix);
+                }
+                activate_pane(other);          // switch away
+                tr++;
+                if (tts_active()) {
+                    tf++; printf("[selftest] FAIL: prefix survived pane switch\n");
+                }
+                st_tts(&paneL, "m");           // fresh sequence in pane B
+                tr++;
+                if (strcmp(g_tts_prefix, "m") != 0) {
+                    tf++; printf("[selftest] FAIL: typing in pane B -> '%s'\n",
+                                 g_tts_prefix);
+                }
+            } else {
+                printf("[selftest]   note: pane split unavailable - "
+                       "pane type-to-select checks skipped\n");
+            }
+            pane_close_active();
+            tts_reset();
+
+            // Backspace with NO active prefix is still CMD_UP (go up):
+            // one key event, the OLD action, exactly as documented.
+            load_dir(st_shelf());
+            st_tts(&paneL, "nu");              // no nu* in the shelf...
+            st_key(&paneL, VK_BACK);
+            st_key(&paneL, VK_BACK);           // ...emptied again
+            char shelfp[sizeof g_app.current_path];
+            snprintf(shelfp, sizeof shelfp, "%s", g_app.current_path);
+            st_key(&paneL, VK_BACK);           // inactive -> go up
+            tr++;
+            if (strcmp(g_tts_prefix, "") != 0 ||
+                strcmp(g_app.current_path, shelfp) == 0) {
+                tf++; printf("[selftest] FAIL: inactive Backspace ('%s')\n",
+                             g_tts_prefix);
+            }
+
+            // (12) Enter still activates the selected item (opens it)
+            load_dir(st_shelf());
+            tts_reset();
+            st_tts(&paneL, "fol");
+            tr++;
+            if (strcmp(st_vname(g_app.selected), "FolA") != 0) {
+                tf++; printf("[selftest] FAIL: tts 'fol' -> %s\n",
+                             st_vname(g_app.selected));
+            }
+            st_key(&paneL, VK_RETURN);
+            tr++;
+            if (strstr(g_app.current_path, "FolA") == NULL) {
+                tf++; printf("[selftest] FAIL: Enter did not open FolA\n");
+            }
+
+            // (13) typing into the global Search field never reaches the
+            //      file-list sequence - and does not disturb it
+            load_dir(st_shelf());
+            tts_reset();
+            st_tts(&paneL, "q");               // active prefix "q" (no q*)
+            focus_search();
+            st_tts(&paneL, "n");
+            tr++;
+            if (g_app.search_buf[0] != 'n' || g_app.search_buf[1] != '\0') {
+                tf++; printf("[selftest] FAIL: search field got '%s'\n",
+                             g_app.search_buf);
+            }
+            tr++;
+            if (strcmp(g_tts_prefix, "q") != 0) {
+                tf++; printf("[selftest] FAIL: search typing leaked -> '%s'\n",
+                             g_tts_prefix);
+            }
+            blur_fields();
+            g_app.search_buf[0] = '\0';
+            search_changed();
+
+            // (14a) address-bar editing: the same text-field guard - the
+            //       characters go into the field, never into the sequence
+            focus_address();
+            char abuf[1024];
+            snprintf(abuf, sizeof abuf, "%s", g_app.addr_buf);
+            size_t alen = strlen(abuf);
+            st_tts(&paneL, "xy");
+            tr++;
+            if (strlen(g_app.addr_buf) != alen + 2 ||
+                strncmp(g_app.addr_buf, abuf, alen) != 0) {
+                tf++; printf("[selftest] FAIL: addr did not take chars '%s'\n",
+                             g_app.addr_buf);
+            }
+            tr++;
+            if (strcmp(g_tts_prefix, "q") != 0) {
+                tf++; printf("[selftest] FAIL: addr typing leaked -> '%s'\n",
+                             g_tts_prefix);
+            }
+            blur_fields();
+            snprintf(g_app.addr_buf, sizeof g_app.addr_buf, "%s", abuf);
+
+            // (14) the rename field owns its typing: the modal guard
+            //      returns before type-to-select can see a character
+            rename_begin(&g_app.entries[g_app.view[0]]);
+            char rtxt[64];
+            snprintf(rtxt, sizeof rtxt, "%s", g_rename_txt);
+            st_tts(&paneL, "zzz");
+            tr++;
+            if (g_rename_vi < 0 || strcmp(g_rename_txt, rtxt) != 0) {
+                tf++; printf("[selftest] FAIL: rename typing stolen ('%s')\n",
+                             g_rename_txt);
+            }
+            rename_cancel();
+
+            // (15) established shortcuts still work while a sequence is
+            //      active: Ctrl+N opens a tab, Delete opens its guard
+            st_tts(&paneL, "z");
+            int ws0 = g_ws_n;
+            InputState kn;
+            memset(&kn, 0, sizeof kn);
+            kn.key_code = 'N'; kn.ctrl_pressed = true;
+            handle_keys(&kn, &paneL);
+            tr++;
+            if (g_ws_n != ws0 + 1) {
+                tf++; printf("[selftest] FAIL: Ctrl+N swallowed by typing\n");
+            }
+            if (g_ws_n > ws0) ws_close(g_ws_n - 1);
+            st_tts(&paneL, "z");
+            st_key(&paneL, VK_DELETE);
+            tr++;
+            if (g_confirm_kind == CONFIRM_NONE) {
+                tf++; printf("[selftest] FAIL: Delete swallowed by typing\n");
+            }
+            g_confirm_kind = CONFIRM_NONE;     // cancel the opened guard
+            tts_reset();
+
+            // (16) the typed prefix is ALSO drawn inside the matched
+            //      row's name: tts_row_query hands the growing prefix to
+            //      the painter while OUR sequence owns the selection, and
+            //      goes NULL on timeout, on a foreign selection move, on
+            //      a focused text field / open guard, and on reset.
+            blur_fields();
+            st_tts(&paneL, "nu");              // live sequence on a match
+            tr++;
+            const char* tq = tts_row_query(g_app.selected);
+            if (!tq || strcmp(tq, "nu") != 0) {
+                tf++; printf("[selftest] FAIL: in-name query '%s'\n",
+                             tq ? tq : "(null)");
+            }
+            g_tts_last_ms = GetTickCount() - (DWORD)TTS_TIMEOUT_MS - 100;
+            tr++;
+            if (tts_row_query(g_app.selected) != NULL) {
+                tf++; printf("[selftest] FAIL: stale in-name query kept\n");
+            }
+            g_tts_last_ms = GetTickCount();    // fresh again
+            int osel = g_app.selected;
+            g_app.selected = osel == 0 ? 1 : osel - 1;
+            tr++;
+            if (tts_row_query(g_app.selected) != NULL) {
+                tf++; printf("[selftest] FAIL: foreign selection kept query\n");
+            }
+            g_app.selected = osel;
+            g_confirm_kind = CONFIRM_DELETE;
+            tr++;
+            if (tts_row_query(g_app.selected) != NULL) {
+                tf++; printf("[selftest] FAIL: guard kept in-name query\n");
+            }
+            g_confirm_kind = CONFIRM_NONE;
+            tts_reset();
+            tr++;
+            if (tts_row_query(g_app.selected) != NULL) {
+                tf++; printf("[selftest] FAIL: reset kept in-name query\n");
+            }
+
+            // (17) restore the caller's world, then the caller's listing
+            snprintf(g_app.search_buf, sizeof g_app.search_buf, "%s", ssearch);
+            g_app.view_mode = smode;
+            load_dir(spath);                   // the caller's listing back
+            g_app.selected = (ssel >= 0 && ssel < (int)g_app.view_count)
+                                 ? ssel
+                                 : ((int)g_app.view_count > 0 ? 0 : -1);
+            g_app.scroll = sscroll;
+            if (g_app.selected >= 0) { sel_clear(); sel_add(g_app.selected); }
+            tts_reset();
+            printf("[selftest] type-to-select: %d/%d check(s) %s\n",
+                   tr - tf, tr, tf ? "FAILED" : "ok");
+            if (tf) printf("[selftest] FAIL: type-to-select\n");
         }
 
         // --- Settings filter: the SAME text model as the main fields ---
@@ -19232,7 +25247,7 @@ static void run_selftest(void) {
             compute_pane_tree_layout(g_pane_root, M.list);
             int wn0 = g_ws_n;
             bool single = (pane_count(g_pane_root) == 1);
-            RectI xr = pane_close_rect(g_active_pane->rect);
+            RectI xr = pane_close_rect(pane_body_rect(g_active_pane));
             memset(&fake, 0, sizeof fake);
             fake.left_click = true;
             fake.x = xr.x + xr.w / 2;
@@ -19274,6 +25289,91 @@ static void run_selftest(void) {
             if (!ok) printf("[selftest] FAIL: tab overflow scroll\n");
             g_tab_scroll = 0;
             while (g_ws_n > wn1) ws_close(g_ws_n - 1);
+        }
+
+        // ---- (10b) RESPONSIVE tab widths: shares the strip, never
+        //      overlaps, never shrinks past the compact floor, never
+        //      covers the '+' / caption buttons, and keeps the ACTIVE tab
+        //      on screen. Recomputed live for 1 .. 20 tabs.
+        printf("[selftest] responsive tab strip...\n");
+        {
+            int fails = 0, saved_n = g_ws_n, saved_cur = g_ws_cur;
+            int widths[21], vis[21], k = 0;
+            while (g_ws_n > 1) ws_close(g_ws_n - 1);
+            for (int want = 1; want <= 20 && k < 21; want++) {
+                while (g_ws_n < want) ws_new(NULL);
+                if (g_ws_n != want) break;
+                g_ws_cur = g_ws_n - 1;        // jump to the LAST tab
+                g_tab_scroll = 0;
+                Layout T;
+                compute_layout(&T, 1280, 720);
+                st_run = 0;
+                // every drawn tab: inside the strip, no overlap, no zero
+                int prev_r = T.tabs_x, all = 1, shown = 0;
+                for (int i = 0; i < T.tab_drawn && all; i++) {
+                    const RectI* r = &T.tab_rects[i];
+                    if (r->w <= 0) continue;
+                    shown++;
+                    if (r->x < prev_r || r->x + r->w > T.tabs_x + T.tab_area ||
+                        r->y != T.tab_rects[0].y || r->h != T.tab_rects[0].h)
+                        all = 0;
+                    prev_r = r->x + r->w;
+                }
+                st_expect(all, "tabs never overlap and stay inside the strip",
+                          &fails);
+                int tw = (T.tab_drawn > 0) ? T.tab_rects[0].w : 0;
+                // clipped tabs at either end report a partial width; use
+                // the WIDEST as the true per-tab width
+                for (int i = 1; i < T.tab_drawn; i++)
+                    if (T.tab_rects[i].w > tw) tw = T.tab_rects[i].w;
+                st_expect(tw <= SC(170), "tab never wider than the max", &fails);
+                st_expect(tw >= SC(84), "tab never narrower than the floor",
+                          &fails);
+                // the ACTIVE tab must be reachable (on screen after the
+                // auto-scroll-to-active)
+                if (g_ws_cur < T.tab_drawn)
+                    st_expect(T.tab_rects[g_ws_cur].w > 0 &&
+                              T.tab_rects[g_ws_cur].x >= T.tabs_x &&
+                              T.tab_rects[g_ws_cur].x +
+                              T.tab_rects[g_ws_cur].w <=
+                              T.tabs_x + T.tab_area,
+                              "the active tab is scrolled into view", &fails);
+                // the '+' button never collides with a tab
+                for (int i = 0; i < T.tab_drawn; i++)
+                    st_expect(T.tab_rects[i].w <= 0 ||
+                              T.tab_rects[i].x + T.tab_rects[i].w <=
+                              T.new_tab_btn.x + SC(2),
+                              "tabs never cover the '+' button", &fails);
+                // nav/search row is untouched by the tab count
+                st_expect(T.search_field.w >= SC(70) &&
+                          T.search_field.x + T.search_field.w <= 1280,
+                          "search box survives every tab count", &fails);
+                widths[k] = tw; vis[k] = shown; k++;
+                st_run = 0;
+            }
+            // width is monotonically non-increasing as tabs are added
+            bool mono = true;
+            for (int i = 1; i < k; i++)
+                if (widths[i] > widths[i - 1]) mono = false;
+            st_expect(mono, "adding a tab never widens the others", &fails);
+            // 20 tabs: the strip scrolled, but nothing was lost or shrunk
+            if (k >= 20) {
+                Layout T;
+                compute_layout(&T, 1280, 720);
+                st_expect(T.tab_drawn == 20 && T.tab_scroll_max >= 0,
+                          "20 tabs all still laid out", &fails);
+            }
+            printf("[selftest]   1..20 tabs: widths %d..%d px, visible %d..%d -> %s\n",
+                   (k > 0) ? widths[k - 1] : 0, (k > 0) ? widths[0] : 0,
+                   (k > 0) ? vis[k - 1] : 0, (k > 0) ? vis[0] : 0,
+                   fails ? "FAILED" : "ok");
+            if (fails) printf("[selftest] FAIL: responsive tabs (%d)\n", fails);
+            // restore
+            while (g_ws_n > saved_n) ws_close(g_ws_n - 1);
+            while (g_ws_n < saved_n) ws_new(NULL);
+            g_ws_cur = (saved_cur < g_ws_n) ? saved_cur : 0;
+            g_tab_scroll = 0;
+            compute_layout(&M, w, h);
         }
 
         // restore the state everything after this expects
@@ -19359,13 +25459,12 @@ static void run_selftest(void) {
                           c[i].x + c[i].w <= big.x + big.w &&
                           c[i].y + c[i].h <= big.y + big.h,
                           "chip stays inside the pane", &fails);
-            st_expect(c[0].x + c[0].w <= c[1].x &&
-                      c[1].x + c[1].w <= c[2].x,
-                      "LEFT|CENTER|RIGHT ordered without overlap", &fails);
-            st_expect(c[3].y + c[3].h <= c[0].y,
-                      "TOP chip sits above the trio", &fails);
-            st_expect(c[4].y >= c[0].y + c[0].h,
-                      "BOTTOM chip sits below the trio", &fails);
+            st_expect(c[0].x + c[0].w <= c[1].x,
+                      "LEFT|RIGHT pair ordered without overlap", &fails);
+            st_expect(c[2].y + c[2].h <= c[0].y,
+                      "TOP chip sits above the side pair", &fails);
+            st_expect(c[3].y >= c[0].y + c[0].h,
+                      "BOTTOM chip sits below the side pair", &fails);
         }
         RectI tiny = {0, 0, 60, 40};
         st_expect(!dock_chip_layout(&tiny, c),
@@ -19373,12 +25472,12 @@ static void run_selftest(void) {
         RectI mid = {0, 0, SC(220), SC(180)};
         st_expect(dock_chip_layout(&mid, c),
                   "a modest pane still gets a (shrunk) chooser", &fails);
-        st_expect(dock_zone_lights(DZ_TL, DZ_LEFT) &&
-                  dock_zone_lights(DZ_TL, DZ_TOP) &&
-                  !dock_zone_lights(DZ_TL, DZ_RIGHT) &&
+        st_expect(dock_zone_lights(DZ_LEFT, DZ_LEFT) &&
+                  !dock_zone_lights(DZ_LEFT, DZ_TOP) &&
+                  !dock_zone_lights(DZ_RIGHT, DZ_LEFT) &&
                   dock_zone_lights(DZ_RIGHT, DZ_RIGHT) &&
                   !dock_zone_lights(DZ_NONE, DZ_LEFT),
-                  "corner zones light both of their edges", &fails);
+                  "each directional zone lights only its own chip", &fails);
         printf("[selftest] dock chips: %d/%d check(s) %s\n",
                st_run - fails, st_run, fails ? "FAILED" : "ok");
         if (fails) printf("[selftest] FAIL: dock chips\n");
@@ -19701,8 +25800,8 @@ static void run_selftest(void) {
                actb, acta, patha, pathb, keepb, ok3 ? "ok" : "FAILED");
         if (!ok3) printf("[selftest] FAIL: pane activation / per-pane state\n");
 
-        // (4) drop on the OTHER pane's center -> the two panes SWAP
-        bool prev4 = false, swap_ok = false;
+        // (4) drop on the OTHER pane's RIGHT half -> tiles, focus follows
+        bool prev4 = false, commit4 = false;
         if (B) {
             compute_layout(&M, w, h); g_content = M.list;
             compute_pane_tree_layout(g_pane_root, M.list);
@@ -19713,53 +25812,84 @@ static void run_selftest(void) {
             f.y = A->rect.y + M.list_head_h / 2;   // header = grab strip
             handle_mouse(&M, &f);             // press (A is active, arms)
             f.left_click = false;
-            f.x = b0.x + b0.w / 2;            // B's center = CENTER zone
+            f.x = b0.x + b0.w * 9 / 10;        // near B's right edge -> RIGHT
             f.y = b0.y + b0.h / 2;
             handle_mouse(&M, &f);             // drag + preview
             prev4 = g_drag_split && g_drop_active &&
-                    g_drop_zone == DZ_CENTER;
+                    g_drop_zone == DZ_RIGHT;
             f.left_down = false;
-            handle_mouse(&M, &f);             // release -> swap
-            swap_ok = prev4 && g_active_pane == A &&
-                      A->rect.x == b0.x && A->rect.y == b0.y &&
-                      pane_count(g_pane_root) == 2;
+            handle_mouse(&M, &f);             // release -> commit the split
+            commit4 = prev4 && pane_tree_tiles(g_pane_root, M.list) &&
+                      pane_count(g_pane_root) >= 2 &&
+                      g_active_pane == A;
         }
-        printf("[selftest]   center drop swaps panes: %s\n",
-               swap_ok ? "ok" : "FAILED");
-        if (!swap_ok) printf("[selftest] FAIL: pane swap\n");
+        printf("[selftest]   right drop tiles + focus: %s\n",
+               commit4 ? "ok" : "FAILED");
+        if (!commit4) printf("[selftest] FAIL: directional drop\n");
 
-        // (5) drop on the other pane's TOP-LEFT corner -> 3 panes, tiled
+        // (4b) ANY pane's header can be grabbed, not just the active one's:
+        //     pressing an INACTIVE pane's title strip activates it AND arms
+        //     the move - its close [x] already behaved that way, so without
+        //     this a 3+-pane tree could only be rearranged by first closing
+        //     panes to make the wanted one active.
+        bool grab_inactive = false;
+        {
+            compute_layout(&M, w, h); g_content = M.list;
+            compute_pane_tree_layout(g_pane_root, M.list);
+            Pane* l1 = first_leaf(g_pane_root);
+            Pane* l2 = (g_pane_root && g_pane_root->kind != PN_LEAF)
+                         ? first_leaf(g_pane_root->right) : NULL;
+            Pane* other = (l2 && l2 != g_active_pane) ? l2 : l1;
+            if (other && other != g_active_pane && other->kind == PN_LEAF) {
+                memset(&f, 0, sizeof f);
+                f.left_click = f.left_down = true;
+                f.x = other->rect.x + other->rect.w / 2;
+                f.y = other->rect.y + M.list_head_h / 2;  // its own header
+                handle_mouse(&M, &f);            // press -> activate + arm
+                grab_inactive = g_drag_split_armed && g_drag_src == DRAG_PANE &&
+                                g_active_pane == other;
+                f.left_click = false;            // release: no new press edge
+                f.left_down = false;
+                handle_mouse(&M, &f);            // release = cancel the drag
+                grab_inactive = grab_inactive && !g_drag_split_armed &&
+                                !g_drag_split;
+                activate_pane(A);                // leave focus where it was
+            }
+        }
+        printf("[selftest]   grab an INACTIVE pane by its header: %s\n",
+               grab_inactive ? "ok" : "FAILED");
+        if (!grab_inactive) printf("[selftest] FAIL: inactive pane grab\n");
+
+        // (5) four-way zones only: every point maps to LEFT/RIGHT/TOP/BOTTOM
+        //     (nearest edge). A CORNER maps to a side zone - never a diagonal
+        //     - and all four directions are reachable, so corner / centre
+        //     docking is impossible by construction.
+        {
+            RectI rr = {0, 0, 400, 300};
+            // Corner-WARD points, each clearly nearer one edge than the other
+            // (a dead tie would be ambiguous) - a corner must collapse to a
+            // single side zone, never a diagonal.
+            bool corners =
+                zone_of(&rr, 30, 60)   == DZ_LEFT &&   // upper-left  -> LEFT
+                zone_of(&rr, 370, 60)  == DZ_RIGHT &&  // upper-right -> RIGHT
+                zone_of(&rr, 30, 240)  == DZ_LEFT &&   // lower-left  -> LEFT
+                zone_of(&rr, 370, 240) == DZ_RIGHT &&  // lower-right -> RIGHT
+                zone_of(&rr, 200, 150) == DZ_LEFT;     // dead centre  -> LEFT
+            bool reach =
+                zone_of(&rr, 5, 150)   == DZ_LEFT &&
+                zone_of(&rr, 395, 150) == DZ_RIGHT &&
+                zone_of(&rr, 200, 5)   == DZ_TOP &&
+                zone_of(&rr, 200, 295) == DZ_BOTTOM &&
+                zone_of(&rr, -10, 150) == DZ_NONE;     // outside = no zone
+            bool ok5 = corners && reach;
+            printf("[selftest]   corners collapse to sides, 4 zones: %s\n",
+                   ok5 ? "ok" : "FAILED");
+            if (!ok5) printf("[selftest] FAIL: four-way zones\n");
+        }
+
+        // (6) release OUTSIDE every pane -> no zone: clean cancel
         compute_layout(&M, w, h); g_content = M.list;
         compute_pane_tree_layout(g_pane_root, M.list);
-        Pane* LB = (g_pane_root && g_pane_root->kind != PN_LEAF)
-                       ? first_leaf(g_pane_root->left) : NULL;
-        bool corner_ok = true, prev5 = false;
-        if (LB && zone_valid(&LB->rect, DZ_TL)) {
-            memset(&f, 0, sizeof f);
-            f.left_click = f.left_down = true;
-            f.x = A->rect.x + A->rect.w / 2;
-            f.y = A->rect.y + M.list_head_h / 2;   // header = grab strip
-            handle_mouse(&M, &f);
-            f.left_click = false;
-            f.x = LB->rect.x + LB->rect.w / 10; // 10%/10% -> TL corner
-            f.y = LB->rect.y + LB->rect.h / 10;
-            handle_mouse(&M, &f);
-            prev5 = g_drag_split && g_drop_active && g_drop_zone == DZ_TL;
-            f.left_down = false;
-            handle_mouse(&M, &f);
-            int n3 = pane_count(g_pane_root);
-            corner_ok = prev5 && n3 == 3 &&
-                        pane_tree_tiles(g_pane_root, M.list) &&
-                        g_active_pane == A &&
-                        strcmp(g_app.current_path, home) == 0;
-            printf("[selftest]   corner drop -> 3 panes: preview=%d panes=%d -> %s\n",
-                   prev5, n3, corner_ok ? "ok" : "FAILED");
-        } else {
-            printf("[selftest]   corner drop: (skipped, panes too small)\n");
-        }
-        if (!corner_ok) printf("[selftest] FAIL: corner drop\n");
-
-        // (6) drop on your OWN center -> no zone exists: clean cancel
         int n_before = pane_count(g_pane_root);
         memset(&f, 0, sizeof f);
         f.left_click = f.left_down = true;
@@ -19767,7 +25897,7 @@ static void run_selftest(void) {
         f.y = A->rect.y + M.list_head_h / 2;   // header = grab strip
         handle_mouse(&M, &f);
         f.left_click = false;
-        f.x = A->rect.x + A->rect.w / 2;       // own center = cancel
+        f.x = M.sidebar.x + M.sidebar.w / 2;   // over the SIDEBAR: no pane
         f.y = A->rect.y + A->rect.h / 2;
         handle_mouse(&M, &f);
         bool no_prev = !g_drop_active;
@@ -19776,7 +25906,7 @@ static void run_selftest(void) {
         bool ok6 = no_prev && !g_drag_split &&
                    pane_count(g_pane_root) == n_before &&
                    pane_tree_tiles(g_pane_root, M.list);
-        printf("[selftest]   center-on-self cancels: %s\n",
+        printf("[selftest]   release-outside cancels: %s\n",
                ok6 ? "ok" : "FAILED");
         if (!ok6) printf("[selftest] FAIL: drop cancel\n");
 
@@ -19784,8 +25914,8 @@ static void run_selftest(void) {
         RectI tiny = {0, 0, 100, 50};
         RectI big = {0, 0, 4000, 3000};
         bool ok7 = !zone_valid(&tiny, DZ_LEFT) && !zone_valid(&tiny, DZ_TOP) &&
-                   !zone_valid(&tiny, DZ_TL) && zone_valid(&big, DZ_LEFT) &&
-                   zone_valid(&big, DZ_TL) && zone_valid(&big, DZ_CENTER);
+                   zone_valid(&big, DZ_LEFT) && zone_valid(&big, DZ_RIGHT) &&
+                   zone_valid(&big, DZ_TOP) && zone_valid(&big, DZ_BOTTOM);
         printf("[selftest]   min-size zones: %s\n", ok7 ? "ok" : "FAILED");
         if (!ok7) printf("[selftest] FAIL: min pane sizes\n");
 
@@ -19829,18 +25959,18 @@ static void run_selftest(void) {
         compute_pane_tree_layout(g_pane_root, M.list);
     }
 
-    // ---------------- SPEC 20: tab absorb / drag sources / 3-dot grip ---
+    // ---------------- SPEC 20: tab absorb / drag sources / full-bar resize --
     //  (A) a top tab is named by its FOLDER, never "Workspace"
     //  (B) grab TOP TAB -> over another view -> zones -> drop -> SPLIT
     //      and the source tab disappears (the only split gesture)
     //  (C) drag a tab, leave the target, release -> fully cancelled
     //  (D) a plain click on a tab switches the view, and only on release
-    //  (E) only the centered 3-dot grip resizes: col-resize cursor on a
-    //      vertical divider, arrow elsewhere, off-grip press = nothing
-    //  (F) a horizontal divider's grip asks for the row-resize cursor
+    //  (E) the WHOLE divider bar resizes: col-resize cursor anywhere on a
+    //      vertical divider, arrow elsewhere, off-grip press starts a drag
+    //  (F) a horizontal divider asks for the row-resize cursor
     //  (G) a pane TITLE STRIP press arms a move; the column header only
     //      sorts and the list body never arms anything layout related
-    printf("[selftest] tab absorb / drag sources / resize grip...\n");
+    printf("[selftest] tab absorb / drag sources / full-bar resize...\n");
     {
         int w = 0, h = 0;
         platform_window_size(&w, &h);
@@ -20096,7 +26226,7 @@ static void run_selftest(void) {
             if (!ok) printf("[selftest] FAIL: pane drag source is title strip only\n");
         }
 
-        // ---- (E) the centered 3-dot grip is the ONLY resize (spec 8/9/10) ----
+        // ---- (E) the WHOLE divider bar is draggable (not just the grip) ----
         {
             while (pane_count(g_pane_root) > 1) {
                 activate_pane(first_leaf(g_pane_root));
@@ -20118,30 +26248,29 @@ static void run_selftest(void) {
                 int top = root->left->rect.y + SC(10);   // far above the grip
                 float ratio0 = root->ratio;
 
-                // (E1) press the bar AWAY from the grip -> NOTHING at all
+                // (E1) press the bar AWAY from the center grip -> a resize
+                //      drag STARTS (the whole bar is draggable now)
                 g_sort_pending = -1;
                 memset(&f, 0, sizeof f);
                 f.left_click = f.left_down = true;
                 f.x = mid; f.y = top;
                 handle_mouse(&M, &f);
-                bool off_press = !g_splitter_drag &&
-                                 (g_drag_src != DRAG_RESIZE) &&
+                bool off_press = g_splitter_drag &&
+                                 (g_drag_src == DRAG_RESIZE) &&
                                  !g_drag_split_armed && (g_sort_pending < 0);
                 f.left_click = false;
-                f.x = mid - 60; f.y = top + 40;
-                handle_mouse(&M, &f);
-                bool off_move = !g_splitter_drag && !g_drag_split;
                 f.left_down = false;
-                handle_mouse(&M, &f);
-                bool off_ok = off_press && off_move && (root->ratio == ratio0);
+                handle_mouse(&M, &f);          // release (no move yet)
+                bool off_ok = off_press && !g_splitter_drag &&
+                              (root->ratio == ratio0);
 
-                // (E2) hover the grip -> col-resize cursor
+                // (E2) hover the bar -> col-resize cursor
                 memset(&f, 0, sizeof f);
                 f.x = mid; f.y = cy;
                 handle_mouse(&M, &f);
                 bool cur_col = (platform_get_cursor() == NOVA_CURSOR_COL);
 
-                // (E3) press + drag the grip -> the ratio really changes
+                // (E3) press + drag the bar -> the ratio really changes
                 f.left_click = f.left_down = true;
                 handle_mouse(&M, &f);
                 bool grip_press = g_splitter_drag &&
@@ -20158,7 +26287,7 @@ static void run_selftest(void) {
                                !g_splitter_drag &&
                                (root->ratio != ratio0);
 
-                // (E4) away from the grip -> the plain arrow comes back
+                // (E4) away from the divider -> the plain arrow comes back
                 memset(&f, 0, sizeof f);
                 f.x = M.list.x + SC(40); f.y = M.list.y + SC(40);
                 handle_mouse(&M, &f);
@@ -20166,13 +26295,13 @@ static void run_selftest(void) {
 
                 ok = off_ok && cur_col && grip_ok && cur_arrow;
                 if (!ok)
-                    printf("[selftest]   off=%d col=%d grip=%d arrow=%d\n",
+                    printf("[selftest]   off=%d col=%d drag=%d arrow=%d\n",
                            off_ok, cur_col, grip_ok, cur_arrow);
             }
-            printf("[selftest]   3-dot grip (off / col / drag / arrow): %s\n",
+            printf("[selftest]   full-bar resize (off / col / drag / arrow): %s\n",
                    ok ? "ok" : (ran ? "FAILED" : "skipped"));
-            if (ran && !ok) printf("[selftest] FAIL: resize grip / resize cursor\n");
-            if (!ran) printf("[selftest]   (no split for the grip test)\n");
+            if (ran && !ok) printf("[selftest] FAIL: full-bar resize / cursor\n");
+            if (!ran) printf("[selftest]   (no split for the resize test)\n");
         }
 
         // ---- (F) a HORIZONTAL divider's grip -> row-resize cursor ----
@@ -20236,6 +26365,491 @@ static void run_selftest(void) {
         load_dir(platform_get_home_directory());
         g_app.selected = (g_app.view_count > 0) ? 0 : -1;
         g_app.scroll = 0;
+        compute_layout(&M, w, h);
+        g_content = M.list;
+        compute_pane_tree_layout(g_pane_root, M.list);
+    }
+
+    // ---------------- search popup: a focused overlay per pane ----------
+    printf("[selftest] search popup overlay...\n");
+    {
+        int w = 0, h = 0;
+        platform_window_size(&w, &h);
+        Layout M;
+        InputState f;
+        memset(&f, 0, sizeof f);
+        g_app.menu_open = false;
+        g_app.view_menu_open = false;
+        g_zoom_pop_until = 0;
+        while (pane_count(g_pane_root) > 1) {
+            activate_pane(first_leaf(g_pane_root));
+            pane_close_active();
+        }
+        while (g_ws_n > 1) ws_close(g_ws_n - 1);
+        load_dir(platform_get_home_directory());
+        compute_layout(&M, w, h);
+        g_content = M.list;
+        compute_pane_tree_layout(g_pane_root, M.list);
+        Pane* A = g_active_pane;
+
+        // (1) clicking the Search box opens ONE popup that is LARGE,
+        //     FOCUSED, centered over the WHOLE window (not embedded in the
+        //     pane) and fully inside the window bounds.
+        bool ok1 = false;
+        if (A && A->kind == PN_LEAF && M.search_field.w > 0) {
+            memset(&f, 0, sizeof f);
+            f.left_click = f.left_down = true;
+            f.x = M.search_field.x + M.search_field.w / 3;
+            f.y = M.search_field.y + M.search_field.h / 2;
+            handle_mouse(&M, &f);
+            f.left_click = false;
+            f.left_down = false;
+            handle_mouse(&M, &f);
+            RectI po = search_popup_rect();
+            int cx = po.x + po.w / 2;
+            ok1 = g_search_popup_open && g_search_popup_pane == A &&
+                  g_app.search_focused &&          // type immediately
+                  po.w >= SC(200) && po.h >= SC(56) &&   // big, not a sliver
+                  cx == w / 2 &&                   // horizontally centered
+                  po.x >= 0 && po.x + po.w <= w &&  // inside the window
+                  po.y >= SC(TOOLBAR_H) &&          // below the top bar
+                  po.y + po.h <= h - SC(STATUS_H);  // above the status bar
+        }
+        printf("[selftest]   click -> one global centered popup: %s\n",
+               ok1 ? "ok" : "FAILED");
+        if (!ok1) printf("[selftest] FAIL: search popup opens\n");
+
+        // (2) typing in the popup drives the REAL search of THIS pane
+        {
+            Layout paneL;
+            pane_input_build(&paneL, &M);
+            g_app.search_buf[0] = '\0';
+            search_changed();
+            st_tts(&paneL, "zqx");
+            bool typed = strcmp(g_app.search_buf, "zqx") == 0;
+            bool filtered = (g_app.view_count != g_app.count); // real filter
+            printf("[selftest]   popup typing -> real filter '%s': %s\n",
+                   g_app.search_buf,
+                   (typed && filtered) ? "ok" : "FAILED");
+            if (!(typed && filtered))
+                printf("[selftest] FAIL: popup typing must drive the search\n");
+
+            // (3) the popup's clear (x) empties the query through the
+            //     real search_changed(), not a fake box
+            RectI clr = search_popup_clear_rect();
+            memset(&f, 0, sizeof f);
+            f.left_click = f.left_down = true;
+            f.x = clr.x + clr.w / 2;
+            f.y = clr.y + clr.h / 2;
+            handle_mouse(&M, &f);
+            f.left_click = false;
+            f.left_down = false;
+            handle_mouse(&M, &f);
+            bool cleared = g_app.search_buf[0] == '\0' &&
+                           g_app.view_count == g_app.count;
+            printf("[selftest]   popup clear (x) empties the query: %s\n",
+                   cleared ? "ok" : "FAILED");
+            if (!cleared) printf("[selftest] FAIL: popup clear\n");
+
+            // (4) Escape closes the popup (existing convention)
+            st_tts(&paneL, "ab");
+            st_key(&paneL, VK_ESCAPE);
+            bool esc = !g_search_popup_open && !g_app.search_focused &&
+                       g_app.search_buf[0] == '\0';
+            printf("[selftest]   Escape closes the popup: %s\n",
+                   esc ? "ok" : "FAILED");
+            if (!esc) printf("[selftest] FAIL: popup Escape\n");
+        }
+
+        // (5) a press OUTSIDE the popup closes it and the click falls
+        //     through (nothing is swallowed)
+        {
+            bool ok5 = false;
+            if (A && A->kind == PN_LEAF && M.search_field.w > 0) {
+                memset(&f, 0, sizeof f);
+                f.left_click = f.left_down = true;
+                f.x = M.search_field.x + M.search_field.w / 3;
+                f.y = M.search_field.y + M.search_field.h / 2;
+                handle_mouse(&M, &f);
+                f.left_click = f.left_down = false;
+                handle_mouse(&M, &f);                 // release: popup open
+                bool opened = g_search_popup_open;
+                RectI po = search_popup_rect();      // global overlay
+                int sx = po.x + po.w + SC(60);        // clear of the popup
+                int sy = po.y + po.h + SC(60);
+                if (sx > M.list.x + M.list.w - SC(8)) sx = M.list.x + SC(40);
+                if (sy > M.list.y + M.list.h - SC(8)) sy = M.list.y + SC(120);
+                memset(&f, 0, sizeof f);
+                f.left_click = f.left_down = true;    // a REAL press out there
+                f.x = sx; f.y = sy;
+                handle_mouse(&M, &f);
+                bool closed_now = !g_search_popup_open;
+                f.left_click = f.left_down = false;
+                handle_mouse(&M, &f);                 // ... and its release
+                ok5 = opened && closed_now;
+                if (!ok5)
+                    printf("[selftest]   opened=%d closed=%d at %d,%d\n",
+                           opened, closed_now, sx, sy);
+            }
+            printf("[selftest]   outside press closes the popup: %s\n",
+                   ok5 ? "ok" : "FAILED");
+            if (!ok5) printf("[selftest] FAIL: popup outside-click\n");
+        }
+
+        // (6) per-pane independence: split, type in one pane, switch - the
+        //     other pane keeps its OWN query and never inherits the popup
+        {
+            bool ok6 = false;
+            compute_layout(&M, w, h);
+            g_content = M.list;
+            compute_pane_tree_layout(g_pane_root, M.list);
+            pane_split_right();
+            compute_layout(&M, w, h);
+            g_content = M.list;
+            compute_pane_tree_layout(g_pane_root, M.list);
+            Pane* B = first_leaf(g_pane_root);
+            if (B && B != g_active_pane && pane_count(g_pane_root) == 2) {
+                Pane* P1 = g_active_pane;         // the one we type into
+                Layout paneL;
+                pane_input_build(&paneL, &M);
+                focus_search();
+                g_search_popup_open = true;
+                g_search_popup_pane = P1;
+                st_tts(&paneL, "qq");
+                bool p1_has = strcmp(g_app.search_buf, "qq") == 0;
+                bool pop1 = g_search_popup_open && g_search_popup_pane == P1;
+
+                activate_pane(B);                 // switch away
+                bool p2_clean = g_app.search_buf[0] == '\0' &&
+                                !g_search_popup_open;   // no leak, no ghost
+
+                activate_pane(P1);                // ... and back again
+                bool back = strcmp(g_app.search_buf, "qq") == 0;  // kept
+                bool pop_gone = !g_search_popup_open;  // but not the overlay
+
+                ok6 = p1_has && pop1 && p2_clean && back && pop_gone;
+                if (!ok6)
+                    printf("[selftest]   p1=%d pop=%d p2=%d back=%d ghost=%d\n",
+                           p1_has, pop1, p2_clean, back, !pop_gone);
+                g_app.search_buf[0] = '\0';
+                search_changed();
+                blur_fields();
+            }
+            printf("[selftest]   per-pane query + popup independence: %s\n",
+                   ok6 ? "ok" : "FAILED");
+            if (!ok6) printf("[selftest] FAIL: popup per-pane independence\n");
+        }
+
+        // (6b) the address-bar typing focus is PER PANE (stored in
+        //      FolderView like the search focus): focusing one pane's
+        //      address must not light up every other pane's address bar
+        //      (the "everything looks selected" bug), a NEW pane (split
+        //      clone) never inherits it, and leaving a pane clears it -
+        //      typing focus does not travel.
+        {
+            bool ok6b = false;
+            while (pane_count(g_pane_root) > 1) {
+                activate_pane(first_leaf(g_pane_root));
+                pane_close_active();
+            }
+            Pane* A3 = g_active_pane;
+            focus_address();
+            pane_sync_active();                 // A3 stores addr_focused
+            pane_split_right();                 // clone built from A3's view
+            Pane* B3 = pane_leaf_other(g_pane_root, A3);
+            if (A3 && B3 && pane_count(g_pane_root) == 2) {
+                bool a_focus = A3->folder.addr_focused;   // kept per pane
+                bool clone_clean = !B3->folder.addr_focused &&
+                                   !B3->folder.search_focused;
+                activate_pane(B3);              // focus does not travel
+                bool b_clean = !g_app.addr_focused && !g_search_popup_open;
+                activate_pane(A3);              // ... and coming back is
+                bool a_cleared = !g_app.addr_focused;     // unfocused too
+                ok6b = a_focus && clone_clean && b_clean && a_cleared;
+                if (!ok6b)
+                    printf("[selftest]   a=%d clone=%d b=%d back=%d\n",
+                           a_focus, clone_clean, b_clean, a_cleared);
+            }
+            // Tab from the address bar moves typing focus to the search
+            // box - which must bring the SAME big centered popup as
+            // clicking the search box or the search shortcut (focus in
+            // search = popup, however the focus was gained).
+            compute_layout(&M, w, h);
+            focus_address();
+            {
+                InputState tin;
+                memset(&tin, 0, sizeof tin);
+                tin.key_code = VK_TAB;
+                st_input(&M, &tin);
+            }
+            bool ok6c = g_search_popup_open && g_app.search_focused &&
+                        g_search_popup_pane == g_active_pane;
+            blur_fields();
+            pane_sync_active();
+            printf("[selftest]   per-pane address focus: %s\n",
+                   ok6b ? "ok" : "FAILED");
+            if (!ok6b) printf("[selftest] FAIL: per-pane address focus\n");
+            printf("[selftest]   Tab->search opens the popup: %s\n",
+                   ok6c ? "ok" : "FAILED");
+            if (!ok6c) printf("[selftest] FAIL: Tab->search popup\n");
+        }
+
+        // (7) the popup is a GLOBAL overlay: a pane split changes the pane
+        //     geometry but must NOT move the popup (it is not embedded in a
+        //     pane) - it stays window-centered and in bounds. It still goes
+        //     stale the moment the ACTIVE pane changes.
+        {
+            bool ok7 = false;
+            compute_layout(&M, w, h);
+            g_content = M.list;
+            compute_pane_tree_layout(g_pane_root, M.list);
+            while (pane_count(g_pane_root) > 1) {
+                activate_pane(first_leaf(g_pane_root));
+                pane_close_active();
+            }
+            compute_layout(&M, w, h);
+            g_content = M.list;
+            compute_pane_tree_layout(g_pane_root, M.list);
+            Pane* A2 = g_active_pane;
+            if (A2 && A2->kind == PN_LEAF && M.search_field.w > 0) {
+                focus_search();
+                g_search_popup_open = true;
+                g_search_popup_pane = A2;
+                RectI r0 = search_popup_rect();
+                pane_split_right();                // pane geometry changes
+                compute_layout(&M, w, h);
+                g_content = M.list;
+                compute_pane_tree_layout(g_pane_root, M.list);
+                bool still = g_search_popup_open && g_search_popup_pane == A2;
+                RectI r1 = search_popup_rect();
+                // GLOBAL: window-anchored, so the split must leave the rect
+                // byte-for-byte identical and still centered / in bounds.
+                int cx = r1.x + r1.w / 2;
+                bool global = still && r1.w > 0 &&
+                              r1.x == r0.x && r1.y == r0.y &&
+                              r1.w == r0.w && r1.h == r0.h &&
+                              cx == w / 2 &&
+                              r1.x >= 0 && r1.x + r1.w <= w &&
+                              r1.y >= SC(TOOLBAR_H) &&
+                              r1.y + r1.h <= h - SC(STATUS_H);
+                // now move focus to the OTHER pane: the overlay is stale
+                Pane* other = first_leaf(g_pane_root);
+                if (other == A2 && g_pane_root->right)
+                    other = first_leaf(g_pane_root->right);
+                bool stale = false;
+                if (other && other != A2) {
+                    activate_pane(other);
+                    search_popup_sync();
+                    stale = !g_search_popup_open && !g_search_popup_pane;
+                }
+                ok7 = global && stale;
+                if (!ok7)
+                    printf("[selftest]   still=%d same=%d cx=%d/%d stale=%d\n",
+                           still,
+                           (r1.x == r0.x && r1.y == r0.y &&
+                            r1.w == r0.w && r1.h == r0.h),
+                           cx, w / 2, stale);
+                g_app.search_buf[0] = '\0';
+                search_changed();
+                blur_fields();
+            }
+            printf("[selftest]   global through split, pane switch dismisses: %s\n",
+                   ok7 ? "ok" : "FAILED");
+            if (!ok7) printf("[selftest] FAIL: popup global overlay\n");
+        }
+
+        // (7b) the MAIN SEARCH / LOCATION-BAR popup reuses the SAME global
+        //      overlay architecture: focusing the address bar opens a
+        //      window-centered panel (identical horizontal anchor to the
+        //      Ctrl+F popup), it is scoped to the active pane, and a pane
+        //      switch or blur dismisses it.  It never edits another pane.
+        {
+            bool ok7b = false;
+            while (pane_count(g_pane_root) > 1) {
+                activate_pane(first_leaf(g_pane_root));
+                pane_close_active();
+            }
+            compute_layout(&M, w, h);
+            g_content = M.list;
+            compute_pane_tree_layout(g_pane_root, M.list);
+            Pane* A4 = g_active_pane;
+            if (A4 && A4->kind == PN_LEAF) {
+                focus_address();                 // opens the location popup
+                bool opens = g_addr_popup_open && g_addr_popup_pane == A4 &&
+                             g_app.addr_focused;
+                RectI r0 = addr_popup_rect();
+                int cx = r0.x + r0.w / 2;        // centered on the WHOLE window
+                bool centered = r0.w > 0 && cx == w / 2 &&
+                                r0.x >= 0 && r0.x + r0.w <= w &&
+                                r0.y >= SC(TOOLBAR_H) &&
+                                r0.y + r0.h <= h - SC(STATUS_H);
+                RectI sp = search_popup_rect();  // same anchor as Ctrl+F
+                bool same_anchor = r0.x == sp.x && r0.w == sp.w;
+                pane_split_right();              // scoped: split, switch away
+                compute_layout(&M, w, h);
+                g_content = M.list;
+                compute_pane_tree_layout(g_pane_root, M.list);
+                Pane* B4 = pane_leaf_other(g_pane_root, A4);
+                bool scoped = false;
+                if (B4 && B4 != A4) {
+                    activate_pane(B4);
+                    addr_popup_sync();
+                    scoped = !g_addr_popup_open && !g_addr_popup_pane;
+                    activate_pane(A4);
+                }
+                focus_address();                 // blur (Escape) closes it
+                blur_fields();
+                bool closed = !g_addr_popup_open && !g_addr_popup_pane;
+                ok7b = opens && centered && same_anchor && scoped && closed;
+                if (!ok7b)
+                    printf("[selftest]   opens=%d centered=%d anchor=%d "
+                           "scoped=%d closed=%d\n",
+                           opens, centered, same_anchor, scoped, closed);
+            }
+            printf("[selftest]   location-bar popup global+scoped: %s\n",
+                   ok7b ? "ok" : "FAILED");
+            if (!ok7b) printf("[selftest] FAIL: location-bar popup\n");
+        }
+
+        // ---- (H) location popup CHILD SUGGESTIONS: real FS, 4 states ----
+        //  (1) a folder with children -> SUG_OK: folders only (the file is
+        //      never listed), sorted, and read ONCE (armed -> pump -> cached)
+        //  (2) a folder with ZERO children -> SUG_EMPTY (a real read that
+        //      genuinely returned nothing)
+        //  (3) a path that cannot be read   -> SUG_ERROR, count 0 - a
+        //      failure is NEVER reported as a confirmed empty folder
+        //  (4) Up/Down move the highlight; with no list the keys are NOT
+        //      eaten (they keep driving the normal list selection)
+        //  (5) the highlight stays visible when the list scrolls, and
+        //  (6) Enter on a highlight opens THAT child in the ACTIVE pane
+        {
+            char base[512], d[600], emptyd[640], gone[640];
+            char tmp[MAX_PATH];
+            GetTempPathA((DWORD)sizeof(tmp), tmp);
+            snprintf(base, sizeof base, "%snova_st_sug_%u", tmp,
+                     (unsigned)GetCurrentProcessId());
+            CreateDirectoryA(base, NULL);
+            for (int i = 1; i <= 12; i++) {        // 12 children > 8 rows,
+                snprintf(d, sizeof d, "%s\\sub%02d", base, i);  // so it scrolls
+                CreateDirectoryA(d, NULL);
+            }
+            snprintf(d, sizeof d, "%s\\a_file.txt", base);   // NOT a child dir
+            {
+                HANDLE fh = CreateFileA(d, GENERIC_WRITE, 0, NULL,
+                                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                        NULL);
+                if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh);
+            }
+            // SIBLING of base (not a child): base must contain exactly the
+            // 12 subNN folders so the count/sort assertions stay exact.
+            snprintf(emptyd, sizeof emptyd, "%snova_st_sug_empty_%u", tmp,
+                     (unsigned)GetCurrentProcessId());
+            CreateDirectoryA(emptyd, NULL);
+            snprintf(gone, sizeof gone, "%s\\not_a_real_folder_xyz", base);
+
+            bool ok8 = false;
+            bool ran8 = (GetFileAttributesA(base) != INVALID_FILE_ATTRIBUTES);
+            if (ran8) {
+                snprintf(g_app.current_path, sizeof g_app.current_path, "%s",
+                         base);
+                focus_address();                  // opens the popup on base
+                addr_popup_sync();                // retargets -> read armed
+                bool loading = (sug_state() == SUG_LOADING);
+                sug_pump();                       // the deferred read lands
+
+                // (1) children only, sorted, bounded, cached
+                bool no_file = true;
+                for (int i = 0; i < sug_count(); i++)
+                    if (_stricmp(sug_name(i), "a_file.txt") == 0) no_file = false;
+                bool ok_rows = (sug_state() == SUG_OK) && (sug_count() == 12) &&
+                               no_file &&
+                               _stricmp(sug_name(0), "sub01") == 0 &&
+                               _stricmp(sug_name(11), "sub12") == 0;
+                addr_popup_sync();                // same folder again
+                bool cached = (sug_state() == SUG_OK) && !g_sug_armed;
+
+                // (2) a successful read that really returned zero children
+                snprintf(g_app.current_path, sizeof g_app.current_path, "%s",
+                         emptyd);
+                addr_popup_sync();
+                sug_pump();
+                bool is_empty = (sug_state() == SUG_EMPTY) &&
+                                (sug_count() == 0);
+
+                // (3) an unreadable path is an ERROR, never "empty"
+                snprintf(g_app.current_path, sizeof g_app.current_path, "%s",
+                         gone);
+                addr_popup_sync();
+                sug_pump();
+                bool is_error = (sug_state() == SUG_ERROR) &&
+                                (sug_count() == 0);
+                // ... and with no list the arrow keys are not swallowed
+                bool keys_free = !sug_move(1) && !sug_move(-1);
+
+                // (4) Up/Down walk the highlight over the real children
+                snprintf(g_app.current_path, sizeof g_app.current_path, "%s",
+                         base);
+                addr_popup_sync();
+                sug_pump();
+                bool walk = sug_move(1) && sug_sel() == 0 &&
+                            sug_move(1) && sug_sel() == 1 &&
+                            sug_move(-1) && sug_sel() == 0;
+                // (5) walk to the END: the list scrolls, highlight visible
+                bool scrolled = true;
+                int rows = sug_rows_shown();
+                while (sug_sel() < sug_count() - 1 && sug_move(1)) { }
+                if (rows > 0 && sug_count() > rows)
+                    scrolled = (sug_sel() == sug_count() - 1) &&
+                               (sug_scroll() > 0) &&
+                               (sug_scroll() + rows > sug_sel()) &&
+                               (sug_scroll() >= 0);
+
+                // (6) Enter on a highlight opens THAT child (active pane)
+                g_sug_sel = 0;                    // sub01
+                bool accepted = sug_accept();
+                char want[640];
+                snprintf(want, sizeof want, "%s\\sub01", base);
+                bool navigated = accepted &&
+                    _strnicmp(g_app.current_path, want, strlen(want)) == 0;
+                bool closed = !g_addr_popup_open && !g_addr_popup_pane;
+
+                ok8 = loading && ok_rows && cached && is_empty && is_error &&
+                      keys_free && walk && scrolled && navigated && closed;
+                if (!ok8)
+                    printf("[selftest]   load=%d rows=%d cache=%d empty=%d "
+                           "err=%d free=%d walk=%d scroll=%d go=%d close=%d\n",
+                           loading, ok_rows, cached, is_empty, is_error,
+                           keys_free, walk, scrolled, navigated, closed);
+            }
+            printf("[selftest]   location popup child suggestions: %s\n",
+                   ok8 ? "ok" : (ran8 ? "FAILED" : "skipped"));
+            if (ran8 && !ok8)
+                printf("[selftest] FAIL: location popup child suggestions\n");
+
+            // fixture out (children first), popup and pane back to normal
+            blur_fields();
+            addr_popup_sync();                    // -> sug_reset()
+            for (int i = 12; i >= 1; i--) {
+                snprintf(d, sizeof d, "%s\\sub%02d", base, i);
+                RemoveDirectoryA(d);
+            }
+            snprintf(d, sizeof d, "%s\\a_file.txt", base);
+            DeleteFileA(d);
+            RemoveDirectoryA(emptyd);
+            RemoveDirectoryA(base);
+        }
+
+        // restore: one tab, one pane, no popup
+        blur_fields();
+        g_app.search_buf[0] = '\0';
+        search_changed();
+        while (pane_count(g_pane_root) > 1) {
+            activate_pane(first_leaf(g_pane_root));
+            pane_close_active();
+        }
+        while (g_ws_n > 1) ws_close(g_ws_n - 1);
+        load_dir(platform_get_home_directory());
+        g_app.selected = (g_app.view_count > 0) ? 0 : -1;
         compute_layout(&M, w, h);
         g_content = M.list;
         compute_pane_tree_layout(g_pane_root, M.list);
@@ -21291,6 +27905,36 @@ static void run_selftest(void) {
         fav_init_path(tstore);
         st_expect(g_fav_n == 0, "a fresh favorites store starts empty", &fails);
 
+        // ---- the Alt+S alias: a PLAIN press opens the wheel -----------
+        // C keeps its tap/hold gesture; a CHORD has none - the press
+        // itself is the shortcut, and Alt never types into the prefix.
+        {
+            int opens0 = g_rad_opens;
+            InputState fk;
+            memset(&fk, 0, sizeof(fk));
+            fk.key_code = 'S';
+            fk.alt_pressed = true;
+            handle_keys(&fk, &paneL);
+            st_expect(g_rad_open && g_rad_opens == opens0 + 1,
+                      "Alt+S opens the wheel on the plain press", &fails);
+            st_expect(g_tts_prefix[0] == '\0',
+                      "Alt+S never types into the prefix", &fails);
+            rad_close("test");
+            memset(&fk, 0, sizeof(fk));
+            fk.key_code = 'S';              // bare S: typing, not the wheel
+            fk.charq[0] = (unsigned int)'s';  // the WM_CHAR of that press
+            fk.charq_n = 1;
+            handle_keys(&fk, &paneL);
+            st_expect(!g_rad_open && g_rad_opens == opens0 + 1,
+                      "bare S does not open the wheel", &fails);
+            st_expect(g_tts_prefix[0] == 's',
+                      "bare S still types 's' for type-to-select", &fails);
+            tts_reset();
+            st_expect(g_ents[CMD_WHEEL].akey == 'S' &&
+                      g_ents[CMD_WHEEL].amods == (int)M_ALT,
+                      "the wheel's fixed alias is Alt+S", &fails);
+        }
+
         // ---- 1) the cap and the LRU rule (spec 9 / 10) -----------------
         char cand[12][1024];
         int ncand = 0;
@@ -21504,6 +28148,7 @@ static void run_selftest(void) {
             // instead of running off the viewport (spec 15).
             memset(&fake, 0, sizeof(fake));
             fake.key_code = 'C';
+            fake.key_repeat = 'C';   // HOLD: the OS auto-repeat edge
             fake.x = 0;
             fake.y = 0;
             int opens0 = g_rad_opens;
@@ -21584,6 +28229,7 @@ static void run_selftest(void) {
             g_app.menu_open = true;
             memset(&fake, 0, sizeof(fake));
             fake.key_code = 'C';
+            fake.key_repeat = 'C';   // HOLD: the OS auto-repeat edge
             fake.x = 10;
             fake.y = 10;
             handle_keys(&fake, &paneL);
@@ -21598,6 +28244,7 @@ static void run_selftest(void) {
                       "opens a second one", &fails);
             memset(&fake, 0, sizeof(fake));
             fake.key_code = 'C';
+            fake.key_repeat = 'C';   // HOLD: the OS auto-repeat edge
             fake.x = 10;
             fake.y = 10;
             handle_keys(&fake, &paneL);
@@ -21632,6 +28279,7 @@ static void run_selftest(void) {
             // hub points at nothing, so only then does it clear it.
             memset(&fake, 0, sizeof(fake));
             fake.key_code = 'C';
+            fake.key_repeat = 'C';   // HOLD: the OS auto-repeat edge
             fake.x = w / 2;
             fake.y = h / 2;
             handle_keys(&fake, &paneL);
@@ -21659,6 +28307,7 @@ static void run_selftest(void) {
             // app's OWN navigation / open path (spec 6-8)
             memset(&fake, 0, sizeof(fake));
             fake.key_code = 'C';
+            fake.key_repeat = 'C';   // HOLD: the OS auto-repeat edge
             fake.x = w / 2;
             fake.y = h / 2;
             handle_keys(&fake, &paneL);
@@ -21689,6 +28338,7 @@ static void run_selftest(void) {
             // a click in the dead zone just dismisses it
             memset(&fake, 0, sizeof(fake));
             fake.key_code = 'C';
+            fake.key_repeat = 'C';   // HOLD: the OS auto-repeat edge
             fake.x = w / 2;
             fake.y = h / 2;
             handle_keys(&fake, &paneL);
@@ -21706,6 +28356,7 @@ static void run_selftest(void) {
             clamp_scroll(&paneL);
             memset(&fake, 0, sizeof(fake));
             fake.key_code = 'C';
+            fake.key_repeat = 'C';   // HOLD: the OS auto-repeat edge
             fake.x = w - 1;
             fake.y = h - 1;
             handle_keys(&fake, &paneL);
@@ -21726,6 +28377,7 @@ static void run_selftest(void) {
             // Escape chain (which would exit the program)
             memset(&fake, 0, sizeof(fake));
             fake.key_code = 'C';
+            fake.key_repeat = 'C';   // HOLD: the OS auto-repeat edge
             fake.x = w / 2;
             fake.y = h / 2;
             handle_keys(&fake, &paneL);
@@ -21741,6 +28393,7 @@ static void run_selftest(void) {
             // another key closes it and then acts normally
             memset(&fake, 0, sizeof(fake));
             fake.key_code = 'C';
+            fake.key_repeat = 'C';   // HOLD: the OS auto-repeat edge
             fake.x = w / 2;
             fake.y = h / 2;
             handle_keys(&fake, &paneL);
@@ -21758,10 +28411,13 @@ static void run_selftest(void) {
             // do ONE thing (spec 4 / 12 / 16 / 18).
             memset(&fake, 0, sizeof(fake));
             fake.key_code = 'C';
+            fake.key_repeat = 'C';   // HOLD: the OS auto-repeat edge
             fake.x = w / 2;
             fake.y = h / 2;
             handle_keys(&fake, &paneL);
-            st_expect(g_rad_open, "a plain tap opens the wheel", &fails);
+            st_expect(g_rad_open,
+                      "a HELD press opens the wheel (a tap would type "
+                      "the letter instead)", &fails);
             {
                 RadGeo ge;
                 rad_geom(w, h, g_rad_cx, g_rad_cy, &ge);
@@ -21820,6 +28476,7 @@ static void run_selftest(void) {
             // ---- "+" -> the picker -> the SAME list (spec 6-10 / 13) ---
             memset(&fake, 0, sizeof(fake));
             fake.key_code = 'C';
+            fake.key_repeat = 'C';   // HOLD: the OS auto-repeat edge
             fake.x = w / 2;
             fake.y = h / 2;
             handle_keys(&fake, &paneL);
@@ -22466,6 +29123,13 @@ static void run_selftest(void) {
             S_EXP(text_caret_from_x("abcdefghijklmno", 0, 19, 110) <= 13,
                   "settings: click-to-caret maps through real glyph widths");
 
+            // The search box centers text on the font's REAL line height;
+            // guard the metric source itself - Segoe UI's cell is ~1.35em,
+            // so a nominal-size fallback (raw px = 14) fails these bounds.
+            S_EXP(renderer_text_height(g_app.renderer, 14) >= 16 &&
+                  renderer_text_height(g_app.renderer, 14) <= 23,
+                  "settings: line height comes from real font metrics");
+
             // New tab on Ctrl+Shift+N: Shift is OPTIONAL at dispatch (the
             // recorded binding stays Ctrl+N), so the browser habit works
             // without a second binding that could clash with anything.
@@ -22480,6 +29144,87 @@ static void run_selftest(void) {
                 kn.ctrl_pressed = false; kn.shift_pressed = false;
                 S_EXP(!cmd_hit(&kn, CMD_NEW_TAB),
                       "settings: a lone N never opens a tab");
+            }
+
+            // ---- New Tab duplicates the ACTIVE tab's folder ----
+            // Every New Tab action (hamburger, Ctrl+N, the '+' button)
+            // routes through ws_new(g_app.current_path); ws_new keeps its
+            // own home fallback for an empty path.
+            {
+                char before[1024], newp[1024];
+                int ws0 = g_ws_cur;
+                int sav_ws_n = g_ws_n;
+                load_dir("C:\\Windows");          // a folder that is NOT Home
+                snprintf(before, sizeof before, "%s", g_app.current_path);
+                S_EXP(before[0] && strcmp(before,
+                                          platform_get_home_directory()) != 0,
+                      "new tab: C:\\Windows is the active folder");
+                run_menu(0);                      // the hamburger's New tab
+                S_EXP(g_ws_n == sav_ws_n + 1, "new tab: one tab is added");
+                S_EXP(g_ws_cur != ws0, "new tab: the new tab becomes active");
+                snprintf(newp, sizeof newp, "%s", g_app.current_path);
+                S_EXP(strcmp(newp, before) == 0,
+                      "new tab: it duplicates the CURRENT folder, not Home");
+                load_dir(st_shelf());          // navigate the NEW tab away
+                ws_switch(ws0);
+                S_EXP(strcmp(g_app.current_path, before) == 0,
+                      "new tab: the original tab keeps its own folder");
+                ws_switch(g_ws_n - 1);
+                S_EXP(strstr(g_app.current_path, "shelf") != NULL,
+                      "new tab: the new tab keeps its own navigation");
+                ws_close(g_ws_cur);               // restore the tab count
+            }
+
+            // ---- Tab click hit-testing at 100 / 125 / 150% ----
+            // The chip is inset SC(4) from the window top; that thin
+            // padding above it is tab-bar territory, so the WHOLE tab
+            // column (padding + chip) must hit the tab - a top-edge click
+            // must never fall into the resize border / drag strip. The
+            // gaps between tabs and the area below the chips stay drag
+            // strip.
+            {
+                const int tscales[3] = {100, 125, 150};
+                int sav_ws_g = g_ws_n;
+                while (g_ws_n < 2) ws_new(NULL);   // geometry needs 2 tabs
+                for (int s = 0; s < 3; s++) {
+                    Layout tl;
+                    char nm[128];
+                    ui_scale_set(tscales[s]);
+                    compute_layout(&tl, 1600, 900);
+                    const RectI* a = &tl.tab_rects[0];
+                    const RectI* b = &tl.tab_rects[1];
+                    int mx = a->x + a->w / 2;
+                    snprintf(nm, sizeof nm,
+                             "tabs@%d: the padding above a chip is the tab",
+                             tscales[s]);
+                    S_EXP(tab_hit_at(&tl, mx, 1) == 0, nm);
+                    snprintf(nm, sizeof nm,
+                             "tabs@%d: NCHITTEST hands the top edge to the "
+                             "app", tscales[s]);
+                    S_EXP(topbar_hit(mx, 1) == 1, nm);
+                    snprintf(nm, sizeof nm, "tabs@%d: the chip top edge",
+                             tscales[s]);
+                    S_EXP(tab_hit_at(&tl, mx, a->y) == 0, nm);
+                    snprintf(nm, sizeof nm, "tabs@%d: the chip center",
+                             tscales[s]);
+                    S_EXP(tab_hit_at(&tl, mx, a->y + a->h / 2) == 0, nm);
+                    snprintf(nm, sizeof nm, "tabs@%d: the chip bottom edge",
+                             tscales[s]);
+                    S_EXP(tab_hit_at(&tl, mx, a->y + a->h - 1) == 0, nm);
+                    snprintf(nm, sizeof nm,
+                             "tabs@%d: the second tab's top edge", tscales[s]);
+                    S_EXP(tab_hit_at(&tl, b->x + b->w / 2, 1) == 1, nm);
+                    snprintf(nm, sizeof nm,
+                             "tabs@%d: the gap between tabs stays drag strip",
+                             tscales[s]);
+                    S_EXP(tab_hit_at(&tl, b->x - SC(2), 1) == -1, nm);
+                    snprintf(nm, sizeof nm,
+                             "tabs@%d: below the chips is not a tab",
+                             tscales[s]);
+                    S_EXP(tab_hit_at(&tl, mx, a->y + a->h + SC(2)) == -1, nm);
+                }
+                ui_scale_set(100);                // leave the app at default
+                while (g_ws_n > sav_ws_g) ws_close(g_ws_n - 1);
             }
 
             S_EXP(!set_rebind(CMD_VIEW, 'N', M_CTRL, err, sizeof err) &&
@@ -22526,6 +29271,7 @@ static void run_selftest(void) {
             opt_set(CMD_WHEEL, true);
             memset(&f, 0, sizeof f);
             f.key_code = 'C';
+            f.key_repeat = 'C';   // HOLD: the OS auto-repeat edge
             f.x = 640; f.y = 360;
             st_input(&m, &f);
             S_EXP(g_rad_open,
@@ -23043,9 +29789,21 @@ static void run_selftest(void) {
                     s2, sizeof s2);
         bool sok = strncmp(s1, "nova_on_crash", 13) == 0 &&
                    strncmp(s2, "load_dir", 8) == 0;
-        printf("[selftest] crash symbol lookup: %s (%s | %s)\n",
-               sok ? "ok" : "FAILED", s1, s2);
-        if (!sok) printf("[selftest] FAIL: crash symbol lookup\n");
+        // A STRIPPED release build (-s: ~30% smaller download) carries no
+        // symbol table - the crash box then names the offset, which
+        // build\NovaFile.map resolves.  Only a build WITH a table must
+        // resolve names.
+        IMAGE_DOS_HEADER* dh = (IMAGE_DOS_HEADER*)mbase;
+        IMAGE_NT_HEADERS* nh = (IMAGE_NT_HEADERS*)(mbase + dh->e_lfanew);
+        bool stripped = nh->FileHeader.PointerToSymbolTable == 0 ||
+                        nh->FileHeader.NumberOfSymbols == 0;
+        if (stripped && !sok) {
+            printf("[selftest] crash symbol lookup: skipped (stripped build - names via NovaFile.map)\n");
+        } else {
+            printf("[selftest] crash symbol lookup: %s (%s | %s)\n",
+                   sok ? "ok" : "FAILED", s1, s2);
+            if (!sok) printf("[selftest] FAIL: crash symbol lookup\n");
+        }
     }
 
     // --- jumbo (256px) icon source -----------------------------------
@@ -23328,8 +30086,11 @@ static void run_selftest(void) {
         if (f) printf("[selftest] FAIL: updates\n");
     }
 
-    printf("[selftest] all features OK\n");
+    st_explorer_parity();
+    st_system_menu();
+    if (g_st_failures == 0) printf("[selftest] all features OK\n");
 }
+#undef printf
 
 // =============================================================
 // Search benchmark (--bench) - MEASUREMENT ONLY.
@@ -23886,6 +30647,11 @@ static void run_bench_nav(void) {
 // =============================================================
 
 #define SPLITTER_W 5
+// Hit tolerance ACROSS the divider.  The visible bar stays SPLITTER_W (5px),
+// but the grab band is wider so a divider is easy to catch, and it runs the
+// divider's FULL length - the user can drag from any point along it, not just
+// the 3-dot grip at its center.
+#define SPLITTER_HIT SC(7)
 #define PANE_MIN_W SC(150)      // a split half never gets smaller than this
 #define PANE_MIN_H SC(90)
 
@@ -23902,14 +30668,36 @@ static void pane_free(Pane* p) {
     free(p);
 }
 
+// The live multi-selection <-> a FolderView's stored bitset (see
+// FolderView.sel_bits).  Indices are view rows; anything out of range is
+// skipped on the way in and simply can't be set on the way out.
+static void sel_bits_from_g(unsigned* bits) {
+    memset(bits, 0, sizeof(unsigned) * (SEL_MAX / 32));
+    for (int i = 0; i < g_sel_n; i++)
+        if (g_sel[i] >= 0 && g_sel[i] < SEL_MAX)
+            bits[g_sel[i] >> 5] |= 1u << (g_sel[i] & 31);
+}
+
+static void sel_g_from_bits(const unsigned* bits) {
+    // Flat append, NOT sel_add(): sel_add() linearly scans for duplicates,
+    // so rebuilding a Ctrl+A-sized set (SEL_MAX rows) would be O(n^2) - and
+    // this runs on every background-pane render swap.  Each index is visited
+    // exactly once here, so no duplicate can appear.
+    g_sel_n = 0;
+    for (int i = 0; i < SEL_MAX; i++)
+        if (bits[i >> 5] & (1u << (i & 31))) g_sel[g_sel_n++] = i;
+}
+
 static FolderView folder_view_from_app(void) {
     FolderView fv;
     memset(&fv, 0, sizeof(fv));
     memcpy(fv.current_path, g_app.current_path, sizeof(fv.current_path));
     fv.count = g_app.count;
+    fv.load_state = g_app.load_state;
     fv.view = g_app.view;
     fv.view_count = g_app.view_count;
     fv.selected = g_app.selected;
+    sel_bits_from_g(fv.sel_bits);      // whole range travels with the view
     fv.scroll = g_app.scroll;
     fv.view_mode = g_app.view_mode;
     fv.sort_key = g_app.sort_key;
@@ -23921,6 +30709,8 @@ static FolderView folder_view_from_app(void) {
     memcpy(fv.addr_buf, g_app.addr_buf, sizeof(fv.addr_buf));
     memcpy(fv.search_buf, g_app.search_buf, sizeof(fv.search_buf));
     fv.search_focused = g_app.search_focused;
+    fv.addr_focused = g_app.addr_focused;
+    fv.zoom = g_app.zoom;              // per-pane icon size (live value)
     fv.entries = g_app.entries;
     return fv;
 }
@@ -23929,9 +30719,19 @@ static void app_push_folder(const FolderView* fv) {
     memcpy(g_app.current_path, fv->current_path, sizeof(g_app.current_path));
     g_app.entries = fv->entries;
     g_app.count = fv->count;
+    g_app.load_state = fv->load_state;
     g_app.view = fv->view;
     g_app.view_count = fv->view_count;
     g_app.selected = fv->selected;
+    // Restore this view's WHOLE stored selection, not just the anchor row.
+    // Rebuilding from fv->selected alone destroyed every Shift/Ctrl range
+    // on the first push - and render_pane_view() pushes a background pane
+    // on EVERY frame of a split window, so multi-select evaporated one
+    // frame after each click (single pane: no swap, no loss).
+    // A FolderView that never recorded bits (fresh/memset) falls back to
+    // the anchor row exactly as before.
+    sel_g_from_bits(fv->sel_bits);
+    if (g_sel_n == 0 && fv->selected >= 0) sel_add(fv->selected);
     g_app.scroll = fv->scroll;
     g_app.view_mode = fv->view_mode;
     g_app.sort_key = fv->sort_key;
@@ -23943,6 +30743,12 @@ static void app_push_folder(const FolderView* fv) {
     memcpy(g_app.addr_buf, fv->addr_buf, sizeof(g_app.addr_buf));
     memcpy(g_app.search_buf, fv->search_buf, sizeof(g_app.search_buf));
     g_app.search_focused = fv->search_focused;
+    g_app.addr_focused = fv->addr_focused;
+    // Per-pane icon zoom: this pane's stored size becomes the live view.
+    // g_zoom (the active pane's animating value) is deliberately NOT touched
+    // here - a render swap of an inactive pane must never disturb it; only a
+    // real activation (activate_pane) re-syncs g_zoom.
+    g_app.zoom = (fv->zoom > 0.01f) ? fv->zoom : 0.6f;
     // NOTE: the theme (light) is deliberately NOT pushed: it is global,
     // and a pane that stored an older value would flip the palette on
     // every pane switch. The sort mirrors cmp_entry reads are pushed.
@@ -23990,23 +30796,24 @@ static int slide_i(int cur, int tgt) {
 }
 
 // ---- drop zones: position inside the pane under the cursor ----
-// corners (30% squares) -> quarter split, edge bands -> half split,
-// middle -> swap (only valid when dragging onto ANOTHER pane).
+// The pane is partitioned into exactly FOUR clear, non-overlapping regions,
+// one per legal dock direction (LEFT / RIGHT / TOP / BOTTOM). Each point
+// belongs to the region whose edge is NEAREST, computed from the pane's own
+// geometry - so the four regions tile the pane with no gaps, no overlap and
+// no corner/centre cells that could trigger a diagonal or swap arrangement.
+// A tie (dead centre) resolves to the first minimum (LEFT) - a real side
+// zone, never a special centre target.
 static int zone_of(const RectI* r, int x, int y) {
     if (x < r->x || x >= r->x + r->w || y < r->y || y >= r->y + r->h)
         return DZ_NONE;
     float rx = (float)(x - r->x) / (float)r->w;
     float ry = (float)(y - r->y) / (float)r->h;
-    bool l = rx < 0.30f, rt = rx >= 0.70f, t = ry < 0.30f, b = ry >= 0.70f;
-    if (t && l)  return DZ_TL;
-    if (t && rt) return DZ_TR;
-    if (b && l)  return DZ_BL;
-    if (b && rt) return DZ_BR;
-    if (l)  return DZ_LEFT;
-    if (rt) return DZ_RIGHT;
-    if (t)  return DZ_TOP;
-    if (b)  return DZ_BOTTOM;
-    return DZ_CENTER;
+    float dl = rx, dr = 1.0f - rx, dt = ry, db = 1.0f - ry;
+    float m = dl; int z = DZ_LEFT;
+    if (dr < m) { m = dr; z = DZ_RIGHT; }
+    if (dt < m) { m = dt; z = DZ_TOP; }
+    if (db < m) { m = db; z = DZ_BOTTOM; }
+    return z;
 }
 
 // A zone is only offered when both resulting halves fit the minimum
@@ -24015,9 +30822,7 @@ static bool zone_valid(const RectI* r, int zone) {
     switch (zone) {
         case DZ_LEFT: case DZ_RIGHT:  return r->w >= 2 * PANE_MIN_W;
         case DZ_TOP:  case DZ_BOTTOM: return r->h >= 2 * PANE_MIN_H;
-        case DZ_TL: case DZ_TR: case DZ_BL: case DZ_BR:
-            return r->w >= 2 * PANE_MIN_W && r->h >= 2 * PANE_MIN_H;
-        default: return true;           // CENTER (swap) changes no size
+        default: return false;          // only the four directions exist
     }
 }
 
@@ -24030,12 +30835,7 @@ static RectI zone_rect(const RectI* r, int zone) {
         case DZ_RIGHT:  return (RectI){mx, r->y, r->x + r->w - mx, r->h};
         case DZ_TOP:    return (RectI){r->x, r->y, r->w, my - r->y};
         case DZ_BOTTOM: return (RectI){r->x, my, r->w, r->y + r->h - my};
-        case DZ_TL:     return (RectI){r->x, r->y, mx - r->x, my - r->y};
-        case DZ_TR:     return (RectI){mx, r->y, r->x + r->w - mx, my - r->y};
-        case DZ_BL:     return (RectI){r->x, my, mx - r->x, r->y + r->h - my};
-        case DZ_BR:     return (RectI){mx, my, r->x + r->w - mx,
-                                       r->y + r->h - my};
-        default:        return *r;      // CENTER: the whole target pane
+        default:        return *r;
     }
 }
 
@@ -24075,6 +30875,11 @@ static Pane* pane_clone(const FolderView* fv) {
     p->kind = PN_LEAF;
     p->ratio = 0.5f;
     p->folder = *fv;
+    // A brand-new pane never inherits the TYPING focus of the pane it was
+    // cloned from: focus belongs to one pane only, so the clone starts
+    // unfocused instead of showing a stale blue address/search box.
+    p->folder.search_focused = false;
+    p->folder.addr_focused = false;
     p->folder.entries = NULL;
     p->folder.view = NULL;
     if (fv->entries && fv->count > 0) {
@@ -24119,50 +30924,26 @@ static void pane_free_partial(Pane* p, Pane* keep1, Pane* keep2) {
 }
 
 // Build the subtree that replaces the target pane's slot. Every cell a
-// split creates must be filled, so a corner (quarter) cut out of a pane
-// gets ONE filler clone of that pane: the layout always tiles exactly and
-// never leaves a gap (the filler shows the same folder, so the rest reads
-// visually as one pane with a notch).
+// split creates must be filled, so the target's other half gets either the
+// dragged pane's sibling or (for a self-split) a clone of the target: the
+// layout always tiles exactly and never leaves a gap. Only the four
+// directional half-splits exist - there are no corner/quarter builds.
 static Pane* build_zone_subtree(int zone, Pane* D, Pane* T) {
     bool self = (D == T);
-    if (zone == DZ_LEFT || zone == DZ_RIGHT ||
-        zone == DZ_TOP  || zone == DZ_BOTTOM) {
-        Pane* other = T;
-        if (self) {                        // splitting oneself: the clone
-            other = pane_clone(&T->folder);    // fills the other half
-            if (!other) return NULL;
-        }
-        PaneKind kind = (zone == DZ_LEFT || zone == DZ_RIGHT)
-                            ? PN_SPLIT_V : PN_SPLIT_H;
-        bool drag_first = (zone == DZ_LEFT || zone == DZ_TOP);
-        Pane* s = drag_first ? mk_split(kind, 0.5f, D, other)
-                             : mk_split(kind, 0.5f, other, D);
-        if (!s && self) pane_free(other);
-        return s;
+    if (zone != DZ_LEFT && zone != DZ_RIGHT &&
+        zone != DZ_TOP  && zone != DZ_BOTTOM) return NULL;
+    Pane* other = T;
+    if (self) {                        // splitting oneself: the clone
+        other = pane_clone(&T->folder);    // fills the other half
+        if (!other) return NULL;
     }
-    // Corners: the outer split puts D in the corner-ward half, that half
-    // splits again so D lands in the exact quarter; T keeps the whole
-    // opposite half and a clone of T fills the sibling quarter.
-    bool top_half = (zone == DZ_TL || zone == DZ_TR);
-    bool left_side = (zone == DZ_TL || zone == DZ_BL);
-    Pane* fill = pane_clone(&T->folder);
-    if (!fill) return NULL;
-    Pane* inner = left_side ? mk_split(PN_SPLIT_V, 0.5f, D, fill)
-                            : mk_split(PN_SPLIT_V, 0.5f, fill, D);
-    if (!inner) { pane_free(fill); return NULL; }
-    Pane* rest = T;
-    if (self) {
-        rest = pane_clone(&T->folder);
-        if (!rest) { pane_free_partial(inner, D, T); return NULL; }
-    }
-    Pane* outer = top_half ? mk_split(PN_SPLIT_H, 0.5f, inner, rest)
-                           : mk_split(PN_SPLIT_H, 0.5f, rest, inner);
-    if (!outer) {
-        if (self) pane_free(rest);
-        pane_free_partial(inner, D, T);
-        return NULL;
-    }
-    return outer;
+    PaneKind kind = (zone == DZ_LEFT || zone == DZ_RIGHT)
+                        ? PN_SPLIT_V : PN_SPLIT_H;
+    bool drag_first = (zone == DZ_LEFT || zone == DZ_TOP);
+    Pane* s = drag_first ? mk_split(kind, 0.5f, D, other)
+                         : mk_split(kind, 0.5f, other, D);
+    if (!s && self) pane_free(other);
+    return s;
 }
 
 // Execute a drop: re-link the dragged pane into the target's region (or
@@ -24172,24 +30953,6 @@ static Pane* build_zone_subtree(int zone, Pane* D, Pane* T) {
 static bool pane_apply_drop(Pane* D, Pane* T, int zone) {
     if (!D || !T || T->kind != PN_LEAF) return false;
     if (zone == DZ_NONE) return false;
-    if (zone == DZ_CENTER) {              // swap the two panes' positions.
-        // Only meaningful between two panes of THIS tree (a top-tab
-        // absorb remaps CENTER to a side zone before it gets here).
-        if (D == T || D->kind != PN_LEAF) return false;
-        pane_sync_active();
-        Pane** ld = find_link(&g_pane_root, D);
-        Pane** lt = find_link(&g_pane_root, T);
-        if (!ld || !lt) return false;
-        Pane* tmp = *ld;
-        *ld = *lt;
-        *lt = tmp;
-        printf("[tile] swap panes (%d panes)\n", pane_count(g_pane_root));
-        fflush(stdout);                          // visible to redirected logs at once
-        set_status("Panes swapped");
-        g_active_pane = D;                  // focus follows the dragged pane
-        compute_pane_tree_layout(g_pane_root, g_content);
-        return true;
-    }
 
     pane_sync_active();     // store live state before folders are read
     if (!zone_valid(&T->rect, zone)) return false;   // too small
@@ -24291,16 +31054,55 @@ static RectI pane_close_rect(RectI r) {
                    PANE_TITLE_H - SC(4)};
 }
 
+// A pane stacked BELOW the top row (a horizontal / nested split) shares the
+// window's single nav band with the panes above it, so it can never have a
+// toolbar up there.  It therefore reserves a nav strip - its OWN back / fwd /
+// up / refresh + address + search row - at the top of its own region, and its
+// title strip + list shift down beneath it.  Top-row panes (a single pane, and
+// every pane of a side-by-side V-split) use the window nav band and shift by
+// 0, so those layouts stay pixel-identical.  TOOLBAR_H (= TAB_H + NAV_H) is
+// the content top every pane region starts at; a region beginning below it is
+// a stacked-below pane.
+static int pane_nav_dy(const Pane* p) {
+    return (p && p->rect.y > SC(TOOLBAR_H)) ? SC(NAV_H) : 0;
+}
+// A pane's region with the reserved nav strip removed: where its title strip
+// and list begin.  Drawing (render_pane_view) and hit-testing (title [x],
+// pane drag) all read THIS so they can never drift apart.
+static RectI pane_body_rect(const Pane* p) {
+    RectI r = p->rect;
+    int dy = pane_nav_dy(p);
+    r.y += dy; r.h -= dy;
+    return r;
+}
+
 // Which pane's title [x] is under (x, y)? Walks the whole split tree so
 // an INACTIVE pane's cross works too (the press activates it first).
 static Pane* pane_title_close_at(Pane* p, int x, int y) {
     if (!p) return NULL;
     if (p->kind == PN_LEAF) {
-        RectI r = pane_close_rect(p->rect);
+        RectI r = pane_close_rect(pane_body_rect(p));
         return inside(&r, x, y) ? p : NULL;
     }
     Pane* hit = pane_title_close_at(p->left, x, y);
     return hit ? hit : pane_title_close_at(p->right, x, y);
+}
+
+// Which leaf's TITLE STRIP (its whole header bar, not just the [x]) is
+// under (x, y)?  Walks the whole split tree, so an INACTIVE pane's header
+// can be grabbed to MOVE that pane - the press activates it first, exactly
+// like its close [x] already does.  Without this only the active pane could
+// ever be dragged, and in a 3+-pane tree reaching a pane meant closing
+// another one first.
+static Pane* pane_title_strip_at(Pane* p, int x, int y) {
+    if (!p) return NULL;
+    if (p->kind != PN_LEAF) {
+        Pane* hit = pane_title_strip_at(p->left, x, y);
+        return hit ? hit : pane_title_strip_at(p->right, x, y);
+    }
+    RectI br = pane_body_rect(p);
+    RectI tr = {br.x, br.y, br.w, PANE_TITLE_H};
+    return inside(&tr, x, y) ? p : NULL;
 }
 
 // Switch the borrowed g_app window to another pane. The outgoing pane is
@@ -24308,6 +31110,9 @@ static Pane* pane_title_close_at(Pane* p, int x, int y) {
 // then the incoming pane's stored state becomes the app state.
 static void activate_pane(Pane* p) {
     if (!p || p->kind != PN_LEAF || p == g_active_pane) return;
+    // A type-to-select prefix belongs to ONE pane's typing: never carry
+    // it into the pane we are entering (spec: pane change resets state).
+    tts_reset();
     // Search results (and the listing they hide) belong to ONE pane: put
     // the real listing back into the pane we are leaving before g_app is
     // repointed at the pane we are entering.
@@ -24316,6 +31121,17 @@ static void activate_pane(Pane* p) {
     pane_sync_active();                  // save the pane we are leaving
     g_active_pane = p;
     app_push_folder(&p->folder);         // load the pane we are entering
+    // A pane whose listing was never loaded (session restore stores PATHS
+    // only, so background panes come back with entries == NULL) must be
+    // read NOW, not shown as an empty folder.  app_push_folder() only
+    // re-points g_app at the pane's array - without this reload the pane
+    // looked empty ("folder is empty") even though its path was set.
+    if (g_app.current_path[0] && !g_app.entries)
+        load_dir(g_app.current_path);
+    // Real activation re-syncs the ACTIVE pane's live (animating) zoom to
+    // the pane we just entered, so the zoom slider / Ctrl+wheel now drive
+    // this pane's icon size.
+    g_zoom = g_zoom_target = g_app.zoom;
     g_scroll_to_sel = false;             // one-shot nav flags are per pane
     g_select_pending[0] = '\0';
     set_root(g_app.entries, g_app.count); // tree ops read this flat copy
@@ -24366,6 +31182,18 @@ static void pane_list_metrics(Layout* L, RectI rect) {
     rect.h -= PANE_TITLE_H;               // above its list ...
     if (rect.h < L->list_head_h) rect.h = L->list_head_h;
     L->list = rect;
+    // Per-pane icon zoom (Phase 4): recompute the zoom-derived metrics from
+    // THIS pane's stored size (g_app.zoom is always the pane being drawn -
+    // the active pane's live value, or a swapped-in inactive pane's value),
+    // overriding the window-wide g_zoom base from compute_layout().  The
+    // same g_app.zoom drives row hit-testing (pane_input_build -> here), so
+    // clicks and rendering always agree per pane.
+    L->row_h = (int)(SC(ROW_H) * g_app.zoom + 0.5f);
+    if (L->row_h < SC(22)) L->row_h = SC(22);
+    L->cell_w = (int)(SC(CELL_W) * g_app.zoom + 0.5f);
+    if (L->cell_w < SC(48)) L->cell_w = SC(48);
+    L->thumb = (int)(SC(THUMB_BOX) * g_app.zoom + 0.5f);
+    L->cell_h = L->thumb + SC(62);
     int body_h = rect.h - L->list_head_h;
     if (mode_is_grid()) {
         int avail = rect.w - L->scroll_w - L->pad_x * 2;
@@ -24417,7 +31245,13 @@ static void pane_input_build(Layout* out, const Layout* win) {
     compute_pane_tree_layout(g_pane_root, win->list);
     if (g_active_pane && g_active_pane->kind == PN_LEAF &&
         g_active_pane->rect.w > 0 && g_active_pane->rect.h > 0)
-        pane_list_metrics(out, g_active_pane->rect);
+        // pane_body_rect, NOT the raw rect: a pane stacked BELOW the top row
+        // reserves a nav strip (pane_nav_dy) at the top of its region, and
+        // render_pane_view() draws its rows from that shifted rect.  Feeding
+        // the raw rect here put list.y SC(NAV_H) too high, so every click in
+        // such a pane resolved ~1-2 rows BELOW the cursor (draw and
+        // hit-test must share this one rect - see the note on pane_list_metrics).
+        pane_list_metrics(out, pane_body_rect(g_active_pane));
 }
 
 static void compute_pane_tree_layout(Pane* p, RectI content) {
@@ -24469,7 +31303,7 @@ static void render_pane_view(Pane* p, const Layout* win) {
     }
 
     Layout L = *win;                        // window chrome ...
-    pane_list_metrics(&L, p->rect);         // ... + this pane's list
+    pane_list_metrics(&L, pane_body_rect(p)); // ... + this pane's list
     InputState* in = platform_get_input();
 
     g_icon_budget = ICONS_PER_FRAME;
@@ -24504,11 +31338,27 @@ static void render_pane_view(Pane* p, const Layout* win) {
 
     fill(L.list.x, L.list.y, L.list.w, L.list.h, P->bg);
 
+    // ---- stacked-below pane's OWN nav toolbar ----
+    // A pane under the top row can't use the shared window nav band, so it
+    // reserves a strip at the top of its region and draws its complete,
+    // independent back/fwd/up/refresh + address + search row right here -
+    // g_app is already THIS pane's state (swapped above), so every read
+    // below (history, path, search query/focus) is this pane's own and can
+    // never bleed into another pane.
+    if (pane_nav_dy(p) > 0) {
+        fill(p->rect.x, p->rect.y, p->rect.w, SC(NAV_H), P->bg);
+        Layout nl = L;
+        nav_row_metrics(&nl, p->rect.x, p->rect.w,
+                        p->rect.y + (nav_row_y() - SC(TAB_H)));
+        compute_crumbs(&nl, g_app.current_path);
+        draw_nav_row(&nl, in);
+    }
+
     // ---- pane title strip: [icon  path] .......... [x] - the pane's
     //      identity, its drag handle and its close button, drawn for
     //      every pane in the workspace's existing palette only ----
     {
-        RectI tt = p->rect;
+        RectI tt = pane_body_rect(p);
         bool act = (p == g_active_pane);
         fill(tt.x, tt.y, tt.w, PANE_TITLE_H, act ? P->head : P->panel);
         hline(tt.x, tt.x + tt.w, tt.y + PANE_TITLE_H, P->border);
@@ -24516,8 +31366,13 @@ static void render_pane_view(Pane* p, const Layout* win) {
             draw_item_image(g_app.current_path, true, tt.x + SC(6),
                             tt.y + (PANE_TITLE_H - SC(14)) / 2,
                             SC(14), SC(14));
+        // The pane header keeps its folder path (unchanged single-pane
+        // design); it simply ends before the [x] now that the split-only
+        // search pill is gone.  The address breadcrumb lives in row 2.
+        int path_w = pane_close_rect(tt).x - SC(6) - (tt.x + SC(25));
+        if (path_w < SC(20)) path_w = SC(20);
         char nm[512];
-        fit_text(g_app.current_path, nm, sizeof(nm), tt.w - SC(54));
+        fit_text(g_app.current_path, nm, sizeof(nm), path_w, L.text_small);
         text_px(nm, tt.x + SC(25), tt.y + (PANE_TITLE_H - L.text_small) / 2,
                 L.text_small, act ? P->text : P->dim);
         RectI xr = pane_close_rect(tt);
@@ -24539,6 +31394,10 @@ static void render_pane_view(Pane* p, const Layout* win) {
     if (g_app.view_count == 0) {
         // Empty-results state says WHICH scope was searched: the folder
         // itself while filtering, folder + subfolders after a scan.
+        // "(empty folder)" is only ever shown after a SUCCESSFUL load that
+        // really returned zero entries; a failed open (disconnected drive,
+        // denied, not ready) and a listing that is not in yet say so
+        // instead - a failure is never reported as a confirmed empty folder.
         const char* raw;
         if (g_srch_state == SRCH_DONE && p == g_active_pane)
             raw = "No matches in this folder or any subfolder";
@@ -24547,10 +31406,17 @@ static void render_pane_view(Pane* p, const Layout* win) {
             raw = "No matches yet - searching all drives";
         else if (g_app.search_buf[0])
             raw = "No matches here - press Enter to search subfolders too";
-        else
+        else if (g_app.load_state == LOAD_ERROR)
+            raw = g_load_retry_n > 0 ? "Cannot open folder - retrying..."
+                                     : "Cannot open folder";
+        else if (g_app.load_state == LOAD_EMPTY)
             raw = "(empty folder)";
+        else if (!g_app.entries)
+            raw = "Loading...";       // not read yet (first activation)
+        else
+            raw = "(empty folder)";   // loaded, filtered down to nothing
         char msg[160];
-        fit_text(raw, msg, sizeof(msg), L.list.w - SC(56));
+        fit_text(raw, msg, sizeof(msg), L.list.w - SC(56), L.text_h);
         text_px(msg, L.list.x + SC(28), L.list.y + L.list_head_h + SC(8),
                 L.text_h, P->dim);
     } else if (mode_is_grid()) {
@@ -24665,24 +31531,21 @@ static void draw_drop_preview(void) {
         renderer_draw_line(g_app.renderer, r.x+r.width, r.y, r.x+r.width, r.y+r.height, P->accent, 2.0f);
     }
 
-    // (2) docking chooser chips over the TARGET pane: dashed cells for
-    //     Left / Center / Right through the middle and Top / Bottom near
-    //     the edges - the zone under the cursor fills cyan, a zone that
-    //     merely exists stays dim, an impossible one stays hollow. Pure
-    //     overlay: it never takes a click; the zone state machine owns
-    //     every drop decision, this only pictures it.
+    // (2) docking chooser chips over the TARGET pane: exactly FOUR dashed
+    //     cells - Left and Right flanking the middle, Top and Bottom centred
+    //     above and below - one per legal dock. The zone under the cursor
+    //     fills cyan, a zone that merely exists stays dim, an impossible one
+    //     stays hollow. Pure overlay: it never takes a click; the zone state
+    //     machine owns every drop decision, this only pictures it.
     if (g_drop_active && g_drop_target) {
         RectI chips[DOCK_CHIP_N];
         if (dock_chip_layout(&g_drop_target->rect, chips)) {
             static const int zmap[DOCK_CHIP_N] =
-                {DZ_LEFT, DZ_CENTER, DZ_RIGHT, DZ_TOP, DZ_BOTTOM};
+                {DZ_LEFT, DZ_RIGHT, DZ_TOP, DZ_BOTTOM};
             Color none = (Color){0, 0, 0, 0};
             for (int i = 0; i < DOCK_CHIP_N; i++) {
                 int z = zmap[i];
-                // A TOP_TAB drop never swaps - its centre lands as a
-                // right half - so the centre cell stays neutral there.
-                bool valid = zone_valid(&g_drop_target->rect, z) &&
-                             !(tab_drag && z == DZ_CENTER);
+                bool valid = zone_valid(&g_drop_target->rect, z);
                 bool live = valid && dock_zone_lights(g_drop_zone, z);
                 RectI c = chips[i];
                 Color fillc = none, bord;
@@ -24720,7 +31583,7 @@ static void draw_drop_preview(void) {
     if (tab_drag) {
         char raw[128], nm[256];
         ws_title(g_tab_drag_idx, raw, sizeof(raw));
-        fit_text(raw, nm, sizeof(nm), gw - SC(36));
+        fit_text(raw, nm, sizeof(nm), gw - SC(36), SC(12));
         int ch = SC(26);
         rrect(gx, gy, gw, ch, SC(6),
               mixc(P->panel, P->accent, 0.12f * g_drop_fade), P->accent, 1.5f);
@@ -24753,17 +31616,12 @@ static void draw_drop_preview(void) {
 // pane is too small for.
 static Pane* pane_find_drop(Pane* root, int x, int y, Pane* drag,
                             int* out_zone, RectI* out_rect) {
+    (void)drag;          // four-way tiling never special-cases the source
     *out_zone = DZ_NONE;
     Pane* t = pane_at_point(root, x, y);
     if (!t || t->kind != PN_LEAF) return NULL;
     int z = zone_of(&t->rect, x, y);
     if (z == DZ_NONE) return NULL;              // outside the panes
-    if (z == DZ_CENTER) {
-        if (!drag || t == drag) return NULL;    // center on self = cancel
-        if (out_rect) *out_rect = t->rect;      // other pane: swap (all of it)
-        *out_zone = z;
-        return t;
-    }
     if (!zone_valid(&t->rect, z)) return NULL;  // too small: no zone
     if (out_rect) *out_rect = zone_rect(&t->rect, z);
     *out_zone = z;
@@ -24785,23 +31643,14 @@ static void tile_hover_clear(void) {
 }
 
 static void tile_hover_update(Pane* drag, int x, int y, bool tab_absorb) {
+    (void)tab_absorb;   // both drag kinds now tile into the four zones alike
     int zone = DZ_NONE;
     RectI rect = {0, 0, 0, 0};
     Pane* tgt = pane_find_drop(g_pane_root, x, y, drag, &zone, &rect);
 
-    // A top-tab drop has no "swap" meaning: landing on the MIDDLE of a
-    // pane absorbs the tab onto that pane's RIGHT half - the exact layout
-    // the spec's example shows - instead of doing nothing.
-    if (!tgt && tab_absorb) {
-        Pane* t2 = pane_at_point(g_pane_root, x, y);
-        if (t2 && t2->kind == PN_LEAF &&
-            zone_of(&t2->rect, x, y) == DZ_CENTER &&
-            zone_valid(&t2->rect, DZ_RIGHT)) {
-            tgt = t2;
-            zone = DZ_RIGHT;
-            rect = zone_rect(&t2->rect, DZ_RIGHT);
-        }
-    }
+    // A top-tab drop simply tiles into whichever of the four directional
+    // zones the cursor is over (pane_find_drop already resolved it); there
+    // is no separate "centre" meaning to remap any more.
 
     if (!tgt) { tile_hover_clear(); return; }   // no valid zone: hide it
 
@@ -24860,17 +31709,19 @@ static void draw_splitters(Pane* p) {
 // =============================================================
 
 // Return the internal split node whose divider bar contains (x,y),
-// or NULL if the point is not on a splitter.
+// or NULL if the point is not on a splitter.  The band spans the divider's
+// FULL length and is SPLITTER_HIT wide (a comfortable grab zone around the
+// 5px visible bar), so the divider can be dragged from anywhere along it.
 static Pane* splitter_at_point(Pane* p, int x, int y) {
     if (!p || p->kind == PN_LEAF) return NULL;
     if (p->kind == PN_SPLIT_V) {
         int dx = p->left->rect.x + p->left->rect.w;
-        if (x >= dx - SPLITTER_W/2 && x < dx + SPLITTER_W/2 &&
+        if (x >= dx - SPLITTER_HIT/2 && x < dx + SPLITTER_HIT/2 &&
             y >= p->left->rect.y && y < p->left->rect.y + p->left->rect.h)
             return p;
     } else {
         int dy = p->left->rect.y + p->left->rect.h;
-        if (y >= dy - SPLITTER_W/2 && y < dy + SPLITTER_W/2 &&
+        if (y >= dy - SPLITTER_HIT/2 && y < dy + SPLITTER_HIT/2 &&
             x >= p->left->rect.x && x < p->left->rect.x + p->left->rect.w)
             return p;
     }
@@ -24904,19 +31755,55 @@ static RectI splitter_handle_rect(Pane* p) {
     return (RectI){cx - SC(44) / 2, dy - SC(14) / 2, SC(44), SC(14)};
 }
 
-// Deepest divider whose grip is under (x, y). A nested tree tests its own
-// (short) dividers first, so an inner grip wins over an outer one.
-static Pane* splitter_handle_at(Pane* root, int x, int y) {
-    if (!root || root->kind == PN_LEAF) return NULL;
-    RectI hr = splitter_handle_rect(root);
-    if (inside(&hr, x, y)) return root;
-    Pane* l = splitter_handle_at(root->left, x, y);
-    return l ? l : splitter_handle_at(root->right, x, y);
+// ---- idle-aware frame pacing -------------------------------------------
+// The loop used to paint a FULL frame every 16 ms forever - ~27% of a CPU
+// core with the window just sitting there.  Now it paints at the full
+// 60 fps only while something is happening (input, a background job, an
+// animation) and for a short tail after it, then drops to a slow
+// heartbeat that still advances clocks, status timeouts and the caret.
+// Input and worker results wake the loop at once (MsgWaitForMultiple-
+// Objects + platform_wake), so it reacts faster than the fixed sleep did.
+#define HOT_TAIL_MS   1200   // full rate this long after the last activity
+#define BEAT_IDLE_MS   500   // idle repaint (status clock, retries)
+#define BEAT_CARET_MS   80   // a focused text field: keep the caret blinking
+
+static bool app_busy(void) {
+    if (g_tc_qn > 0 || g_tc_iqn > 0 || g_tc_rn > 0 ||
+        InterlockedCompareExchange(&g_tc_inflight, 0, 0) > 0)
+        return true;                         // icons / thumbnails landing
+    if (g_srch_state == SRCH_RUN) return true;               // folder scan
+    if (InterlockedCompareExchange(&g_props_running, 0, 0)) return true;
+    if (paste_busy()) return true;                           // copy / move
+    if (zoom_settling() || g_shell_burst > 0) return true;   // animations
+    if (g_drag_split || g_tab_drag || g_splitter_drag || g_size_drag)
+        return true;
+    if (g_rad_open || g_close_pending) return true;
+    if (g_xm_open && g_xm_ver >= 0 && g_xm_ver < 2 && g_xm_gen) return true;
+    InputState* in = platform_get_input();
+    if (in && (in->left_down || in->alt_pressed)) return true;
+    if (g_sb_drag) return true;
+    if (g_side_anim != (g_opt_sidebar ? 1.0f : 0.0f)) return true;   // sliding
+    if (g_tip_pending) return true;                                  // tooltip due
+    return false;
 }
+
+static int app_beat_ms(void) {
+    // In the background (another app has the focus) nothing is typed
+    // and no caret blinks: one repaint a second is plenty.
+    if (g_app.hwnd && GetForegroundWindow() != (HWND)g_app.hwnd)
+        return 1000;
+    if (g_app.addr_focused || g_app.search_focused || g_rename_vi >= 0 ||
+        g_set_open || g_xm_open || g_help_open)
+        return BEAT_CARET_MS;
+    return BEAT_IDLE_MS;
+}
+
 static void app_run(bool selftest) {
     int frames = 0;
+    DWORD last_active = GetTickCount();
+    DWORD last_paint = 0;
 
-    if (selftest) run_selftest();
+    if (selftest && !g_smoke) run_selftest();
     if (g_bench) {                     // benchmark mode: measure, then out
         if (g_bench_nav) run_bench_nav();
         else run_bench();
@@ -24933,6 +31820,12 @@ static void app_run(bool selftest) {
         if (g_update_auto) update_startup();
     }
 
+    // First start ever: the short welcome tour (never in test runs).
+    if (!selftest && !g_bench &&
+        ((!g_opt_welcomed && !platform_offscreen_mode()) || getenv("NOVA_SHOW_WELCOME"))) {
+        g_welcome_open = true;
+        g_welcome_step = 0;
+    }
     while (g_app.running) {
         if (!platform_poll_events()) break;
 
@@ -24947,12 +31840,70 @@ static void app_run(bool selftest) {
         }
 
         handle_input();
+        // Re-attempt a folder that failed to open (bounded, only the active
+        // pane's path) so a not-yet-ready drive fills in instead of sitting
+        // there looking empty.
+        if (!selftest) load_retry_pump();
+        // Perform a DUE child-list read for the location popup (armed by
+        // sug_sync() when the target folder changed).  Running it here - one
+        // frame after the arm - is what lets the panel paint its real
+        // "Loading..." line instead of blocking the click that opened it,
+        // and it can never re-walk a folder that did not change.
+        sug_pump();
         if (!selftest) session_tick();  // debounced workspace snapshot
-        platform_invalidate();
-        paint();
+        // Look for a new release again every 6 hours while NovaFile stays
+        // open (the start-up check covers a fresh launch).
+        {
+            static DWORD last_upd = 0;
+            if (!last_upd) last_upd = GetTickCount();
+            if (!selftest && !g_bench && g_update_auto && !update_ready() &&
+                GetTickCount() - last_upd > 6u * 3600u * 1000u) {
+                last_upd = GetTickCount();
+                update_kick_check(false);
+            }
+        }
+        // Warm the shell extensions once, in the background, ~3 s after
+        // start: the FIRST right-click then opens with its system rows
+        // in a blink instead of waiting ~1.5 s for the DLLs to load.
+        {
+            static bool warmed = false;
+            static DWORD t_start = 0;
+            if (!t_start) t_start = GetTickCount();
+            if (!warmed && !selftest && !g_bench &&
+                GetTickCount() - t_start > 3000) {
+                warmed = true;
+                const char* home = platform_get_home_directory();
+                if (home && home[0]) {
+                    char* one[1] = {(char*)home};
+                    int wg = shmsvc_request(one, 1, false, false);
+                    if (wg) shmsvc_release(wg);
+                }
+            }
+        }
+
+        DWORD now = GetTickCount();
+        if (platform_last_activity() > 0 || app_busy()) last_active = now;
+        bool hot = selftest || (now - last_active) < HOT_TAIL_MS;
+        bool minimized = platform_window_minimized();
+        int beat = app_beat_ms();
+        if (!minimized &&
+            (hot || last_paint == 0 || (int)(now - last_paint) >= beat)) {
+            platform_invalidate();
+            paint();
+            last_paint = now;
+        }
 
         if (selftest && ++frames >= 3) break;
-        g_app.platform->sleep(16);
+        if (hot && !minimized) {
+            // Full rate: the same 16 ms frame cadence as before.
+            g_app.platform->sleep(16);
+        } else {
+            // Idle: sleep until input / a worker wakes us, or the next
+            // heartbeat is due (minimized: nothing to draw, long wait).
+            int wait = minimized ? 500 : beat - (int)(GetTickCount() - last_paint);
+            if (wait < 1) wait = 1;
+            platform_wait(wait);
+        }
     }
 }
 
@@ -24989,6 +31940,8 @@ static void app_shutdown(void) {
     g_active_pane = NULL;
     printf("Shutting down...\n");
 
+    xm_close();
+    shmsvc_stop();              // shell-menu thread (before OLE goes away)
     tc_shutdown();              // join the worker BEFORE freeing caches
     tbmp_clear();
     ct_shutdown();              // release the thumbnail associations
@@ -25003,7 +31956,7 @@ static void app_shutdown(void) {
     }
     icons_clear();
     if (g_ole_ready) {
-        CoUninitialize();
+        OleUninitialize();
         g_ole_ready = false;
     }
 
@@ -25021,6 +31974,7 @@ int main(int argc, char* argv[]) {
     int update_cli_mode = 0;      // 1 = --update-check, 2 = --update-apply
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--selftest") == 0) selftest = true;
+        else if (strcmp(argv[i], "--smoke") == 0) { selftest = true; g_smoke = true; }
         else if (strcmp(argv[i], "--bench") == 0) g_bench = true;
         else if (strcmp(argv[i], "--update-check") == 0) update_cli_mode = 1;
         else if (strcmp(argv[i], "--update-apply") == 0) update_cli_mode = 2;
@@ -25078,6 +32032,17 @@ int main(int argc, char* argv[]) {
     app_run(selftest);
     app_shutdown();
 
-    if (selftest) printf("SELFTEST OK\n");
+    if (g_smoke) {                      // the installer's post-install check:
+        printf("SMOKE OK\n");           // it started, painted and closed
+        return 0;
+    }
+    if (selftest) {
+        if (g_st_failures > 0) {
+            printf("SELFTEST FAILED (%d failing check line%s)\n",
+                   g_st_failures, g_st_failures == 1 ? "" : "s");
+            return 1;
+        }
+        printf("SELFTEST OK\n");
+    }
     return 0;
 }

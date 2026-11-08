@@ -6,6 +6,9 @@
 // file/version source used by Explorer, the installer and update checks.
 #include "include/version.h"
 1 ICON "NovaFile.ico"
+// Application manifest (RT_MANIFEST = 24): UTF-8 code page so file names
+// in every script work, plus Common-Controls 6 for the system dialogs.
+1 24 "NovaFile.manifest"
 1 VERSIONINFO
  FILEVERSION NOVA_VERSION_MAJOR,NOVA_VERSION_MINOR,NOVA_VERSION_PATCH,0
  PRODUCTVERSION NOVA_VERSION_MAJOR,NOVA_VERSION_MINOR,NOVA_VERSION_PATCH,0

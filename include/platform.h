@@ -28,6 +28,7 @@ typedef struct {
     bool right_click;     // true ONLY on the frame the button went down
     bool middle_click;    // true ONLY on the frame the button went down
     bool double_click;    // true ONLY on the frame of a double click
+    int xbutton;          // mouse side button THIS frame: 0 none, 1 Back, 2 Forward
     bool ctrl_pressed;
     bool shift_pressed;
     bool alt_pressed;     // Alt held: arms the corner Back/Forward gesture
@@ -38,6 +39,15 @@ typedef struct {
     bool v_held;
     int wheel;            // scroll notches this frame (+up / -down), 0 = none
     unsigned int char_pressed; // printable character typed THIS frame (0 = none)
+    // The full CHARACTER stream of this frame, oldest first.  A single
+    // latch loses characters whenever the pump resumes after a stall
+    // (blocking icon loads, a slow paint): every queued WM_CHAR then
+    // arrives inside ONE frame and only the last survived - typing
+    // "work" through such a stall fed nothing but 'k'.  The queue keeps
+    // them in order; char_pressed stays the FIRST one so every single-
+    // character consumer behaves exactly as before.
+    unsigned int charq[32];
+    int charq_n;
     char key_text[16];
     int key_code;         // virtual key pressed THIS frame, 0 = none
     // Auto-REPEATED virtual key this frame, 0 = none.  The OS keyboard
@@ -123,6 +133,16 @@ InputState* platform_get_input(void);
 void* platform_window_handle(void);               // HWND on Windows
 void platform_set_paint_callback(void (*cb)(void));
 void platform_invalidate(void);                   // request a repaint
+
+// ---- idle-aware frame pacing + drop target ----
+int  platform_last_activity(void);   // messages (non-paint) the last poll handled
+void platform_wait(int ms);          // wait for a message or ms, whichever first
+void platform_wake(void);            // any thread: wake the UI loop now
+bool platform_window_minimized(void);
+// Files dropped onto the window since the last call (Explorer drag-in).
+// Returns the count; *out = malloc'd array of malloc'd paths (caller frees).
+// (*x, *y) = the client point of the drop (may be NULL).
+int  platform_take_dropped(char*** out, int* x, int* y);
 
 // ---- Custom title bar (the client area IS the whole window) -------------
 // There is no OS caption: WM_NCHITTEST asks the app what a client point

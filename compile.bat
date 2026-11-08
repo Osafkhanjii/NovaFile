@@ -42,15 +42,17 @@ echo.
     src\core\memory.c ^
     src\core\indexer.c ^
     src\platform\window_win.c ^
+    src\platform\shell_ole.c ^
     src\renderer\renderer_gl.c ^
     src\ui\ui_framework.c ^
     src\app\update.c ^
     src\app\main.c ^
     -mwindows ^
     -lole32 -loleaut32 -lshell32 -luser32 -lkernel32 -lgdi32 -lmsimg32 ^
+    -ladvapi32 ^
     -lcomdlg32 ^
-    -lwinhttp -lbcrypt -lcrypt32 -lwintrust ^
-    -Wl,-Map=build\NovaFile.map ^
+    -lwinhttp -lbcrypt -lcrypt32 -lwintrust -luuid ^
+    -s -Wl,-Map=build\NovaFile.map ^
     -o build\NovaFile.exe
 
 if errorlevel 1 goto :failed
@@ -71,7 +73,6 @@ echo   Hamburger button         Menu: tab, bookmark, refresh, theme, exit
 echo   Breadcrumb click         Jump to that folder segment
 echo   Wheel                    Scrolls the list 2x (sidebar too)
 echo   Ctrl+H                   Show / hide hidden files
-echo   Ctrl+T                   Dark / Light theme
 echo   Ctrl+B                   Bookmark current folder
 echo   Tab                      Address bar (breadcrumb)
 echo   F2                       Rename the selected item inline

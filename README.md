@@ -147,7 +147,45 @@ is in this repository. Output: `build\NovaFile.exe` (~955 KB).
   Windows shell chain: folder -> drive -> **This PC** -> **Desktop**,
   where it stops (button greys out); **back** and **up** re-select the
   folder you came out of instead of highlighting the first row
-- Read-only: it can open things, it can never delete or change them
+- **Explorer file operations** - Delete sends to the **Recycle Bin**
+  (Shift+Delete = permanent, both confirmed; Enter confirms); paste never
+  overwrites: a copy in the same folder becomes `name - Copy`, a taken
+  name becomes `name (2)`, and a folder can never be pasted into itself.
+  Copies run on a **background thread** (progress in the status bar, Esc
+  cancels), and **Ctrl+Z** undoes the last rename, new item or paste
+- **Drag and drop with Windows** - drag files **out** to Explorer, the
+  desktop or any app, and drop files **in** from them (same drive moves,
+  another drive copies; Ctrl = copy, Shift = move); a drop lands in the
+  pane under the pointer
+- **System context menu (File Pilot style)** - right-click a file, a
+  selection, a drive or empty space: one dark, searchable menu with
+  EVERY command Windows offers for it (WinRAR, 7-Zip, Open with, Send to,
+  Give access to, Scan with Defender, New > every file type, ...) with
+  their icons and submenus, plus NovaFile's own rows (Open in New Tab /
+  Pane, View / Sort / Group, custom thumbnail, bookmark, Open in
+  Terminal).  It opens instantly - the system rows are built on a
+  background thread - and typing filters every command
+  ("Select a system command...").  Cut / Copy / Paste / Delete / Rename /
+  New Folder from that menu run through NovaFile (Recycle Bin, Undo, safe
+  paste).  The Menu key or Shift+F10 opens it from the keyboard
+- **Easy to learn** - the first start shows a short 5-step welcome tour;
+  **F1** opens every shortcut and mouse gesture on one searchable page
+  (always the user's current keys); hovering a top-bar button shows its
+  name and shortcut; a command picked from the right-click menu tells
+  you its key once
+- **Hide the sidebar** - the panel button next to the gear (or Ctrl+S)
+  slides the sidebar shut so the files get the whole width; remembered
+- **Inline rename** - clicking anywhere outside the field saves the new
+  name (Esc cancels), a click inside places the caret
+- **Auto-refresh** - the open folder is watched; files another program
+  creates, renames or deletes appear on their own (selection and scroll
+  are kept)
+- **Every language** - file names in Urdu, Arabic, Chinese, emoji ... list,
+  open and can be typed (UTF-8 manifest + a Unicode window)
+- **Light on the machine** - the window paints at full rate only while
+  something happens and otherwise sleeps on the message queue: idle CPU
+  dropped from ~30% of a core to ~1-2%; the back buffer is reused instead
+  of re-allocated every frame
 
 ## Controls
 
@@ -185,6 +223,18 @@ is in this repository. Output: `build\NovaFile.exe` (~955 KB).
 | C                           | Quick Access wheel (radial menu of starred folders) |
 | Ctrl+,                      | Open Settings (gear panel)      |
 | Ctrl+Q or Esc              | Exit (Esc first leaves a field or closes a menu/popup) |
+| Alt+Left / Alt+Right       | Back / Forward (also the mouse side buttons) |
+| Alt+Up                     | Parent folder                   |
+| Alt+Enter                  | Properties                      |
+| Alt+D                      | Address bar                     |
+| Shift+Delete               | Delete permanently (skips the Recycle Bin) |
+| Ctrl+Z                     | Undo the last rename / new item / paste |
+| F11                        | Maximize / restore              |
+| Menu key / Shift+F10       | Context menu of the selection   |
+| F1                         | Keyboard shortcuts guide (searchable) |
+| Ctrl+S                     | Hide / show the sidebar (also the panel button top left) |
+| Type in an open menu       | Search every command            |
+| Drag a row out of the window | Copy / move it into Explorer or another app |
 | Mouse wheel                | Scroll the list (2 / 6 rows per notch) |
 | Wheel over the sidebar     | Scroll the sidebar              |
 | Click a breadcrumb segment | Jump to that folder             |
@@ -255,7 +305,8 @@ Nova File/
 │   │   ├── memory.c      # allocator, UTF-8, dynamic array, hash map
 │   │   └── indexer.c     # fuzzy search, size formatting, extensions
 │   ├── platform/
-│   │   └── window_win.c  # Win32 window, events, read-only file system
+│   │   ├── window_win.c  # Win32 window, events, file system
+│   │   └── shell_ole.c   # native shell menu + OLE drag-out
 │   ├── renderer/
 │   │   └── renderer_gl.c # GDI renderer (double buffered)
 │   ├── ui/
@@ -304,9 +355,9 @@ four-tap bilinear guess).
 
 ## Safety notes
 
-- **Read only**: `delete`, `copy`, `create directory` and `write` are
-  deliberately left `NULL` in the platform layer - the app cannot modify
-  your files even if it wanted to.
+- **No silent damage**: every delete is confirmed and goes to the
+  Recycle Bin unless you hold Shift; paste never overwrites an existing
+  file; Ctrl+Z takes the last rename / new item / paste back.
 - Files are handed to the OS default handler (`ShellExecuteA`); Nova File
   never parses or executes them itself.
 - All strings bounded (`snprintf` / `strncpy`), allocations checked,

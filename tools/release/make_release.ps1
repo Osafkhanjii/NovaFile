@@ -86,11 +86,16 @@ if ($fvi.FileVersion -ne $Ver) {
 if (-not $SkipTests) {
     Write-Host '[2/9] selftest...'
     $env:NOVA_OFFSCREEN = '1'
+    # Shell extensions (cloud clients) may log to stderr while the system
+    # menu checks run: that is not a failure - only the exit code and the
+    # FAIL lines are.  'Stop' would abort on the first stderr line.
+    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     $st = & $Exe --selftest 2>&1 | Out-String
     $rc = $LASTEXITCODE
+    $ErrorActionPreference = $eap
     Remove-Item Env:NOVA_OFFSCREEN -ErrorAction SilentlyContinue
     if ($rc -ne 0) { Write-Host $st; Fail "selftest exit=$rc" }
-    if ($st -match 'FAIL') { Write-Host $st; Fail 'selftest reported FAIL' }
+    if ($st -match '\[selftest\] FAIL') { Write-Host $st; Fail 'selftest reported FAIL' }
     if ($st -notmatch 'updates:\s+\d+/\d+\s+check\(s\)\s+ok') {
         Write-Host $st; Fail 'selftest updates section missing'
     }
@@ -162,6 +167,11 @@ if ($BaseUrl -eq '') {
 } else {
     $Url = "$BaseUrl$SetupName"
     $NotesUrl = "$BaseUrl$NotesName"
+    # GitHub Releases cannot host "notes/x.html" (no folders in asset
+    # names): the release page itself is the notes page.
+    if ($BaseUrl -match '^(https://github\.com/[^/]+/[^/]+)/releases/download/([^/]+)/$') {
+        $NotesUrl = "$($Matches[1])/releases/tag/$($Matches[2])"
+    }
 }
 $Manifest = @"
 {

@@ -832,8 +832,11 @@ static void up_work(void) {
     // A newer version that no longer supports this build must NOT be
     // auto-installed (its installer could not upgrade this baseline).
     if (minv[0] && nova_ver_cmp(NOVA_VERSION, minv) == -1) {
-        InterlockedExchange(&g_up_state, UPS_READY);
-        // READY with no local package = "manual action required"
+        // READY with no local package = "manual action required".
+        // ORDER MATTERS: the stale package path is cleared BEFORE the state
+        // flips to READY - update_ready() short-circuits on READY and then
+        // reads g_up_pkg, so the old order could briefly report readiness
+        // with the PREVIOUS build's file and apply the wrong installer.
         char s[256];
         snprintf(s, sizeof s,
                  "Update v%s needs NovaFile v%s or newer - download it "
@@ -843,6 +846,7 @@ static void up_work(void) {
         g_up_pkg[0] = '\0';
         LeaveCriticalSection(&g_up_cs);
         up_set_status(s);
+        InterlockedExchange(&g_up_state, UPS_READY);
         if (g_up_echo) printf("nova-update: %s\n", s);
         return;
     }
@@ -858,7 +862,13 @@ static void up_work(void) {
         }
         char dir[MAX_PATH];
         snprintf(dir, sizeof dir, "%s\\NovaFile\\%s", appdir, UP_DIR_NAME);
-        CreateDirectoryA(dir, NULL);
+        // An existing directory is fine; anything else would only surface
+        // later as the misleading "cannot write package file".
+        if (!CreateDirectoryA(dir, NULL) &&
+            GetLastError() != ERROR_ALREADY_EXISTS) {
+            up_fail("cannot create the updates folder; update unavailable.");
+            return;
+        }
         snprintf(g_up_pkg, sizeof g_up_pkg, "%s\\NovaFile-Setup-%s.exe",
                  dir, ver);
     }
@@ -988,6 +998,12 @@ bool update_init(void) {
         if (GetEnvironmentVariableA("NOVA_UPDATE_URL", env,
                                     (DWORD)sizeof env) > 0)
             snprintf(g_up_cfg_url, sizeof g_up_cfg_url, "%s", env);
+        // No updates.cfg: the official release channel (version.h).  Before
+        // 1.2.0 an installed copy had NO source at all and never saw an
+        // update - the installer does not write updates.cfg.
+        if (!g_up_cfg_url[0])
+            snprintf(g_up_cfg_url, sizeof g_up_cfg_url, "%s",
+                     NOVA_UPDATE_DEFAULT_URL);
     }
     return true;
 }
@@ -1045,6 +1061,9 @@ const char* update_status_text(void) { return g_up_show; }
 const char* update_source_text(void) {
     return g_up_cfg_url[0] ? g_up_cfg_url : "Not configured";
 }
+
+// The version a ready (downloaded + verified) package installs.
+const char* update_ready_version(void) { return g_up_ver; }
 
 bool update_ready(void) {
     return InterlockedCompareExchange(&g_up_state, UPS_IDLE, UPS_IDLE) ==

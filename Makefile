@@ -14,6 +14,7 @@ SOURCES = \
     $(SRC_DIR)/core/memory.c \
     $(SRC_DIR)/core/indexer.c \
     $(SRC_DIR)/platform/window_win.c \
+    $(SRC_DIR)/platform/shell_ole.c \
     $(SRC_DIR)/renderer/renderer_gl.c \
     $(SRC_DIR)/ui/ui_framework.c \
     $(SRC_DIR)/app/update.c \
@@ -44,7 +45,7 @@ CFLAGS = -std=gnu11 -Wall -O2 $(INCLUDES)
 #            machine's Smart App Control blocks the console build)
 # -Map: symbol map - a crash dialog shows the offset, this file names the
 #       function (see nova_on_crash in src/app/main.c)
-LDFLAGS = -mwindows -Wl,-Map=build/NovaFile.map -lole32 -loleaut32 -lshell32 -luser32 -lkernel32 -lgdi32 -lmsimg32 -lcomdlg32 -lwinhttp -lbcrypt -lcrypt32 -lwintrust
+LDFLAGS = -mwindows -s -Wl,-Map=build/NovaFile.map -lole32 -loleaut32 -lshell32 -luser32 -lkernel32 -lgdi32 -lmsimg32 -lcomdlg32 -lwinhttp -lbcrypt -lcrypt32 -lwintrust -luuid
 EXECUTABLE = NovaFile.exe
 
 ifdef DEBUG
@@ -63,7 +64,7 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(RES_OBJECT): resource.rc NovaFile.ico
+$(RES_OBJECT): resource.rc NovaFile.ico NovaFile.manifest include/version.h
 	$(WINDRES) --preprocessor=cpp -i resource.rc -O coff -o $@
 
 $(EXECUTABLE): $(OBJECTS) $(RES_OBJECT)

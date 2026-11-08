@@ -113,7 +113,7 @@ begin
     // Silent installs are the update path: the freshly installed build
     // must pass its own headless selftest before it is trusted.
     if WizardSilent then begin
-      if Exec(AppExe, '--selftest', '', SW_HIDE,
+      if Exec(AppExe, '--smoke', '', SW_HIDE,
               ewWaitUntilTerminated, ResultCode) then begin
         if ResultCode <> 0 then begin
           if FileExists(Prev) then begin

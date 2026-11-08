@@ -41,6 +41,7 @@ bool update_open_notes(void);               // ShellExecute the notes URL
 const char* update_status_text(void);       // dynamic row text (stable ptr)
 const char* update_source_text(void);       // configured URL or "Not configured"
 bool update_ready(void);                    // verified package waiting
+const char* update_ready_version(void);     // its version ("1.2.0")
 
 // ---- pure logic (exercised by --selftest) ----
 int  nova_ver_parse(const char* s, unsigned* maj, unsigned* min, unsigned* pat);

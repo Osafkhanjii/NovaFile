@@ -6,8 +6,11 @@
 // ============================================
 #include "platform.h"
 #include "core.h"
+#include "shell_ole.h"
+#include "renderer.h"       // renderer_blit_last (WM_PRINT)
 #include <windows.h>
 #include <shlobj.h>
+#include <shellapi.h>   // DragAcceptFiles / DragQueryFile (drop files in)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,12 +28,26 @@ static bool g_quit_requested = false;
 static int g_key_frame = 0;
 static int g_key_rep_frame = 0;   // auto-repeated key this frame (0 = none)
 static int g_key_up_frame = 0;      // key released this frame (0 = none)
-static unsigned int g_char_frame = 0;
+// Printable characters dispatched THIS frame, oldest first.  One latch
+// is not enough: after a stall the pump drains many queued WM_CHARs
+// inside a single frame, and keeping only the last one silently
+// swallowed typing - the frame's consumer needs the whole ordered
+// stream (type-to-select especially: "work" must feed w, o, r, k).
+#define CHARQ_MAX 32
+static unsigned int g_charq[CHARQ_MAX];
+static int g_charq_n = 0;
 static bool g_left_click_frame = false;
 static bool g_right_click_frame = false;
 static bool g_double_click_frame = false;
 static bool g_middle_click_frame = false;   // one frame per wheel-button press
+static int g_xbutton_frame = 0;   // mouse side button THIS frame: 1 back, 2 forward
 static int g_wheel_raw = 0;
+static unsigned int g_hi_surrogate = 0;   // first half of a UTF-16 pair
+// Activity: how many messages (other than paints) the last pump handled.
+// The app's idle-aware loop paints at full rate only while something is
+// happening, and otherwise waits on the queue instead of burning a core.
+static int g_msg_activity = 0;
+static HDROP g_drop_pending = NULL;   // WM_DROPFILES handed to the app
 
 // Held state as OUR QUEUE sees it. The messages below are exactly what a
 // real press/release produces, so the OR with GetKeyState() in
@@ -197,6 +214,13 @@ static LRESULT CALLBACK fp_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    case WM_PRINTCLIENT:
+    case WM_PRINT:
+        // PrintWindow / screenshot tools / taskbar thumbnails: hand them
+        // the last frame we drew (the client area IS the whole window).
+        if (renderer_blit_last((void*)wp)) return 0;
+        return DefWindowProcW(hwnd, msg, wp, lp);
+
     case WM_GETMINMAXINFO: {
         MINMAXINFO* mmi = (MINMAXINFO*)lp;
         // Minimum usable size in design pixels, scaled for 4K.
@@ -221,7 +245,10 @@ static LRESULT CALLBACK fp_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDBLCLK:
         // With CS_DBLCLKS this replaces the second WM_LBUTTONDOWN,
         // so report it as a click too - otherwise a double click would
-        // never select anything.
+        // never select anything.  Capture exactly like WM_LBUTTONDOWN:
+        // without it, a double-click followed by a drag out of the window
+        // never receives its WM_LBUTTONUP and the held flag sticks down.
+        SetCapture(hwnd);
         g_input.x = (short)LOWORD(lp);
         g_input.y = (short)HIWORD(lp);
         g_left_click_frame = true;
@@ -256,15 +283,41 @@ static LRESULT CALLBACK fp_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_RBUTTONDOWN:
+        // Own coordinates too: a right-click that arrives without a prior
+        // WM_MOUSEMOVE (posted / synthesized input) must hit-test at ITS
+        // position, not at whatever the pointer last reported.
+        g_input.x = (short)LOWORD(lp);
+        g_input.y = (short)HIWORD(lp);
         g_right_click_frame = true;
         return 0;
 
     case WM_MBUTTONDOWN:
+        g_input.x = (short)LOWORD(lp);
+        g_input.y = (short)HIWORD(lp);
         g_middle_click_frame = true;
         return 0;
 
     case WM_MOUSEWHEEL:
         g_wheel_raw += GET_WHEEL_DELTA_WPARAM(wp);
+        return 0;
+
+    case WM_XBUTTONDOWN:
+        // Mouse side buttons, exactly like Explorer: XBUTTON1 = Back,
+        // XBUTTON2 = Forward.  TRUE must be returned for X buttons.
+        g_input.x = (short)LOWORD(lp);
+        g_input.y = (short)HIWORD(lp);
+        g_xbutton_frame = (HIWORD(wp) == XBUTTON2) ? 2 : 1;
+        return TRUE;
+    case WM_XBUTTONUP:
+    case WM_XBUTTONDBLCLK:
+        return TRUE;
+
+    case WM_DROPFILES:
+        // Files dragged in from Explorer / the desktop.  Parked for the
+        // app (one at a time - a second drop before the app took the
+        // first releases the older one) and handled on the next frame.
+        if (g_drop_pending) DragFinish(g_drop_pending);
+        g_drop_pending = (HDROP)wp;
         return 0;
 
     case WM_SETCURSOR:
@@ -276,7 +329,7 @@ static LRESULT CALLBACK fp_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetCursor(cursor_of(g_cursor_req));
             return TRUE;
         }
-        return DefWindowProcA(hwnd, msg, wp, lp);
+        return DefWindowProcW(hwnd, msg, wp, lp);
 
     case WM_KEYDOWN:
         // Bit 30 of lParam = 1 means this is an auto-repeat. Repeats are
@@ -315,21 +368,53 @@ static LRESULT CALLBACK fp_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // message is still forwarded to DefWindowProc for anything that is
         // not Alt itself (Alt+F4, menu shortcuts) so behaviour is unchanged.
         if (wp == VK_MENU) { g_alt = true; return 0; }
-        return DefWindowProcA(hwnd, msg, wp, lp);
+        // A CHORD's own letter still needs its press edge: Alt+S opens the
+        // Quick Access wheel.  Latch it exactly like WM_KEYDOWN (edge vs
+        // auto-repeat), then hand the message on as before - the OS keeps
+        // whatever it does with Alt+letter keys.
+        if ((lp & (1L << 30)) == 0) {
+            g_key_frame = (int)wp;
+        } else {
+            g_key_rep_frame = (int)wp;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
 
     case WM_SYSKEYUP:
         // ...and WM_SYSKEYUP (0x105) on release.  Without this case g_alt
         // could never be cleared by the message stream, and the gesture
         // overlay would stay on screen after Alt was let go.
         if (wp == VK_MENU) { g_alt = false; return 0; }
-        return DefWindowProcA(hwnd, msg, wp, lp);
+        g_key_up_frame = (int)wp;             // release edge of a chord key
+        return DefWindowProcW(hwnd, msg, wp, lp);
 
     case WM_CHAR:
         // Printable characters only (32..). Control keys such as Enter,
         // Backspace and Esc arrive as VK codes instead.
-        if (wp >= 32 && wp < 256) {
-            g_char_frame = (unsigned int)wp;
+        //
+        // Bit 31 of lParam marks the RELEASE edge: TranslateMessage turns
+        // a key-up into its own WM_CHAR too, and that duplicate would
+        // feed every pressed key TWICE to any character consumer (the
+        // type-to-select prefix, the edit fields). Only the press edge
+        // carries a character worth delivering.
+        // The window is UNICODE: wp is a UTF-16 code unit.  A character
+        // outside the Basic Multilingual Plane (emoji...) arrives as TWO
+        // messages - a high then a low surrogate - and is joined into one
+        // code point here.  The queue carries CODE POINTS; the app encodes
+        // them into its byte strings (see text_insert / tts_char).
+        if (!(lp & 0x80000000)) {
+            unsigned int u = (unsigned int)wp;
+            if (u >= 0xD800 && u <= 0xDBFF) { g_hi_surrogate = u; return 0; }
+            if (u >= 0xDC00 && u <= 0xDFFF) {
+                if (!g_hi_surrogate) return 0;           // stray low half
+                u = 0x10000 + ((g_hi_surrogate - 0xD800) << 10) + (u - 0xDC00);
+            }
+            g_hi_surrogate = 0;
+            if (u >= 32 && u != 127 && g_charq_n < CHARQ_MAX)
+                g_charq[g_charq_n++] = u;
         }
+        return 0;
+
+    case WM_SYSCHAR:
         return 0;
 
     case WM_DESTROY:
@@ -395,8 +480,14 @@ static LRESULT CALLBACK fp_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return HTCLIENT;
     }
 
-    default:
-        return DefWindowProcA(hwnd, msg, wp, lp);
+    default: {
+        // A native shell menu ("Show more options") is open: its owner-
+        // drawn submenus (Open with, Send to) paint through these.
+        intptr_t r = 0;
+        if (shell_menu_handle_msg(msg, (uintptr_t)wp, (intptr_t)lp, &r))
+            return (LRESULT)r;
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
     }
 }
 
@@ -431,7 +522,13 @@ bool platform_window_create(const char* title, int width, int height) {
     if (width < 320) width = 320;
     if (height < 240) height = 240;
 
-    WNDCLASSA wc;
+    // A UNICODE window class: WM_CHAR then carries real UTF-16 text, so
+    // typing in any language (Urdu, Arabic, Chinese, accented letters...)
+    // reaches the app intact - an ANSI window could only ever deliver the
+    // current code page's 256 characters.  Everything else is unchanged:
+    // the same window procedure, and SetWindowTextA still works (Windows
+    // converts the title through the active code page).
+    WNDCLASSW wc;
     memset(&wc, 0, sizeof(wc));
     wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = fp_wnd_proc;
@@ -444,9 +541,9 @@ bool platform_window_create(const char* title, int width, int height) {
     wc.hIcon = LoadImage(wc.hInstance, MAKEINTRESOURCE(1), IMAGE_ICON,
                          0, 0, LR_DEFAULTSIZE);
     wc.hbrBackground = NULL;
-    wc.lpszClassName = "NovaFileWindow";
+    wc.lpszClassName = L"NovaFileWindow";
 
-    if (!RegisterClassA(&wc)) {
+    if (!RegisterClassW(&wc)) {
         DWORD err = GetLastError();
         if (err != ERROR_CLASS_ALREADY_EXISTS) return false;
     }
@@ -456,15 +553,18 @@ bool platform_window_create(const char* title, int width, int height) {
     // client size.
     RECT rc = {0, 0, width, height};
 
-    g_hwnd = CreateWindowExA(
-        0, "NovaFileWindow",
-        title ? title : "Nova File",
+    g_hwnd = CreateWindowExW(
+        0, L"NovaFileWindow", L"Nova File",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         rc.right - rc.left, rc.bottom - rc.top,
         NULL, NULL, GetModuleHandleA(NULL), NULL);
 
     if (!g_hwnd) return false;
+    if (title) SetWindowTextA(g_hwnd, title);
+    // Files dropped from Explorer / the desktop arrive as WM_DROPFILES
+    // (the app copies or moves them into the open folder).
+    DragAcceptFiles(g_hwnd, TRUE);
 
     // Force the frame recalculation NOW: it re-sends WM_NCCALCSIZE with
     // wParam TRUE, so the client area becomes the whole window before the
@@ -539,28 +639,38 @@ bool platform_poll_events(void) {
     g_key_frame = 0;
     g_key_rep_frame = 0;
     g_key_up_frame = 0;
-    g_char_frame = 0;
+    g_charq_n = 0;
     g_left_click_frame = false;
     g_right_click_frame = false;
     g_double_click_frame = false;
     g_middle_click_frame = false;
-    g_wheel_raw = 0;
+    g_xbutton_frame = 0;
+    g_msg_activity = 0;
+    // NOTE: g_wheel_raw is deliberately NOT cleared here - sub-notch
+    // remainders carry over to the next frame (see the publish block).
 
     MSG msg;
-    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) {
             g_quit_requested = true;
             break;
         }
+        if (msg.message != WM_PAINT) g_msg_activity++;
         TranslateMessage(&msg);
-        DispatchMessageA(&msg);
+        DispatchMessageW(&msg);
     }
 
     // Publish the frame's state for the app to read.
     g_input.key_code = g_key_frame;
     g_input.key_repeat = g_key_rep_frame;
     g_input.key_up = g_key_up_frame;
-    g_input.char_pressed = g_char_frame;
+    // First character = the single-char view; the whole ordered stream
+    // rides along for consumers that must not lose any (type-to-select).
+    g_input.char_pressed = g_charq_n ? g_charq[0] : 0;
+    g_input.charq_n = g_charq_n;
+    if (g_input.charq_n > (int)(sizeof g_input.charq / sizeof g_input.charq[0]))
+        g_input.charq_n = (int)(sizeof g_input.charq / sizeof g_input.charq[0]);
+    for (int i = 0; i < g_input.charq_n; i++) g_input.charq[i] = g_charq[i];
     g_input.left_click = g_left_click_frame;
     // held: OUR queue's view OR the hardware state - identical for a human
     // (their press generates these messages), and it also works when the
@@ -569,10 +679,18 @@ bool platform_poll_events(void) {
     g_input.right_click = g_right_click_frame;
     g_input.double_click = g_double_click_frame;
     g_input.middle_click = g_middle_click_frame;   // true for ONE frame only
+    g_input.xbutton = g_xbutton_frame;             // 1 back / 2 forward
 
+    // Whole notches are consumed, the sub-notch remainder STAYS queued for
+    // the next frame.  The old code reset the accumulator every frame and
+    // then rounded any non-zero leftover up to a full notch, so a high
+    // resolution mouse / precision touchpad (15-60 units per frame) scrolled
+    // a full line EVERY frame - roughly 60 lines a second.  A burst is
+    // capped so one stalled frame can never fling the list.
     g_input.wheel = g_wheel_raw / WHEEL_DELTA;
-    if (g_wheel_raw > 0 && g_input.wheel == 0) g_input.wheel = 1;
-    if (g_wheel_raw < 0 && g_input.wheel == 0) g_input.wheel = -1;
+    if (g_input.wheel > 5) g_input.wheel = 5;
+    if (g_input.wheel < -5) g_input.wheel = -5;
+    g_wheel_raw -= g_input.wheel * WHEEL_DELTA;
 
     g_input.ctrl_pressed = g_ctrl || ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0);
     g_input.shift_pressed = g_shift || ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0);
@@ -596,6 +714,53 @@ bool platform_poll_events(void) {
     g_input.v_held = g_vheld || ((GetAsyncKeyState('V') & 0x8000) != 0);
 
     return !g_quit_requested;
+}
+
+// ---- idle-aware frame pacing ------------------------------------------
+int platform_last_activity(void) { return g_msg_activity; }
+
+// Sleep until a message arrives OR `ms` pass - whichever is first.  The
+// old fixed Sleep(16) both wasted the wait (input sat in the queue up to
+// 16 ms) and could never sleep longer while nothing happened.
+void platform_wait(int ms) {
+    if (ms <= 0) return;
+    MsgWaitForMultipleObjects(0, NULL, FALSE, (DWORD)ms, QS_ALLINPUT);
+}
+
+// Wake the UI thread from any thread (a worker finished a job).
+void platform_wake(void) {
+    if (g_hwnd) PostMessageW(g_hwnd, WM_NULL, 0, 0);
+}
+
+bool platform_window_minimized(void) {
+    return g_hwnd && IsIconic(g_hwnd);
+}
+
+// Files dropped on the window since the last call: returns the count and
+// a malloc'd array of malloc'd paths (caller frees both), or 0.
+int platform_take_dropped(char*** out, int* x, int* y) {
+    if (out) *out = NULL;
+    if (!g_drop_pending) return 0;
+    HDROP hd = g_drop_pending;
+    g_drop_pending = NULL;
+    POINT dp = {0, 0};
+    DragQueryPoint(hd, &dp);          // client coordinates of the drop
+    if (x) *x = dp.x;
+    if (y) *y = dp.y;
+    UINT n = DragQueryFileA(hd, 0xFFFFFFFF, NULL, 0);
+    char** v = (n > 0) ? (char**)calloc(n, sizeof(char*)) : NULL;
+    int got = 0;
+    for (UINT i = 0; v && i < n; i++) {
+        char buf[1024];
+        UINT len = DragQueryFileA(hd, i, buf, (UINT)sizeof(buf));
+        if (len == 0 || len >= sizeof(buf)) continue;
+        v[got] = _strdup(buf);
+        if (v[got]) got++;
+    }
+    DragFinish(hd);
+    if (got == 0) { free(v); return 0; }
+    if (out) *out = v; else { for (int i = 0; i < got; i++) free(v[i]); free(v); }
+    return got;
 }
 
 // ---------------------------------------------------------------
@@ -704,8 +869,17 @@ DirEntry* get_directory_entries_impl(const char* path, size_t* count) {
     char search[2048];
     snprintf(search, sizeof(search), "%s%s*", path, path_sep(path));
 
+    // FindExInfoBasic skips the 8.3 short name and LARGE_FETCH asks the
+    // file system for big batches - the same flags Explorer uses; on a
+    // 20,000-item folder the listing is noticeably faster.  Win7+ (older
+    // systems reject the flags: fall back to the classic call).
     WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(search, &fd);
+    HANDLE h = FindFirstFileExA(search, FindExInfoBasic, &fd,
+                                FindExSearchNameMatch, NULL,
+                                2 /* FIND_FIRST_EX_LARGE_FETCH */);
+    if (h == INVALID_HANDLE_VALUE &&
+        GetLastError() == ERROR_INVALID_PARAMETER)
+        h = FindFirstFileA(search, &fd);
     if (h == INVALID_HANDLE_VALUE) return NULL;
 
     size_t cap = 256;

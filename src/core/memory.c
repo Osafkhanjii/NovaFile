@@ -66,12 +66,22 @@ bool utf8_append(UTF8String* str, const char* text) {
 
 int utf8_char_count(const char* str) {
     int count = 0;
+    if (!str) return 0;
     while (*str) {
         unsigned char c = (unsigned char)*str;
-        if (c < 0x80) str++;
-        else if ((c & 0xE0) == 0xC0) str += 2;
-        else if ((c & 0xF0) == 0xE0) str += 3;
-        else str += 4;
+        size_t adv;
+        if (c < 0x80) adv = 1;
+        else if ((c & 0xE0) == 0xC0) adv = 2;
+        else if ((c & 0xF0) == 0xE0) adv = 3;
+        else if ((c & 0xF8) == 0xF0) adv = 4;
+        else adv = 1;                    // stray byte: count it, step 1
+        // A truncated sequence ("\xC0" right before the terminator) must
+        // never step PAST the NUL - that read out of bounds until a stray
+        // zero and inflated the count.  Consume what is really there.
+        size_t k = 1;
+        while (k < adv && str[k] != '\0') k++;
+        if (k < adv) adv = 1;            // cut short: treat lead as one char
+        str += adv;
         count++;
     }
     return count;
@@ -182,8 +192,14 @@ void hm_insert(HashMap* map, const char* key, void* value) {
     }
     unsigned long idx = hash_str(key) % map->capacity;
     size_t i = 0;
-    while (map->keys[(idx + i) % map->capacity] && strcmp(map->keys[(idx + i) % map->capacity], key) != 0)
+    // Bounded probe: if a rehash failed the table can sit above 70% up to
+    // 100% full, and an unbounded "find an empty slot" loop would spin
+    // forever on the next NEW key (100% CPU hang).
+    while (i < map->capacity &&
+           map->keys[(idx + i) % map->capacity] &&
+           strcmp(map->keys[(idx + i) % map->capacity], key) != 0)
         i++;
+    if (i >= map->capacity) return;      // full: drop rather than hang/overwrite
     if (!map->keys[(idx + i) % map->capacity]) {
         char* dup = strdup(key);
         if (!dup) return;        // never count a key we failed to store

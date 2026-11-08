@@ -49,6 +49,8 @@ void widget_add_child(Widget* parent, Widget* child) {
         if (new_children) {
             parent->children = new_children;
             parent->child_capacity = new_cap;
+        } else {
+            return;      // OOM: never write past the end of the old block
         }
     }
     parent->children[parent->child_count] = child;

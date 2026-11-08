@@ -1100,7 +1100,7 @@ bool update_apply(void) {
     }
     char cmdline[MAX_PATH + 48];
     snprintf(cmdline, sizeof cmdline,
-             "\"%s\" /SILENT /SUPPRESSMSGBOXES /UPDATE", pkg);
+             "\"%s\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /UPDATE", pkg);
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
     memset(&si, 0, sizeof si);

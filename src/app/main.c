@@ -22268,6 +22268,19 @@ static void st_system_menu(void) {
         g_app.selected = -1;
         xm_open_bg(400, 200);
         st_xm_wait(15000);
+        // Shell extensions (cloud clients...) sometimes answer the FIRST
+        // background query thin: one retry before judging, and the labels
+        // are printed when it still fails.
+        if (st_xm_find("Properties") < 0 || st_xm_find("New") < 0) {
+            xm_close();
+            xm_open_bg(400, 200);
+            st_xm_wait(15000);
+        }
+        if (st_xm_find("Properties") < 0) {
+            printf("[selftest]   background rows (ver %d):", g_xm_ver);
+            for (int k = 0; k < g_xroot_n; k++) printf(" [%s]", g_xn[g_xroot[k]].label);
+            printf("\n");
+        }
         M_EXP(st_xm_find("View") >= 0 && st_xm_find("Sort by") >= 0 &&
               st_xm_find("Group by") >= 0 && st_xm_find("Refresh") >= 0,
               "background: View / Sort by / Group by / Refresh");
@@ -32013,6 +32026,12 @@ int main(int argc, char* argv[]) {
             if (w > 0 && (size_t)w < sizeof(p)) {
                 DeleteFileA(p);
                 SetEnvironmentVariableA("NOVA_SETTINGS_FILE", p);
+            }
+            char fv[MAX_PATH + 140];
+            int w3 = snprintf(fv, sizeof(fv), "%sNovaFile_selftest_favorites.txt", t);
+            if (w3 > 0 && (size_t)w3 < sizeof(fv) && !getenv("NOVA_FAV_FILE")) {
+                DeleteFileA(fv);
+                SetEnvironmentVariableA("NOVA_FAV_FILE", fv);
             }
             char s[MAX_PATH + 140];
             int w2 = snprintf(s, sizeof(s),

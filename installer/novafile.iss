@@ -128,8 +128,11 @@ begin
       end;
     end;
     // Update flow relaunches the app; the test rig can suppress it.
+    // GetEnv, NOT ExpandConstant('{env:...}'): Inno has no {env:} constant
+    // - that raised "Unknown constant" right here, so the relaunch after an
+    // update NEVER ran and NovaFile simply stayed closed.
     if CmdLineParamExists('/UPDATE') and
-       (ExpandConstant('{env:NOVA_UPDATE_NORELAUNCH}') <> '1') then
+       (GetEnv('NOVA_UPDATE_NORELAUNCH') <> '1') then
       Exec(AppExe, '', '', SW_SHOWNORMAL, ewNoWait, ResultCode);
   end;
 end;

@@ -19,3 +19,6 @@ Thumbs.db
 # The real release config (signing keys, hosting URLs) stays OUT of the
 # repo - only the committed sample file is versioned.
 tools/release/release.config.json
+
+# Debug trace written by NOVA_DEBUG=1 runs
+nova_debug.txt

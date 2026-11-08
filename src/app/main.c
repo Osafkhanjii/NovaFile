@@ -14812,21 +14812,99 @@ static bool reg_val_str(HKEY root, const wchar_t* sub, const wchar_t* val,
     return ok && out[0] != L'\0';
 }
 
-// The type's ProgID, honouring the user's own "choose a default app":
-// FileExts\<ext>\UserChoice\ProgId wins over the class default, exactly
-// the way Explorer resolves it.  (A .txt file on Windows 11, e.g., lives
-// under an AppX ProgID the user picked, NOT under the "txtfilelegacy"
-// class default - skipping UserChoice here would pick the wrong app.)
-static bool effective_progid(const wchar_t* ext, wchar_t* progid,
-                             size_t cap) {
-    wchar_t uc[420];
-    _snwprintf(uc, 420,
+// ---- every ProgID that could open this extension -------------------
+// Machines register the same app in very different ways: one has the
+// class default (HKCR\.nk = "nuke.nk"), another only a per-user
+// UserChoice (which may even point at a ProgID that no longer exists),
+// another only OpenWithProgids or an "Applications\Nuke15.0.exe" entry
+// left by "Open with".  Resolving ONE ProgID and giving up is why a file
+// opened on one PC and failed with "no app registered" on another.  So
+// every candidate is collected, in Explorer's own priority order, and
+// each one is tried until one actually opens the file.
+#define OPEN_MAX_PROGIDS 16
+typedef struct { wchar_t id[OPEN_MAX_PROGIDS][260]; int n; } progid_list;
+
+static void progid_add(progid_list* l, const wchar_t* id) {
+    if (!id || !id[0] || l->n >= OPEN_MAX_PROGIDS) return;
+    if (wcsncmp(id, L"MIME\\", 5) == 0) return;          // not an app type
+    for (int i = 0; i < l->n; i++)
+        if (_wcsicmp(l->id[i], id) == 0) return;          // no duplicates
+    wcsncpy(l->id[l->n], id, 259);
+    l->id[l->n][259] = L'\0';
+    l->n++;
+}
+
+// Adds every value NAME under root\sub (OpenWithProgids stores the
+// ProgIDs as value names with empty data).
+static void progid_add_value_names(progid_list* l, HKEY root,
+                                   const wchar_t* sub) {
+    HKEY k = NULL;
+    if (RegOpenKeyExW(root, sub, 0, KEY_READ, &k) != ERROR_SUCCESS) return;
+    for (DWORD i = 0; i < 32; i++) {
+        wchar_t name[260];
+        DWORD nlen = 260;
+        if (RegEnumValueW(k, i, name, &nlen, NULL, NULL, NULL, NULL)
+            != ERROR_SUCCESS)
+            break;
+        name[259] = L'\0';
+        if (name[0]) progid_add(l, name);
+    }
+    RegCloseKey(k);
+}
+
+// Adds "Applications\<exe>" for each exe in an OpenWithList (values
+// a, b, c... hold exe names; MRUList is bookkeeping, not an app).
+static void progid_add_open_with_list(progid_list* l, HKEY root,
+                                      const wchar_t* sub) {
+    HKEY k = NULL;
+    if (RegOpenKeyExW(root, sub, 0, KEY_READ, &k) != ERROR_SUCCESS) return;
+    for (DWORD i = 0; i < 32; i++) {
+        wchar_t name[64], data[260];
+        DWORD nlen = 64, type = 0, dsz = sizeof data - sizeof(wchar_t);
+        memset(data, 0, sizeof data);
+        if (RegEnumValueW(k, i, name, &nlen, NULL, &type, (LPBYTE)data,
+                          &dsz) != ERROR_SUCCESS)
+            continue;                                     // e.g. too long
+        if (type != REG_SZ || _wcsicmp(name, L"MRUList") == 0) continue;
+        size_t dl = wcslen(data);
+        if (dl < 5 || _wcsicmp(data + dl - 4, L".exe") != 0) continue;
+        wchar_t app[300];
+        _snwprintf(app, 300, L"Applications\\%ls", data);
+        app[299] = L'\0';
+        progid_add(l, app);
+    }
+    RegCloseKey(k);
+}
+
+static void collect_progids(const wchar_t* ext, progid_list* l) {
+    l->n = 0;
+    wchar_t fe[300], sub[360], v[260];
+    _snwprintf(fe, 300,
                L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer"
-               L"\\FileExts\\%ls\\UserChoice", ext);
-    uc[419] = L'\0';
-    if (reg_val_str(HKEY_CURRENT_USER, uc, L"ProgId", progid, cap))
-        return true;
-    return reg_val_str(HKEY_CLASSES_ROOT, ext, NULL, progid, cap);
+               L"\\FileExts\\%ls", ext);
+    fe[299] = L'\0';
+    // 1. the user's own "choose a default app" (Explorer's first pick)
+    _snwprintf(sub, 360, L"%ls\\UserChoice", fe);
+    sub[359] = L'\0';
+    if (reg_val_str(HKEY_CURRENT_USER, sub, L"ProgId", v, 260))
+        progid_add(l, v);
+    // 2. the class default HKCR\<ext>
+    if (reg_val_str(HKEY_CLASSES_ROOT, ext, NULL, v, 260))
+        progid_add(l, v);
+    // 3. OpenWithProgids - machine-wide (merged view) and per user
+    _snwprintf(sub, 360, L"%ls\\OpenWithProgids", ext);
+    sub[359] = L'\0';
+    progid_add_value_names(l, HKEY_CLASSES_ROOT, sub);
+    _snwprintf(sub, 360, L"%ls\\OpenWithProgids", fe);
+    sub[359] = L'\0';
+    progid_add_value_names(l, HKEY_CURRENT_USER, sub);
+    // 4. apps the user picked once with "Open with"
+    _snwprintf(sub, 360, L"%ls\\OpenWithList", ext);
+    sub[359] = L'\0';
+    progid_add_open_with_list(l, HKEY_CLASSES_ROOT, sub);
+    _snwprintf(sub, 360, L"%ls\\OpenWithList", fe);
+    sub[359] = L'\0';
+    progid_add_open_with_list(l, HKEY_CURRENT_USER, sub);
 }
 
 // A verb that OPENS.  "print", "printto", "edit", "properties"... each
@@ -14844,37 +14922,56 @@ static bool verb_is_openish(const wchar_t* v) {
     return true;
 }
 
-// Find an OPENING verb for this extension, or fail.  Called only AFTER
-// the standard "open" attempt already returned NO_ASSOCIATION, so this
-// can never replace a verb that would have worked.
-static bool find_open_verb(const wchar_t* ext, wchar_t* verb, size_t cap) {
+// Does <progid>\shell\<verb>\command exist?
+static bool progid_has_verb(const wchar_t* progid, const wchar_t* verb) {
+    wchar_t sub[600];
+    _snwprintf(sub, 600, L"%ls\\shell\\%ls\\command", progid, verb);
+    sub[599] = L'\0';
+    HKEY c = NULL;
+    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, sub, 0, KEY_READ, &c)
+        != ERROR_SUCCESS)
+        return false;
+    RegCloseKey(c);
+    return true;
+}
+
+// The OPENING verb one ProgID registered (with a real command):
+// "open" first, then the key's declared default verb, then any other
+// opening verb - never print/edit.
+static bool find_verb_in_progid(const wchar_t* progid, wchar_t* verb,
+                                size_t cap) {
     verb[0] = L'\0';
-    wchar_t progid[256];
-    if (!effective_progid(ext, progid, 256)) return false;
-    if (wcsncmp(progid, L"MIME\\", 5) == 0) return false;  // not an app type
-    wchar_t shell[340];
+    if (progid_has_verb(progid, L"open")) {
+        wcsncpy(verb, L"open", cap - 1);
+        verb[cap - 1] = L'\0';
+        return true;
+    }
+    wchar_t shell[340], def[128];
     _snwprintf(shell, 340, L"%ls\\shell", progid);
     shell[339] = L'\0';
+    if (reg_val_str(HKEY_CLASSES_ROOT, shell, NULL, def, 128)) {
+        wchar_t* comma = wcschr(def, L',');   // may list "opennk,edit"
+        if (comma) *comma = L'\0';
+        if (verb_is_openish(def) && progid_has_verb(progid, def)) {
+            wcsncpy(verb, def, cap - 1);
+            verb[cap - 1] = L'\0';
+            return true;
+        }
+    }
     HKEY sh = NULL;
     if (RegOpenKeyExW(HKEY_CLASSES_ROOT, shell, 0, KEY_READ, &sh)
         != ERROR_SUCCESS)
         return false;
     bool found = false;
-    for (int i = 0; i < 12 && !found; i++) {             // a handful max
+    for (DWORD i = 0; i < 24 && !found; i++) {
         wchar_t name[128];
         DWORD nlen = 128;
-        if (RegEnumKeyExW(sh, (DWORD)i, name, &nlen, NULL, NULL, NULL, NULL)
+        if (RegEnumKeyExW(sh, i, name, &nlen, NULL, NULL, NULL, NULL)
             != ERROR_SUCCESS)
             break;
         name[127] = L'\0';
         if (!verb_is_openish(name)) continue;            // never print/edit
-        wchar_t sub[400];
-        _snwprintf(sub, 400, L"%ls\\shell\\%ls\\command", progid, name);
-        sub[399] = L'\0';
-        HKEY c = NULL;
-        if (RegOpenKeyExW(HKEY_CLASSES_ROOT, sub, 0, KEY_READ, &c)
-            == ERROR_SUCCESS) {
-            RegCloseKey(c);
+        if (progid_has_verb(progid, name)) {
             wcsncpy(verb, name, cap - 1);                // e.g. Nuke "opennk"
             verb[cap - 1] = L'\0';
             found = true;
@@ -14884,12 +14981,41 @@ static bool find_open_verb(const wchar_t* ext, wchar_t* verb, size_t cap) {
     return found;
 }
 
+// First OPENING verb across all candidate ProgIDs of this extension.
+// Used by the selftest; the open path itself walks every candidate.
+static bool find_open_verb(const wchar_t* ext, wchar_t* verb, size_t cap) {
+    progid_list l;
+    collect_progids(ext, &l);
+    for (int i = 0; i < l.n; i++)
+        if (find_verb_in_progid(l.id[i], verb, cap)) return true;
+    verb[0] = L'\0';
+    return false;
+}
+
+// "Windows does not know which app to use" - the only failures worth
+// retrying with another ProgID or the picker.  A missing file or
+// access denied stays an honest error.
+static bool open_err_is_no_app(DWORD err) {
+    return err == ERROR_NO_ASSOCIATION || err == ERROR_CLASS_DOES_NOT_EXIST ||
+           err == ERROR_DDE_FAIL;
+}
+
 // Nova File never runs a file itself - the registered handler (the user's
 // default app) does, exactly as Explorer would.  The WIDE call keeps
 // names with spaces / accents intact, SEE_MASK_FLAG_NO_UI stops the
-// shell's own dialog so the failure can be reported in the status bar,
-// and the real Windows error is never thrown away: it is named in the
-// bar and printed to stdout for diagnostics.
+// shell's own error dialog so the failure can be reported in the status
+// bar, and the real Windows error is never thrown away: it is named in
+// the bar and printed to stdout for diagnostics.
+//
+// Order - each step runs only if the previous one found no app:
+//   1. the default verb (lpVerb NULL) - EXACTLY an Explorer double-click,
+//      so whatever opens in Explorer opens here, including types such as
+//      Nuke that register only their own verb ("opennk").
+//   2. explicit "open".
+//   3. every candidate ProgID (UserChoice, class default,
+//      OpenWithProgids, OpenWithList apps) with its opening verb.
+//   4. Windows' own "How do you want to open this file?" picker - the
+//      user chooses the app once, Windows remembers it, the file opens.
 static bool open_with_shell(const char* path, const char* name) {
     wchar_t wp[1024];
     if (MultiByteToWideChar(CP_ACP, 0, path, -1, wp,
@@ -14902,43 +15028,100 @@ static bool open_with_shell(const char* path, const char* name) {
     memset(&sei, 0, sizeof sei);
     sei.cbSize  = sizeof sei;
     sei.fMask   = SEE_MASK_FLAG_NO_UI;
+    sei.hwnd    = (HWND)g_app.hwnd;
     sei.lpFile  = wp;
     sei.lpDirectory = NULL;
     sei.nShow   = SW_SHOWNORMAL;
 
-    // 1. the standard "open" verb - correct on its own for nearly every
-    //    type, so it is always tried first and normally ends here.
-    sei.lpVerb = L"open";
+    // 1. default verb = Explorer double-click
+    sei.lpVerb = NULL;
     if (ShellExecuteExW(&sei)) {
         printf("[open] ok '%s'\n", path);
         return true;
     }
     DWORD err = GetLastError();
+    printf("[open] default verb failed: win32=%lu\n", (unsigned long)err);
 
-    // 2. "open" is genuinely absent: some types register only their OWN
-    //    verb name (Foundry's Nuke uses "opennk").  Look for an OPENING
-    //    verb the type did register and retry.  This branch is never
-    //    reached for a normal type, so a print/edit verb can never be
-    //    picked up by mistake.
-    if (err == ERROR_NO_ASSOCIATION) {
-        wchar_t ext[32];
-        ext[0] = L'\0';
+    // 2. explicit "open"
+    if (open_err_is_no_app(err)) {
+        sei.lpVerb = L"open";
+        if (ShellExecuteExW(&sei)) {
+            printf("[open] ok '%s' (verb 'open')\n", path);
+            return true;
+        }
+        err = GetLastError();
+    }
+
+    // 3. every ProgID that claims this extension
+    wchar_t ext[32];
+    ext[0] = L'\0';
+    {
         const wchar_t* dot = wcsrchr(wp, L'.');
         const wchar_t* slash = wcsrchr(wp, L'\\');
-        if (dot && (!slash || dot > slash) && wcslen(dot) < sizeof ext / 2) {
+        if (dot && (!slash || dot > slash) &&
+            wcslen(dot) < sizeof ext / sizeof ext[0]) {
             wcscpy(ext, dot);
             for (wchar_t* q = ext; *q; q++) *q = towlower(*q);
         }
-        wchar_t verb[128];
-        if (ext[0] != L'\0' && find_open_verb(ext, verb, 128)) {
-            sei.lpVerb = verb;
+    }
+    if (open_err_is_no_app(err) && ext[0] != L'\0') {
+        progid_list l;
+        collect_progids(ext, &l);
+        for (int i = 0; i < l.n; i++) {
+            wchar_t verb[128];
+            if (!find_verb_in_progid(l.id[i], verb, 128)) continue;
+            sei.fMask   = SEE_MASK_FLAG_NO_UI | SEE_MASK_CLASSNAME;
+            sei.lpClass = l.id[i];
+            sei.lpVerb  = verb;
             if (ShellExecuteExW(&sei)) {
-                printf("[open] ok '%s' (verb '%ls')\n", path, verb);
+                printf("[open] ok '%s' (class '%ls', verb '%ls')\n", path,
+                       l.id[i], verb);
                 return true;
             }
-            err = GetLastError();
+            DWORD e2 = GetLastError();
+            printf("[open] class '%ls' verb '%ls' failed: win32=%lu\n",
+                   l.id[i], verb, (unsigned long)e2);
+            if (!open_err_is_no_app(e2)) {     // a real reason: report it
+                err = e2;
+                break;
+            }
         }
+        sei.fMask   = SEE_MASK_FLAG_NO_UI;
+        sei.lpClass = NULL;
     }
+
+    // 4. no app known on THIS machine: Windows' own picker.  It registers
+    //    the user's choice and opens the file, so it never asks again.
+    //    shlobj.h clashes with this file's own shell declarations, so the
+    //    struct is mirrored here and the call resolved from shell32.
+    if (open_err_is_no_app(err)) {
+        typedef struct {
+            const wchar_t* pcszFile;
+            const wchar_t* pcszClass;
+            DWORD oaifInFlags;
+        } nova_openasinfo;
+        typedef HRESULT (WINAPI *open_with_fn)(HWND, const nova_openasinfo*);
+        enum { NOVA_OAIF_ALLOW_REGISTRATION = 0x1, NOVA_OAIF_REGISTER_EXT = 0x2,
+               NOVA_OAIF_EXEC = 0x4 };
+        HMODULE sh32 = GetModuleHandleW(L"shell32.dll");
+        open_with_fn owd = sh32 ? (open_with_fn)(void*)GetProcAddress(
+                                      sh32, "SHOpenWithDialog")
+                                : NULL;
+        nova_openasinfo oai;
+        memset(&oai, 0, sizeof oai);
+        oai.pcszFile    = wp;
+        oai.pcszClass   = NULL;
+        oai.oaifInFlags = NOVA_OAIF_ALLOW_REGISTRATION |
+                          NOVA_OAIF_REGISTER_EXT | NOVA_OAIF_EXEC;
+        HRESULT hr = owd ? owd((HWND)g_app.hwnd, &oai) : E_NOTIMPL;
+        if (SUCCEEDED(hr)) {
+            printf("[open] ok '%s' (Open with picker)\n", path);
+            return true;
+        }
+        if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) err = ERROR_CANCELLED;
+        printf("[open] picker failed: hr=0x%08lx\n", (unsigned long)hr);
+    }
+
     set_status("Cannot open %s: %s (%lu)", name, open_err_text(err),
                (unsigned long)err);
     printf("[open] fail '%s': win32=%lu\n", path, (unsigned long)err);

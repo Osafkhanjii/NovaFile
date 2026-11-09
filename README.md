@@ -52,6 +52,17 @@ is in this repository. Output: `build\NovaFile.exe` (~955 KB).
   **shrinks**, never upscales a 32px icon into a soft blur. Falls back
   to the classic shell icon (`SHGetFileInfo`), then to the OLE picture
   decoder, then to a drawn icon
+- **OpenEXR thumbnails** - Windows has no `.exr` codec, so Explorer (and
+  the shell) only shows a blank icon for every frame of a render / comp
+  image sequence. NovaFile decodes EXR itself (`src/core/exr.c`, pure C,
+  no libraries): scanline and tiled images, multi-part files (first
+  part), HALF / FLOAT / UINT channels, and every standard compression -
+  NONE, RLE, ZIPS, ZIP, PIZ, PXR24, B44, B44A, DWAA, DWAB. It shows RGB(A),
+  else the first layer's RGB (`beauty.R` ...), else Y as grey, framed by
+  the display window, shown in sRGB over black like Nuke / DJV. Decoding
+  runs on the thumbnail workers (a 4K DWAA frame takes ~0.15 s) and
+  lands in the disk cache like every other thumbnail. Deep or damaged
+  files keep the normal icon
 - **Five view modes** - from the **one corner control** in the bottom bar
   (right of the Hidden toggle): a plain **click steps automatically**
   through **Details** (Name / Size / Modified / Type columns) -> **List**
@@ -138,6 +149,13 @@ is in this repository. Output: `build\NovaFile.exe` (~955 KB).
   the status bar shows "N of M files" while a query is active
 - **Sorting** - click Name / Size / Modified / Type headers to sort
   (click again to reverse)
+- **Selection box** - press on empty space (or, in Details / List, on a
+  row to the right of its name) and drag: every item the box touches is
+  selected live, and the list scrolls when you drag past its edge.
+  **Ctrl**+drag adds to the selection you already have
+- **Rename tabs** - double-click a tab, or right-click it -> **Rename
+  Tab**; Enter saves, Esc cancels, an empty name goes back to the folder
+  name. Tab names are kept with the session
 - **Themes** - dark and light (**Ctrl+T**)
 - **Fast scrolling** - the wheel moves **2 rows** (thumbnails) or **6
   rows** (details) per notch, with a blue pill scrollbar; the sidebar
@@ -297,13 +315,15 @@ highlight).
 Nova File/
 ├── include/
 │   ├── core.h            # memory, strings, containers, file types
+│   ├── exr.h             # OpenEXR preview decoder API
 │   ├── platform.h        # platform + window + input API
 │   ├── renderer.h        # renderer API, colours, themes
 │   └── ui.h              # widget types
 ├── src/
 │   ├── core/
 │   │   ├── memory.c      # allocator, UTF-8, dynamic array, hash map
-│   │   └── indexer.c     # fuzzy search, size formatting, extensions
+│   │   ├── indexer.c     # fuzzy search, size formatting, extensions
+│   │   └── exr.c         # OpenEXR decoder for thumbnails (all codecs)
 │   ├── platform/
 │   │   ├── window_win.c  # Win32 window, events, file system
 │   │   └── shell_ole.c   # native shell menu + OLE drag-out

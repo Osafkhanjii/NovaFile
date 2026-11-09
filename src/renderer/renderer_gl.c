@@ -397,7 +397,10 @@ static void rect_fill_alpha(const RECT* r, Color color) {
     // AlphaBlend ignore the pixel alpha, SourceConstantAlpha carries it
     COLORREF flat = to_colorref(color);
     if (!g_af_filled || flat != g_af_key) {
-        DWORD px = (DWORD)flat;
+        // COLORREF is 0x00BBGGRR but a 32bpp DIB pixel is 0x00RRGGBB:
+        // swap, or every non-grey tint lands with red and blue exchanged.
+        DWORD px = ((DWORD)GetRValue(flat) << 16) |
+                   ((DWORD)GetGValue(flat) << 8) | (DWORD)GetBValue(flat);
         int n = g_af_w * g_af_h;
         for (int i = 0; i < n; i++) g_af_bits[i] = px;
         g_af_key = flat;

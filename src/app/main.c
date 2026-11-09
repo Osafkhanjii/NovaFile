@@ -87,6 +87,7 @@ extern int  WINAPI SHGetPathFromIDListA(const void* pidl, char* path);
 #include "ui.h"
 #include "version.h"
 #include "update.h"
+#include "exr.h"        // OpenEXR thumbnails (Windows has no .exr codec)
 #include "../platform/shell_ole.h"   // native menu + drag-out
 
 #include <stdarg.h>
@@ -881,6 +882,7 @@ typedef enum {
     // tab strip (the reference app's right-click menu on a tab)
     CTX_CMD_TAB_SHIFT_L,
     CTX_CMD_TAB_SHIFT_R,
+    CTX_CMD_TAB_RENAME,
     CTX_CMD_TAB_DUP,
     CTX_CMD_TAB_DUP_WIN,
     CTX_CMD_TAB_CLOSE,
@@ -1000,9 +1002,13 @@ static void pane_free(Pane* p);
 // the current workspace ever mutates. Tab labels are DERIVED from the
 // active pane's path (ws_path), so there is no second copy to go stale.
 // ------------------------------------------------------------
+#define WS_NAME_MAX 64
 typedef struct {
     Pane* root;               // layout tree (one leaf when freshly made)
     Pane* active;             // active leaf (always inside root)
+    // The user's own tab label (Rename Tab / double-click the tab).  Empty
+    // = automatic: the label follows the folder as before (ws_title).
+    char name[WS_NAME_MAX];
 } Workspace;
 
 static Workspace g_ws[TAB_MAX];
@@ -3585,9 +3591,69 @@ static void rename_begin(DirEntry* e) {
     blur_fields();
 }
 
-static void rename_cancel(void) { g_rename_vi = -1; }
+// ---- the SAME inline editor renames a TOP TAB ----
+// g_rename_vi holds this sentinel (never a real view row) while a tab is
+// being renamed, so every guard that already reads "g_rename_vi >= 0" -
+// the keyboard owning the field, a click outside committing it, shortcuts
+// being blocked - covers the tab field too, with no second editor.
+#define RENAME_TAB_VI 0x3fffffff
+static int g_tab_ren = -1;                // workspace being renamed
+static void ws_title(int i, char* out, size_t cap);
+static void ws_auto_title(int i, char* out, size_t cap);
+
+static void tab_rename_begin(int i) {
+    if (i < 0 || i >= g_ws_n) return;
+    char t[256];
+    ws_title(i, t, sizeof t);
+    snprintf(g_rename_txt, sizeof(g_rename_txt), "%s", t);
+    g_rename_vi = RENAME_TAB_VI;
+    g_tab_ren = i;
+    g_rename_sel0 = 0;                    // whole label selected: typing
+    g_rename_sel1 = (int)strlen(g_rename_txt);   // replaces it
+    g_rename_caret = g_rename_sel1;
+    blur_fields();
+}
+
+// Cut a label to what fits a Workspace name slot, keeping whole UTF-8
+// characters (a byte cut through a character would draw as garbage).
+static void ws_name_clip(char* s) {
+    size_t n = strlen(s);
+    if (n < WS_NAME_MAX) return;
+    n = WS_NAME_MAX - 1;
+    while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) n--;
+    s[n] = '\0';
+}
+
+static void session_mark_dirty(void);
+static void tab_rename_commit(void) {
+    int i = g_tab_ren;
+    g_rename_vi = -1;
+    g_tab_ren = -1;
+    if (i < 0 || i >= g_ws_n) return;
+    // trim surrounding blanks
+    char* s = g_rename_txt;
+    while (*s == ' ' || *s == '\t') s++;
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t')) s[--n] = '\0';
+    ws_name_clip(s);
+    // Empty, or exactly the automatic label: back to automatic naming,
+    // so the tab follows its folder again.
+    char autot[256];
+    ws_auto_title(i, autot, sizeof autot);
+    if (!s[0] || strcmp(s, autot) == 0) {
+        if (g_ws[i].name[0]) set_status("Tab name reset");
+        g_ws[i].name[0] = '\0';
+    } else {
+        snprintf(g_ws[i].name, WS_NAME_MAX, "%s", s);
+        set_status("Tab renamed to %s", g_ws[i].name);
+    }
+    session_mark_dirty();
+}
+
+static void rename_cancel(void) { g_rename_vi = -1; g_tab_ren = -1; }
 
 static bool rename_commit(void) {
+    if (g_rename_vi == RENAME_TAB_VI) { tab_rename_commit(); return true; }
     if (g_rename_vi < 0) return false;
     if (g_rename_vi >= (int)g_app.view_count) { g_rename_vi = -1; return false; }
     int ei = g_app.view[g_rename_vi];
@@ -3958,7 +4024,17 @@ static void fit_text(const char* src, char* dst, size_t dst_size, int max_px,
 // the same naming logic the sidebar/breadcrumb use (path_name / This PC),
 // with home spelled "Home". Recomputed from ws_path() every frame, so it
 // follows the view as it navigates - there is no stored copy to go stale.
+// A name the user gave the tab wins over the derived one.
+static void ws_auto_title(int i, char* out, size_t cap);
 static void ws_title(int i, char* out, size_t cap) {
+    if (!out || cap == 0) return;
+    if (i >= 0 && i < g_ws_n && g_ws[i].name[0]) {
+        snprintf(out, cap, "%s", g_ws[i].name);
+        return;
+    }
+    ws_auto_title(i, out, cap);
+}
+static void ws_auto_title(int i, char* out, size_t cap) {
     if (!out || cap == 0) return;
     const char* p = ws_path(i);
     if (!p || !p[0]) { snprintf(out, cap, "Home"); return; }
@@ -4721,6 +4797,50 @@ static HDC thumb_dc(void) {
     return g_thumb_dc;
 }
 
+// OpenEXR frames (render / comp image sequences): Windows ships no .exr
+// codec, so the shell only ever answered with a blank file icon. NovaFile
+// decodes the frame itself (src/core/exr.c - pure C, every standard EXR
+// compression) into a 32-bit DIB with the image's own aspect; the drawing
+// code fits it into the cell like any shell thumbnail. Worker threads
+// only (a 4K frame takes ~0.15 s); the result is disk-cached like every
+// other thumbnail, so each frame is decoded once. NULL = not an EXR, or
+// one NovaFile cannot read (deep data, damaged file) - the caller then
+// falls back to the shell icon.
+// Transparent pixels are shown over BLACK, the way Nuke / DJV / RV show a
+// premultiplied EXR: additive elements (sparks, glows: alpha 0, colour
+// > 0) stay visible, and the bitmap never depends on the UI theme.
+static HBITMAP exr_thumb_bitmap(const char* path, int w, int h) {
+    if (!path || !exr_is_exr_name(path)) return NULL;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    // Same HD rule as the shell route below: XL cells get a 256px source
+    // that the scaler only ever shrinks.
+    if (w >= 96 && w < 256) { w = 256; h = 256; }
+    if (w > 1024) w = 1024;
+    if (h > 1024) h = 1024;
+    unsigned char* px = NULL;
+    int pw = 0, ph = 0;
+    if (!exr_preview_file(path, w, h, 0x000000u, &px, &pw, &ph)) return NULL;
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = pw;
+    bi.bmiHeader.biHeight = -ph;                 // top-down, like px
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = NULL;
+    HBITMAP dib = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (dib && bits) {
+        memcpy(bits, px, (size_t)pw * (size_t)ph * 4);
+    } else if (dib) {
+        DeleteObject(dib);
+        dib = NULL;
+    }
+    free(px);
+    return dib;
+}
+
 // Ask the shell for a thumbnail (or its icon if the item has no
 // thumbnail). Returns an HBITMAP the caller must NOT free (cached),
 // or NULL if the shell has nothing for this path.
@@ -4828,7 +4948,8 @@ static void tbmp_fetch(ThumbBmp* t, const char* path, int w, int h) {
         g_tbmp_budget = 0;
         return;                              // keep frame fast
     }
-    t->hbm = shell_thumb_bitmap(path, w, h);
+    t->hbm = exr_thumb_bitmap(path, w, h);   // NULL: not an EXR
+    if (!t->hbm) t->hbm = shell_thumb_bitmap(path, w, h);
     {
         static int nlog = 0;
         const char* base = strrchr(path, '\\');
@@ -5122,6 +5243,9 @@ static unsigned long long tc_hash(const char* s) {
     return h;
 }
 
+// An .exr key carries an "exr1" tag: it retires the blank shell icons
+// that older builds cached for EXR frames before NovaFile could decode
+// them (same path, size and mtime - the old id would hit forever).
 static unsigned long long tc_disk_id(const char* path, int w, int h) {
     if (!g_tc_dir_ok || !path || !path[0]) return 0;
     WIN32_FILE_ATTRIBUTE_DATA fa;
@@ -5131,7 +5255,10 @@ static unsigned long long tc_disk_id(const char* path, int w, int h) {
     unsigned long long sz = ((unsigned long long)fa.nFileSizeHigh << 32)
                             | fa.nFileSizeLow;
     char key[1184];
-    snprintf(key, sizeof(key), "%s|%d|%d|%llu|%llu", path, w, h, m, sz);
+    if (exr_is_exr_name(path))
+        snprintf(key, sizeof(key), "%s|%d|%d|%llu|%llu|exr1", path, w, h, m, sz);
+    else
+        snprintf(key, sizeof(key), "%s|%d|%d|%llu|%llu", path, w, h, m, sz);
     return tc_hash(key);
 }
 
@@ -5364,6 +5491,10 @@ static HBITMAP tc_decode_image(const char* path, int w, int h, int bg) {
 // correct, folders and videos too), then - only for real image files,
 // only for cells big enough to care - the OLE decoder.
 static HBITMAP tc_extract(const TcJob* j) {
+    // EXR first: the shell has no codec and would "succeed" with a blank
+    // icon. A file NovaFile cannot read still gets that shell icon.
+    HBITMAP ex = exr_thumb_bitmap(j->path, j->w, j->h);
+    if (ex) return ex;
     HBITMAP hbm = shell_thumb_bitmap(j->path, j->w, j->h);
     if (!hbm && j->w >= 48 && previewable(j->path))
         hbm = tc_decode_image(j->path, j->w, j->h, j->bg);
@@ -9943,16 +10074,16 @@ static void draw_split_nav(Pane* p, const Layout* base, const InputState* in) {
 
 // Which leaf pane's COLUMN contains x?  A pure-x lookup for the per-pane nav
 // row in the top bar (the nav band sits ABOVE the pane rects, so the caller
-// has already established y is in that band).  In a stacked (H) split the
-// drawn nav row belongs to the ACTIVE pane, so a hit in its column returns it.
+// has already established y is in that band).  Only TOP-ROW leaves own the
+// band - the same rule draw_split_nav() draws with - so a click always lands
+// on the pane whose controls are under the mouse.  A pane stacked below has
+// its own embedded strip; it must never steal a band click, even when it is
+// the active pane (that sent the top pane's Back press to the bottom pane).
 static Pane* nav_pane_at(Pane* p, int x) {
-    if (g_active_pane && g_active_pane->kind == PN_LEAF &&
-        x >= g_active_pane->rect.x &&
-        x < g_active_pane->rect.x + g_active_pane->rect.w)
-        return g_active_pane;
     if (!p) return NULL;
     if (p->kind == PN_LEAF)
-        return (x >= p->rect.x && x < p->rect.x + p->rect.w) ? p : NULL;
+        return (p->rect.w > 0 && p->rect.y <= SC(TOOLBAR_H) &&
+                x >= p->rect.x && x < p->rect.x + p->rect.w) ? p : NULL;
     Pane* r = nav_pane_at(p->left, x);
     return r ? r : nav_pane_at(p->right, x);
 }
@@ -10538,6 +10669,7 @@ static void ctx_icon(int cmd, int x, int y, int s, Color c) {
         vline(x + (s - SC(1)) / 2, y + SC(9), y + SC(12), c);
         break;
     case CTX_CMD_RENAME:               // pencil
+    case CTX_CMD_TAB_RENAME:
         line(x + SC(1), y + s - SC(1), x + s - SC(4), y + SC(2), c, 1.4f);
         line(x + SC(1), y + s - SC(1), x + SC(4), y + s - SC(2), c, 1.4f);
         line(x + SC(4), y + s - SC(4), x + SC(6), y + s - SC(6), c, 1.0f);
@@ -10932,6 +11064,54 @@ static void draw_rename_overlay(const Layout* L, const InputState* in) {
     (void)in;                   // the overlay is driven by g_rename_vi alone
     g_rename_rect = (RectI){0, 0, 0, 0};
     if (g_rename_vi < 0) return;
+    if (g_rename_vi == RENAME_TAB_VI) {
+        // ---- a TOP TAB's label field (L = the WINDOW layout) ----
+        int ti = g_tab_ren;
+        if (ti < 0 || ti >= g_ws_n || ti >= L->tab_drawn ||
+            L->tab_rects[ti].w <= 0) {
+            rename_cancel();          // tab gone / scrolled off: drop it
+            return;
+        }
+        const RectI* r = &L->tab_rects[ti];
+        int fh = r->h - SC(6);
+        if (fh > SC(22)) fh = SC(22);
+        // the icon stays visible on the left, the close cross on the right
+        RectI tr = {r->x + SC(22), r->y + (r->h - fh) / 2,
+                    r->w - SC(22) - SC(24), fh};
+        if (tr.w < SC(30)) tr.w = SC(30);
+        rrect(tr.x, tr.y, tr.w, tr.h, SC(3), P->field, P->accent, 1.0f);
+        int px = L->text_small;
+        const char* txt = g_rename_txt;
+        int pre = g_rename_sel0, post = g_rename_sel1;
+        if (pre > post) { int t = pre; pre = post; post = t; }
+        char a[512], b[512], c2[512], cc[512];
+        snprintf(a, sizeof a, "%.*s", pre, txt);
+        snprintf(b, sizeof b, "%.*s", post - pre, txt + pre);
+        snprintf(c2, sizeof c2, "%s", txt + post);
+        snprintf(cc, sizeof cc, "%.*s", g_rename_caret, txt);
+        int wa = (int)measure_px(a, px);
+        int wb = (int)measure_px(b, px);
+        int wc = (int)measure_px(cc, px);
+        // keep the caret in view: slide the text left once it runs past
+        int room = tr.w - SC(10);
+        int off = (wc > room) ? wc - room : 0;
+        int tx = tr.x + SC(5) - off;
+        int ty = tr.y + (tr.h - px) / 2;
+        g_rename_rect = tr;
+        g_rename_tx = tx;
+        g_rename_px = px;
+        renderer_set_scissor(g_app.renderer,
+                             (Rect){(float)(tr.x + 1), (float)tr.y,
+                                    (float)(tr.w - 2), (float)tr.h});
+        text_px(a, tx, ty, px, P->text);
+        fill(tx + wa, tr.y + SC(2), wb, tr.h - SC(4), P->accent);
+        text_px(b, tx + wa, ty, px, P->paper);
+        text_px(c2, tx + wa + wb, ty, px, P->text);
+        if (pre == post)
+            vline(tx + wc, tr.y + SC(3), tr.y + tr.h - SC(3), P->text);
+        renderer_reset_scissor(g_app.renderer);
+        return;
+    }
     if (g_rename_vi >= (int)g_app.view_count) { g_rename_vi = -1; return; }
     int ei = g_app.view[g_rename_vi];
     if (ei < 0 || (size_t)ei >= g_app.count) { g_rename_vi = -1; return; }
@@ -12786,6 +12966,7 @@ static RectI splitter_handle_rect(Pane* p);        // centered 3-dot grip
 static Pane* pane_at_point(Pane* p, int x, int y);
 static Pane* first_leaf(Pane* p);
 static Pane* pane_leaf_other(Pane* p, Pane* keep);
+static int  pane_leaves(Pane* p, Pane** out, int n, int max);
 static int  pane_count(Pane* p);
 static void compute_pane_tree_layout(Pane* p, RectI content);
 static void pane_list_metrics(Layout* L, RectI rect);
@@ -12874,7 +13055,8 @@ static void paint(void) {
     if (g_app.view_menu_open) draw_view_menu(&L, in);
     if (g_ctx_open) draw_ctx_menu(&L, in);
     if (g_xm_open) xm_draw(&L, in);    // the system context menu
-    if (g_rename_vi >= 0) {            // above the list, below the panels
+    if (g_rename_vi >= 0 && g_rename_vi != RENAME_TAB_VI) {
+        // above the list, below the panels
         // the field belongs to a row of the ACTIVE PANE: use that pane's
         // list metrics (the window layout put it one header too high)
         Layout RL;
@@ -15336,6 +15518,7 @@ static void ws_new(const char* path) {
     fresh->folder.zoom = g_zoom;         // a new tab keeps the current icon size
     g_ws[g_ws_n].root = fresh;
     g_ws[g_ws_n].active = fresh;
+    g_ws[g_ws_n].name[0] = '\0';      // a new tab is named automatically
     g_ws_last = g_ws_cur;             // remember where we came from
     g_ws_cur = g_ws_n;
     g_ws_n++;
@@ -15456,6 +15639,7 @@ static void ws_reset(void) {
     g_active_pane = fresh;
     g_ws[0].root = fresh;
     g_ws[0].active = fresh;
+    g_ws[0].name[0] = '\0';
     g_ws_cur = 0;
     g_ws_last = -1;
     app_push_folder(&fresh->folder);
@@ -16090,6 +16274,7 @@ static void ctx_build_tab(int idx) {
     ctx_add_h("Shift Tab Right", CTX_CMD_TAB_SHIFT_R, idx < last,
               h[0] ? h : NULL);
     ctx_add_sep();
+    ctx_add("Rename Tab", CTX_CMD_TAB_RENAME, true);
     ctx_add("Duplicate Tab", CTX_CMD_TAB_DUP, g_ws_n < TAB_MAX);
     ctx_add("Duplicate Tab To New Window", CTX_CMD_TAB_DUP_WIN, true);
     ctx_add_sep();
@@ -16574,6 +16759,9 @@ static void ctx_run(int cmd) {
     case CTX_CMD_TAB_SHIFT_R:
         tab_shift_idx(g_ctx_tab, 1);
         break;
+    case CTX_CMD_TAB_RENAME:
+        tab_rename_begin(g_ctx_tab);
+        break;
     case CTX_CMD_TAB_DUP: {
         int src = g_ctx_tab;
         if (src < 0 || src >= g_ws_n) break;
@@ -16586,6 +16774,7 @@ static void ctx_run(int cmd) {
         int before = g_ws_n;
         ws_new(p);                       // appends the copy, switches to it
         if (g_ws_n == before + 1) {
+            memcpy(g_ws[g_ws_cur].name, g_ws[src].name, WS_NAME_MAX);
             ws_reorder(g_ws_cur, src + 1);   // ... and parks it by its source
             set_status("Tab duplicated");
         }
@@ -19529,12 +19718,189 @@ static bool file_drag_tick(InputState* in) {
     return true;
 }
 
+// ---- MARQUEE (rubber-band) selection ------------------------------------
+// Pressing EMPTY list space - the background, or (Details / List) a row
+// beyond its name text - and dragging draws a box; every item it touches
+// is selected live.  Ctrl+drag toggles the touched items against the
+// selection that was there before (Explorer).  Dragging past the top or
+// bottom edge scrolls the list.  The anchor is stored in CONTENT space
+// (scroll included), so the box keeps its start point while it scrolls.
+static bool  g_mq_armed = false;      // pressed on empty space, button held
+static bool  g_mq_on = false;         // moved past the drag distance: live
+static Pane* g_mq_pane = NULL;        // the pane the box belongs to
+static int   g_mq_px = 0, g_mq_py = 0;     // press point (screen)
+static int   g_mq_ax = 0, g_mq_ay = 0;     // anchor (list x, content y)
+static int   g_mq_cx = 0, g_mq_cy = 0;     // moving corner (same space)
+static bool  g_mq_ctrl = false;
+static int   g_mq_base_sel = -1;
+static unsigned char g_mq_base[SEL_MAX];   // Ctrl: the set before the drag
+static DWORD g_mq_scroll_t = 0;
+
+static int mq_unit(const Layout* L) {
+    return mode_is_grid() ? L->cell_h : L->row_h;
+}
+static int mq_top(const Layout* L) {
+    return L->list.y + L->list_head_h + (mode_is_grid() ? L->pad_y : 0);
+}
+
+// Where a Details / List row's name text ends on screen (the press test
+// for "blank part of a row"); the SAME geometry draw_details() uses.
+static int row_name_right(const Layout* L, int vi) {
+    if (vi < 0 || (size_t)vi >= g_app.view_count) return L->list.x;
+    int ei = g_app.view[vi];
+    if (ei < 0 || (size_t)ei >= g_app.count) return L->list.x;
+    DirEntry* e = &g_app.entries[ei];
+    int isz = (int)(SC(16) * g_app.zoom + 0.5f);
+    if (isz < SC(10)) isz = SC(10);
+    if (isz > L->row_h - SC(4)) isz = L->row_h - SC(4);
+    int nx = L->list.x + SC(8) + isz + SC(4);
+    char name[512];
+    fit_text(e->name, name, sizeof(name), L->name_w - (isz + SC(18)),
+             L->text_h);
+    return nx + (int)measure_px(name, L->text_h);
+}
+
+static void mq_arm(const Layout* L, const InputState* in) {
+    if (!in->left_down) return;          // a box needs the button held
+    g_mq_armed = true;
+    g_mq_on = false;
+    g_mq_pane = g_active_pane;
+    g_mq_px = in->x;
+    g_mq_py = in->y;
+    g_mq_ax = g_mq_cx = in->x - L->list.x;
+    g_mq_ay = g_mq_cy = in->y - mq_top(L) + g_app.scroll * mq_unit(L);
+    g_mq_ctrl = in->ctrl_pressed;
+    g_mq_base_sel = g_app.selected;
+    memset(g_mq_base, 0, sizeof g_mq_base);
+    if (g_mq_ctrl)
+        for (int i = 0; i < g_sel_n; i++)
+            if (g_sel[i] >= 0 && g_sel[i] < SEL_MAX) g_mq_base[g_sel[i]] = 1;
+}
+
+// Rebuild the selection from the box: O(rows), no per-row search.
+static void mq_apply(const Layout* L) {
+    int x0 = g_mq_ax < g_mq_cx ? g_mq_ax : g_mq_cx;
+    int x1 = g_mq_ax < g_mq_cx ? g_mq_cx : g_mq_ax;
+    int y0 = g_mq_ay < g_mq_cy ? g_mq_ay : g_mq_cy;
+    int y1 = g_mq_ay < g_mq_cy ? g_mq_cy : g_mq_ay;
+    int n = (int)g_app.view_count;
+    if (n > SEL_MAX) n = SEL_MAX;
+    bool grid = mode_is_grid();
+    int u = mq_unit(L);
+    // rows: the box must reach the NAME column (the size / date columns
+    // are not part of an item, as in Explorer)
+    bool xrow = x1 >= SC(8) && x0 <= L->name_w + SC(20);
+    int r0 = (u > 0) ? (y0 < 0 ? 0 : y0 / u) : 0;
+    int r1 = (u > 0 && y1 >= 0) ? y1 / u : -1;
+    int in2 = SC(4);                       // a cell's empty margin
+    g_sel_n = 0;
+    int last = -1;                         // last touched row that is ON
+    bool base_on = false;                  // the old primary still selected
+    for (int vi = 0; vi < n; vi++) {
+        bool hit;
+        if (!grid) {
+            hit = xrow && vi >= r0 && vi <= r1;
+        } else {
+            int cols = L->cols > 0 ? L->cols : 1;
+            int r = vi / cols, c = vi % cols;
+            int cx0 = L->pad_x + c * L->cell_w + in2;
+            int cx1 = cx0 + L->cell_w - 2 * in2;
+            int cy0 = r * L->cell_h + in2;
+            int cy1 = cy0 + L->cell_h - 2 * in2;
+            hit = x1 >= cx0 && x0 <= cx1 && y1 >= cy0 && y0 <= cy1;
+        }
+        bool on = g_mq_ctrl ? ((g_mq_base[vi] != 0) != hit) : hit;
+        if (on) g_sel[g_sel_n++] = vi;
+        if (on && hit) last = vi;
+        if (on && vi == g_mq_base_sel) base_on = true;
+    }
+    // The primary is drawn selected, so it must be a row that IS selected:
+    // a Ctrl+box that toggles rows OFF must never leave one as primary.
+    if (last >= 0) g_app.selected = last;
+    else if (base_on) g_app.selected = g_mq_base_sel;
+    else g_app.selected = (g_sel_n > 0) ? g_sel[g_sel_n - 1] : -1;
+}
+
+// Per frame while the button is held after an empty-space press.  True =
+// the box owns this frame's mouse.  L = the ACTIVE pane's layout.
+static bool mq_tick(const Layout* L, InputState* in) {
+    if (!g_mq_armed) return false;
+    // focus moved, or a NEW press arrived (the old one's release was
+    // missed): drop the box and let this frame act normally
+    if (g_active_pane != g_mq_pane || in->left_click) {
+        g_mq_armed = g_mq_on = false;
+        return false;
+    }
+    if (!in->left_down) {                      // release: keep the set
+        bool was = g_mq_on;
+        g_mq_armed = g_mq_on = false;
+        return was;
+    }
+    if (!g_mq_on) {
+        int dx = in->x - g_mq_px, dy = in->y - g_mq_py;
+        if (dx < 0) dx = -dx;
+        if (dy < 0) dy = -dy;
+        int tx = GetSystemMetrics(SM_CXDRAG), ty = GetSystemMetrics(SM_CYDRAG);
+        if (tx < 4) tx = 4;
+        if (ty < 4) ty = 4;
+        if (dx <= tx && dy <= ty) return false;   // still just a click
+        g_mq_on = true;
+    }
+    // past the top / bottom edge: scroll one row every 40 ms
+    int body_y = L->list.y + L->list_head_h;
+    int bot = L->list.y + L->list.h;
+    DWORD now = GetTickCount();
+    if ((in->y < body_y || in->y >= bot) && now - g_mq_scroll_t >= 40) {
+        g_mq_scroll_t = now;
+        if (in->y < body_y && g_app.scroll > 0) g_app.scroll--;
+        else if (in->y >= bot && g_app.scroll < L->max_scroll) g_app.scroll++;
+    }
+    int lx = in->x - L->list.x;
+    if (lx < 0) lx = 0;
+    if (lx > L->list.w - 1) lx = L->list.w - 1;
+    int ly = in->y;
+    if (ly < body_y) ly = body_y;
+    if (ly > bot - 1) ly = bot - 1;
+    g_mq_cx = lx;
+    g_mq_cy = ly - mq_top(L) + g_app.scroll * mq_unit(L);
+    mq_apply(L);
+    return true;
+}
+
+// The box itself, drawn over the pane's list (inside its body scissor).
+static void draw_marquee(const Layout* L) {
+    int u = mq_unit(L);
+    int x0 = g_mq_ax < g_mq_cx ? g_mq_ax : g_mq_cx;
+    int x1 = g_mq_ax < g_mq_cx ? g_mq_cx : g_mq_ax;
+    int y0 = g_mq_ay < g_mq_cy ? g_mq_ay : g_mq_cy;
+    int y1 = g_mq_ay < g_mq_cy ? g_mq_cy : g_mq_ay;
+    int off = mq_top(L) - g_app.scroll * u;
+    int sx = L->list.x + x0, sy = y0 + off;
+    int w = x1 - x0, h = y1 - y0;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    Color fc = P->accent;
+    fc.a = 0.22f;
+    fill(sx, sy, w, h, fc);
+    // the border as four 1px fills (rrect with a clear fill paints the
+    // inside black: GDI brushes carry no alpha)
+    fill(sx, sy, w, 1, P->accent);
+    fill(sx, sy + h - 1, w, 1, P->accent);
+    fill(sx, sy, 1, h, P->accent);
+    fill(sx + w - 1, sy, 1, h, P->accent);
+}
+
 static void handle_mouse(const Layout* L, InputState* in) {
     // A close is pending (X just clicked): the window is inert for one
     // double-click interval so the trailing click of a double-click is
     // absorbed here instead of falling through to the window behind.
     if (g_close_pending) return;
     if (file_drag_tick(in)) return;       // a row press grew into a drag
+    if (g_mq_armed) {                     // empty-space press: the box
+        Layout ml;
+        pane_input_build(&ml, L);
+        if (mq_tick(&ml, in)) return;
+    }
     if (sb_drag_tick(in)) return;         // dragging the list scrollbar
     if (g_welcome_open) { welcome_mouse(in); return; }
     if (g_help_open) { help_mouse(in); return; }
@@ -20401,6 +20767,12 @@ static void handle_mouse(const Layout* L, InputState* in) {
             RectI xr = {cx - SC(3), cy - SC(3), SC(16), SC(16)};
             if (inside(&xr, in->x, in->y)) {
                 ws_close(tvi);
+            } else if (in->double_click) {
+                // double-click a tab's label = rename it in place (the
+                // first click of the pair already switched to it)
+                g_tab_armed = g_tab_drag = false;
+                g_drag_src = DRAG_NONE;
+                tab_rename_begin(tvi);
             } else {
                 // TAB_DRAG source: arm only. The view switches on RELEASE
                 // (see the tab gesture below) - switching on the press
@@ -20685,12 +21057,32 @@ static void handle_mouse(const Layout* L, InputState* in) {
                 }
                 return;
             }
+            // A plain press on the BLANK part of a Details / List row
+            // (right of its name text) selects the row like before, but a
+            // drag from there draws a selection box instead of dragging
+            // the file - Explorer's rule.
+            bool blank = (g_app.view_mode == MODE_DETAILS ||
+                          g_app.view_mode == MODE_LIST) &&
+                         !in->ctrl_pressed && !in->shift_pressed &&
+                         in->x > row_name_right(L, idx) + SC(8);
             // Multi-selection: Ctrl toggles the row, Shift takes the range
             // from the current anchor, a plain click makes it the only one.
-            if (in->ctrl_pressed) {
-                if (sel_contains(idx)) sel_remove(idx);
-                else sel_add(idx);
+            if (blank) {
+                sel_clear();
+                sel_add(idx);
                 g_app.selected = idx;
+            } else if (in->ctrl_pressed) {
+                // Ctrl+click toggles.  The primary row is always drawn as
+                // selected, so a row Ctrl+clicked OFF must stop being the
+                // primary too - otherwise it stayed blue (looked selected)
+                // although no operation would act on it any more.
+                if (sel_contains(idx)) {
+                    sel_remove(idx);
+                    g_app.selected = (g_sel_n > 0) ? g_sel[g_sel_n - 1] : -1;
+                } else {
+                    sel_add(idx);
+                    g_app.selected = idx;
+                }
             } else if (in->shift_pressed && g_app.selected >= 0) {
                 int a = g_app.selected, b = idx;
                 if (a > b) { int t = a; a = b; b = t; }
@@ -20707,7 +21099,9 @@ static void handle_mouse(const Layout* L, InputState* in) {
                 g_app.selected = idx;
             }
             // Arm the drag-out (any selected row may carry the selection).
-            if (!in->double_click) {
+            if (!in->double_click && blank) {
+                mq_arm(L, in);
+            } else if (!in->double_click) {
                 g_fdrag_armed = true;
                 g_fdrag_x = in->x;
                 g_fdrag_y = in->y;
@@ -20744,12 +21138,17 @@ static void handle_mouse(const Layout* L, InputState* in) {
         // plain click there must not keep a stale selection alive.
         // Header, scrollbar, sidebar and chrome return earlier and can
         // never reach this test.
+        // Ctrl keeps the selection (a Ctrl+drag adds to it); a press here
+        // also arms the selection box.
         if (idx < 0 &&
             in->x >= L->list.x && in->x < L->list.x + L->list.w &&
             in->y >= L->list.y + L->list_head_h &&
             in->y < L->list.y + L->list.h) {
-            sel_clear();
-            g_app.selected = -1;
+            if (!in->ctrl_pressed) {
+                sel_clear();
+                g_app.selected = -1;
+            }
+            if (!in->double_click) mq_arm(L, in);
         }
         return;
     }
@@ -21369,6 +21768,9 @@ static void session_save_now(void) {
         Pane* root = ws_root(i);
         int wn = 0, wsp = 0;   // per tab: mirrors one parser SESS_WS
         ok = root && fprintf(f, "tab\n") > 0 &&
+             // a user-given tab name rides right after its "tab" line
+             (!g_ws[i].name[0] ||
+              fprintf(f, "N %s\n", g_ws[i].name) > 0) &&
              session_write_tree(f, root, 0, &wn, &wsp);
     }
     int c = 0;
@@ -21509,6 +21911,7 @@ static bool session_restore(void) {
     SESS_WS sw;
     memset(&sw, 0, sizeof sw);
     memset(tmp, 0, sizeof tmp);
+    char pend_name[WS_NAME_MAX] = "";   // "N <name>" of the tab being read
     char line[1200];
     bool header = false;
 
@@ -21534,10 +21937,18 @@ static bool session_restore(void) {
                     continue;
                 }
                 tmp[tn].root = tmp[tn].active = sw.stack[0];
+                memcpy(tmp[tn].name, pend_name, WS_NAME_MAX);
                 tn++;
                 memset(&sw, 0, sizeof sw);
             }
+            pend_name[0] = '\0';
             any_tab = true;
+            continue;
+        }
+        if (line[0] == 'N' && line[1] == ' ') {   // the tab's own name
+            if (!any_tab || sw.sp != 0) { bad = true; break; }
+            ws_name_clip(line + 2);
+            snprintf(pend_name, sizeof pend_name, "%s", line + 2);
             continue;
         }
         if (truncated && line[0] != 'c' && line[0] != 'a') continue;
@@ -21573,7 +21984,11 @@ static bool session_restore(void) {
     fclose(f);
     if (!bad && sw.sp > 0) {                    // close the LAST tab
         if (sw.sp != 1 || tn >= TAB_MAX) bad = true;
-        else { tmp[tn].root = tmp[tn].active = sw.stack[0]; tn++; }
+        else {
+            tmp[tn].root = tmp[tn].active = sw.stack[0];
+            memcpy(tmp[tn].name, pend_name, WS_NAME_MAX);
+            tn++;
+        }
     }
     if (!bad && (!header || tn < 1 || (have_cur && cur < 0))) bad = true;
     if (bad || tn < 1) {                        // cleanup, state intact
@@ -22151,6 +22566,184 @@ static const char* st_shelf(void) {
         CreateDirectoryA(fol, NULL);
     }
     return p;
+}
+
+// ---- OpenEXR thumbnails: a hand-built 4x2 frame -------------------------
+// HALF pixels R = 1.0, G = 0.5, B = 0.0 must come out as sRGB (B,G,R) =
+// (0, 188, 255) through the uncompressed AND the RLE route (RLE also runs
+// the byte predictor + interleave every ZIP block shares). The full codec
+// matrix (ZIP, PIZ, PXR24, B44, DWAA, DWAB, tiled, multi-part) is checked
+// against the OpenEXR reference library outside the app.
+static void st_le32(unsigned char* p, unsigned v) {
+    p[0] = (unsigned char)v;
+    p[1] = (unsigned char)(v >> 8);
+    p[2] = (unsigned char)(v >> 16);
+    p[3] = (unsigned char)(v >> 24);
+}
+
+static size_t st_exr_attr(unsigned char* b, size_t n, const char* name,
+                          const char* type, const void* v, int sz) {
+    memcpy(b + n, name, strlen(name) + 1);
+    n += strlen(name) + 1;
+    memcpy(b + n, type, strlen(type) + 1);
+    n += strlen(type) + 1;
+    st_le32(b + n, (unsigned)sz);
+    n += 4;
+    memcpy(b + n, v, (size_t)sz);
+    return n + (size_t)sz;
+}
+
+// OpenEXR's RLE: a run of >= 3 equal bytes is (count-1, byte), anything
+// else a literal block (-count, bytes...).
+static size_t st_exr_rle(const unsigned char* in, size_t n, unsigned char* out) {
+    size_t i = 0, o = 0;
+    while (i < n) {
+        size_t r = 1;
+        while (i + r < n && in[i + r] == in[i] && r < 128) r++;
+        if (r >= 3) {
+            out[o++] = (unsigned char)(r - 1);
+            out[o++] = in[i];
+            i += r;
+            continue;
+        }
+        size_t s = i, len = 0;
+        while (i < n && len < 127) {
+            size_t rr = 1;
+            while (i + rr < n && in[i + rr] == in[i] && rr < 3) rr++;
+            if (rr >= 3) break;
+            i++;
+            len++;
+        }
+        out[o++] = (unsigned char)(-(int)len);
+        memcpy(out + o, in + s, len);
+        o += len;
+    }
+    return o;
+}
+
+// comp 0 = NONE, 1 = RLE. Returns the file size.
+static size_t st_exr_build(unsigned char* b, int comp) {
+    static const unsigned char magic[8] = {0x76, 0x2f, 0x31, 0x01, 2, 0, 0, 0};
+    size_t n = 0;
+    memcpy(b, magic, 8);
+    n = 8;
+    unsigned char ch[55];
+    size_t c = 0;
+    static const char nm[3] = {'B', 'G', 'R'};       // stored sorted
+    for (int k = 0; k < 3; k++) {
+        ch[c++] = (unsigned char)nm[k];
+        ch[c++] = 0;
+        st_le32(ch + c, 1);                          // HALF
+        st_le32(ch + c + 4, 0);                      // pLinear + reserved
+        st_le32(ch + c + 8, 1);                      // xSampling
+        st_le32(ch + c + 12, 1);                     // ySampling
+        c += 16;
+    }
+    ch[c++] = 0;
+    n = st_exr_attr(b, n, "channels", "chlist", ch, (int)c);
+    unsigned char cm = (unsigned char)comp, lo = 0;
+    n = st_exr_attr(b, n, "compression", "compression", &cm, 1);
+    unsigned char box[16];
+    st_le32(box, 0);
+    st_le32(box + 4, 0);
+    st_le32(box + 8, 3);
+    st_le32(box + 12, 1);
+    n = st_exr_attr(b, n, "dataWindow", "box2i", box, 16);
+    n = st_exr_attr(b, n, "displayWindow", "box2i", box, 16);
+    n = st_exr_attr(b, n, "lineOrder", "lineOrder", &lo, 1);
+    float par = 1.0f;
+    n = st_exr_attr(b, n, "pixelAspectRatio", "float", &par, 4);
+    b[n++] = 0;                                      // end of header
+    size_t tab = n;                                  // 2 chunks, 1 line each
+    n += 16;
+    for (int y = 0; y < 2; y++) {
+        unsigned char raw[24];                       // B x4, G x4, R x4
+        for (int x = 0; x < 4; x++) {
+            raw[2 * x] = 0x00;       raw[2 * x + 1] = 0x00;    // 0.0
+            raw[8 + 2 * x] = 0x00;   raw[8 + 2 * x + 1] = 0x38; // 0.5
+            raw[16 + 2 * x] = 0x00;  raw[16 + 2 * x + 1] = 0x3c; // 1.0
+        }
+        unsigned char data[64];
+        size_t dn = 24;
+        if (comp == 1) {
+            unsigned char t[24];
+            for (int i = 0; i < 24; i++)             // even bytes, then odd
+                t[i] = raw[i < 12 ? 2 * i : 2 * (i - 12) + 1];
+            int prev = t[0];
+            for (int i = 1; i < 24; i++) {           // forward predictor
+                int d = t[i] - prev + 128;
+                prev = t[i];
+                t[i] = (unsigned char)d;
+            }
+            dn = st_exr_rle(t, 24, data);
+        } else {
+            memcpy(data, raw, 24);
+        }
+        st_le32(b + tab + 8 * y, (unsigned)n);
+        st_le32(b + tab + 8 * y + 4, 0);
+        st_le32(b + n, (unsigned)y);
+        st_le32(b + n + 4, (unsigned)dn);
+        memcpy(b + n + 8, data, dn);
+        n += 8 + dn;
+    }
+    return n;
+}
+
+static void st_exr(void) {
+    printf("[selftest] EXR thumbnails...\n");
+    bool ok = true;
+    unsigned char buf[512];
+    for (int comp = 0; comp <= 1; comp++) {
+        size_t n = st_exr_build(buf, comp);
+        unsigned char* px = NULL;
+        int w = 0, h = 0, b0 = -1, g0 = -1, r0 = -1;
+        bool got = exr_preview_mem(buf, n, 64, 64, 0, &px, &w, &h);
+        if (got && px) {
+            b0 = px[0];
+            g0 = px[1];
+            r0 = px[2];
+        }
+        free(px);
+        bool good = got && w == 4 && h == 2 && b0 == 0 && g0 == 188 && r0 == 255;
+        // a truncated copy is refused - never read past its end
+        px = NULL;
+        bool cut = exr_preview_mem(buf, n / 2, 64, 64, 0, &px, &w, &h);
+        free(px);
+        printf("[selftest]   %s 4x2 -> bgr=%d,%d,%d truncated=%s -> %s\n",
+               comp ? "RLE " : "NONE", b0, g0, r0, cut ? "decoded" : "refused",
+               (good && !cut) ? "ok" : "FAILED");
+        if (!good || cut) ok = false;
+    }
+    // the worker route: a real .exr file -> tc_extract -> a 4x2 DIB, not
+    // the shell's blank icon
+    char tp[MAX_PATH], fp[MAX_PATH + 40];
+    DWORD tn = GetTempPathA((DWORD)sizeof(tp), tp);
+    int bw = -1, bh = -1;
+    if (tn > 0 && tn < sizeof(tp)) {
+        snprintf(fp, sizeof fp, "%sNovaFile_selftest.exr", tp);
+        size_t n = st_exr_build(buf, 1);
+        FILE* f = fopen(fp, "wb");
+        if (f) {
+            fwrite(buf, 1, n, f);
+            fclose(f);
+            TcJob j;
+            memset(&j, 0, sizeof(j));
+            snprintf(j.path, sizeof j.path, "%s", fp);
+            j.w = j.h = 64;
+            HBITMAP hb = tc_extract(&j);
+            BITMAP bm;
+            if (hb && GetObjectA(hb, (int)sizeof(bm), &bm)) {
+                bw = bm.bmWidth;
+                bh = bm.bmHeight;
+            }
+            if (hb) DeleteObject(hb);
+            DeleteFileA(fp);
+        }
+    }
+    printf("[selftest]   file -> worker bitmap %dx%d -> %s\n", bw, bh,
+           (bw == 4 && bh == 2) ? "ok" : "FAILED");
+    if (bw != 4 || bh != 2) ok = false;
+    if (!ok) printf("[selftest] FAIL: EXR thumbnails\n");
 }
 
 // ---- Explorer-parity checks (Unicode names, paste rules, undo, timers) --
@@ -24689,6 +25282,8 @@ static void run_selftest(void) {
         if (!ok) printf("[selftest] FAIL: box downscale average\n");
     }
 
+    st_exr();                                // OpenEXR thumbnails
+
     // Round 10: pressing back re-selects the folder we came OUT of
     printf("[selftest] back restores selection...\n");
     {
@@ -25747,6 +26342,8 @@ static void run_selftest(void) {
                   "the active pane splits in place", &fails);
         if (g_pane_root && g_pane_root->kind == PN_SPLIT_H)
             g_pane_root->ratio = 0.33f;
+        snprintf(g_ws[1].name, WS_NAME_MAX, "%s", "My Shots \xC3\xA9");
+        g_ws[0].name[0] = '\0';
         session_save_now();
         {
             FILE* tf = fopen(g_sess_file, "rb");
@@ -25766,6 +26363,16 @@ static void run_selftest(void) {
         st_expect(g_ws_n == 2, "both tabs come back", &fails);
         st_expect(strcmp(g_app.current_path, sub) == 0,
                   "the tab that was active is active again", &fails);
+        {
+            char t0[256], t1[256];
+            ws_title(0, t0, sizeof t0);
+            ws_title(1, t1, sizeof t1);
+            st_expect(g_ws[0].name[0] == '\0' &&
+                      strcmp(t1, "My Shots \xC3\xA9") == 0,
+                      "a renamed tab keeps its name, the other stays auto",
+                      &fails);
+            g_ws[1].name[0] = '\0';
+        }
         {
             Pane* r2 = NULL;
             for (int i = 0; i < g_ws_n; i++)
@@ -26540,6 +27147,355 @@ static void run_selftest(void) {
             if (ran && !ok)
                 printf("[selftest] FAIL: row-resize cursor / handle\n");
             if (!ran) printf("[selftest]   (no horizontal split: skipped)\n");
+        }
+
+        // ---- (G) stacked split: the TOP pane's Back button (drawn in the
+        //      window nav band) must act on the top pane even while the
+        //      BOTTOM pane is active - it used to go back in the bottom one.
+        {
+            Pane* root = g_pane_root;
+            bool ran = (root && root->kind == PN_SPLIT_H &&
+                        root->left->kind == PN_LEAF &&
+                        root->right->kind == PN_LEAF);
+            bool ok = false;
+            if (ran) {
+                Pane* top = root->left;
+                Pane* bot = root->right;
+                activate_pane(top);
+                load_dir("C:\\");
+                navigate("C:\\Windows", true);    // top: Back -> C:\ .
+                activate_pane(bot);
+                load_dir("C:\\");
+                navigate("C:\\Users", true);      // bottom: Back -> C:\ .
+                compute_layout(&M, w, h);
+                g_content = M.list;
+                compute_pane_tree_layout(g_pane_root, M.list);
+                Layout nb = M;
+                nav_row_metrics(&nb, top->rect.x, top->rect.w, nav_row_y());
+                RectI back = nb.nav_btns[0];
+                memset(&f, 0, sizeof f);
+                f.x = back.x + back.w / 2;
+                f.y = back.y + back.h / 2;
+                f.left_click = f.left_down = true;
+                handle_mouse(&M, &f);
+                f.left_click = f.left_down = false;
+                handle_mouse(&M, &f);
+                const char* top_path = (g_active_pane == top)
+                                     ? g_app.current_path
+                                     : top->folder.current_path;
+                ok = g_active_pane == top &&
+                     strcmp(top_path, "C:\\") == 0 &&
+                     strcmp(bot->folder.current_path, "C:\\Users") == 0;
+                if (!ok)
+                    printf("[selftest]   active=%s top='%s' bottom='%s'\n",
+                           g_active_pane == top ? "top" : "bottom",
+                           top_path, bot->folder.current_path);
+            }
+            printf("[selftest]   stacked split: top Back acts on top pane: %s\n",
+                   ok ? "ok" : (ran ? "FAILED" : "skipped"));
+            if (ran && !ok)
+                printf("[selftest] FAIL: nav band click routed to wrong pane\n");
+        }
+
+        // ---- (H) every pane's own Back button drives ONLY that pane, in a
+        //      mixed layout: two columns, the left one stacked three high
+        //      and the right one two high.  For each ordered pair (target,
+        //      other) with OTHER active, pressing TARGET's Back must move
+        //      TARGET and leave OTHER untouched - whether TARGET's nav row
+        //      sits in the window band (top row) or embedded in its region.
+        {
+            while (pane_count(g_pane_root) > 1) {
+                activate_pane(first_leaf(g_pane_root));
+                pane_close_active();
+            }
+            compute_layout(&M, w, h);
+            g_content = M.list;
+            compute_pane_tree_layout(g_pane_root, M.list);
+            Pane* first = g_active_pane;
+            pane_apply_drop(first, first, DZ_RIGHT);       // two columns
+            compute_pane_tree_layout(g_pane_root, M.list);
+            Pane* rcol = (g_pane_root && g_pane_root->kind == PN_SPLIT_V)
+                       ? g_pane_root->right : NULL;
+            if (rcol && rcol->kind == PN_LEAF) {
+                activate_pane(rcol);
+                pane_apply_drop(rcol, rcol, DZ_BOTTOM);    // right: 2 high
+                compute_pane_tree_layout(g_pane_root, M.list);
+            }
+            Pane* lcol = g_pane_root && g_pane_root->kind == PN_SPLIT_V
+                       ? g_pane_root->left : NULL;
+            if (lcol && lcol->kind == PN_LEAF) {
+                activate_pane(lcol);
+                pane_apply_drop(lcol, lcol, DZ_BOTTOM);    // left: 2 high
+                compute_pane_tree_layout(g_pane_root, M.list);
+                Pane* lb = (g_pane_root->left->kind == PN_SPLIT_H)
+                         ? g_pane_root->left->right : NULL;
+                if (lb && lb->kind == PN_LEAF) {
+                    activate_pane(lb);
+                    pane_apply_drop(lb, lb, DZ_BOTTOM);    // left: 3 high
+                    compute_pane_tree_layout(g_pane_root, M.list);
+                }
+            }
+            Pane* leaf[8];
+            int nl = pane_leaves(g_pane_root, leaf, 0, 8);
+            bool ran = (nl == 5);
+            int pairs = 0, good = 0;
+            for (int ti = 0; ran && ti < nl; ti++) {
+                for (int oi = 0; oi < nl; oi++) {
+                    if (oi == ti) continue;
+                    Pane* T = leaf[ti];
+                    Pane* O = leaf[oi];
+                    activate_pane(T);
+                    load_dir("C:\\");
+                    navigate("C:\\Windows", true);
+                    activate_pane(O);
+                    load_dir("C:\\");
+                    navigate("C:\\Users", true);
+                    compute_layout(&M, w, h);
+                    g_content = M.list;
+                    compute_pane_tree_layout(g_pane_root, M.list);
+                    int navy = (T->rect.y <= SC(TOOLBAR_H))
+                             ? nav_row_y()
+                             : T->rect.y + (nav_row_y() - SC(TAB_H));
+                    Layout nb = M;
+                    nav_row_metrics(&nb, T->rect.x, T->rect.w, navy);
+                    RectI back = nb.nav_btns[0];
+                    memset(&f, 0, sizeof f);
+                    f.x = back.x + back.w / 2;
+                    f.y = back.y + back.h / 2;
+                    f.left_click = f.left_down = true;
+                    handle_mouse(&M, &f);
+                    f.left_click = f.left_down = false;
+                    handle_mouse(&M, &f);
+                    activate_pane(O);                 // sync T out
+                    activate_pane(T);                 // sync O out
+                    bool pass = strcmp(g_app.current_path, "C:\\") == 0 &&
+                                strcmp(O->folder.current_path,
+                                       "C:\\Users") == 0;
+                    pairs++;
+                    if (pass) good++;
+                    else
+                        printf("[selftest]   pane %d Back with pane %d "
+                               "active: %d='%s' %d='%s'\n", ti, oi, ti,
+                               g_app.current_path, oi,
+                               O->folder.current_path);
+                }
+            }
+            bool ok = ran && good == pairs;
+            printf("[selftest]   5-pane layout: own Back per pane %d/%d: %s\n",
+                   good, pairs, ok ? "ok" : (ran ? "FAILED" : "skipped"));
+            if (ran && !ok)
+                printf("[selftest] FAIL: a pane's Back moved another pane\n");
+            if (!ran) printf("[selftest]   (5-pane layout not built: %d)\n", nl);
+        }
+
+        // ---- (I) marquee: drag a box from empty space -> live multi-select
+        {
+            while (pane_count(g_pane_root) > 1) {
+                activate_pane(first_leaf(g_pane_root));
+                pane_close_active();
+            }
+            char td[MAX_PATH + 32];
+            GetTempPathA(MAX_PATH, td);
+            strcat(td, "nova_mq_selftest");
+            CreateDirectoryA(td, NULL);
+            for (int k = 0; k < 6; k++) {
+                char fp[MAX_PATH + 64];
+                snprintf(fp, sizeof fp, "%s\\a%d.txt", td, k);
+                FILE* tf = fopen(fp, "wb");
+                if (tf) { fputs("x", tf); fclose(tf); }
+            }
+            load_dir(td);
+            set_view_mode(MODE_DETAILS, false);
+            g_app.scroll = 0;
+            sel_clear();
+            g_app.selected = -1;
+            compute_layout(&M, w, h);
+            g_content = M.list;
+            Layout PL;
+            pane_input_build(&PL, &M);
+            int top = PL.list.y + PL.list_head_h, rh = PL.row_h;
+            bool ran = g_app.view_count == 6 &&
+                       top + 8 * rh < PL.list.y + PL.list.h;
+            int mfails = 0, mchecks = 0;
+            #define MQ_EXPECT(c, what) do { mchecks++; if (!(c)) { mfails++; \
+                printf("[selftest]   marquee FAILED: %s\n", what); } } while (0)
+            #define MQ_DRAG(x0, y0, x1, y1, ctrl) do {                       \
+                memset(&f, 0, sizeof f);                                    \
+                f.ctrl_pressed = (ctrl);                                    \
+                f.x = (x0); f.y = (y0);                                     \
+                f.left_click = f.left_down = true;                          \
+                handle_mouse(&M, &f);                                       \
+                f.left_click = false;                                       \
+                f.x = ((x0) + (x1)) / 2; f.y = ((y0) + (y1)) / 2;           \
+                handle_mouse(&M, &f);                                       \
+                f.x = (x1); f.y = (y1);                                     \
+                handle_mouse(&M, &f);                                       \
+                f.left_down = false;                                        \
+                handle_mouse(&M, &f);                                       \
+            } while (0)
+            if (ran) {
+                int ex = PL.list.x + SC(30);
+                // 1) empty space below the rows, up to row 1 -> rows 1..5
+                MQ_DRAG(ex, top + 7 * rh + rh / 2, ex, top + rh + rh / 2, false);
+                bool all = g_sel_n == 5;
+                for (int k = 1; k <= 5; k++) all = all && sel_contains(k);
+                MQ_EXPECT(all && !sel_contains(0),
+                          "box from empty space selects the rows it touches");
+                MQ_EXPECT(!g_mq_armed && !g_mq_on && !g_fdrag_armed,
+                          "release ends the box, no file drag");
+                // 2) a plain click on empty space clears it again
+                MQ_DRAG(ex, top + 7 * rh, ex, top + 7 * rh, false);
+                MQ_EXPECT(g_sel_n == 0 && g_app.selected == -1,
+                          "click on empty space deselects");
+                // 3) Ctrl+drag adds to (toggles against) the selection
+                sel_clear(); sel_add(0); g_app.selected = 0;
+                MQ_DRAG(ex, top + 7 * rh, ex, top + 4 * rh + rh / 2, true);
+                MQ_EXPECT(g_sel_n == 3 && sel_contains(0) && sel_contains(4) &&
+                              sel_contains(5),
+                          "Ctrl+box keeps the old selection");
+                // 3b) Ctrl+click a selected row = it is DESELECTED and no
+                //     longer drawn selected (it used to stay the blue primary)
+                int r4y = top + 4 * rh + rh / 2;
+                MQ_DRAG(ex, r4y, ex, r4y, true);
+                MQ_EXPECT(g_sel_n == 2 && !sel_contains(4) &&
+                              g_app.selected != 4,
+                          "Ctrl+click deselects the row (not drawn selected)");
+                MQ_DRAG(ex, r4y, ex, r4y, true);
+                MQ_EXPECT(g_sel_n == 3 && sel_contains(4) &&
+                              g_app.selected == 4,
+                          "Ctrl+click selects it again");
+                // 3c) a Ctrl+box over a selected row toggles it off too
+                MQ_DRAG(ex, top + 7 * rh, ex, top + 5 * rh + rh / 2, true);
+                MQ_EXPECT(g_sel_n == 2 && !sel_contains(5) &&
+                              g_app.selected != 5,
+                          "Ctrl+box deselects a selected row");
+                // 3d) Ctrl+click every row off = nothing drawn selected
+                MQ_DRAG(ex, top + rh / 2, ex, top + rh / 2, true);
+                MQ_DRAG(ex, r4y, ex, r4y, true);
+                MQ_EXPECT(g_sel_n == 0 && g_app.selected == -1,
+                          "Ctrl+click the last one off = empty selection");
+                // 4) the blank part of a row starts a box, not a file drag
+                int bx = PL.list.x + PL.name_w;
+                if (bx > row_name_right(&PL, 0) + SC(10)) {
+                    MQ_DRAG(bx, top + rh / 2, bx, top + 2 * rh + rh / 2, false);
+                    MQ_EXPECT(g_sel_n == 3 && sel_contains(0) &&
+                                  sel_contains(1) && sel_contains(2) &&
+                                  !g_fdrag_armed,
+                              "drag from a row's blank part = box");
+                }
+                // 5) Icons view: the box hits cells, not rows
+                set_view_mode(MODE_ICONS, false);
+                g_app.scroll = 0;
+                compute_layout(&M, w, h);
+                g_content = M.list;
+                pane_input_build(&PL, &M);
+                int gt = PL.list.y + PL.list_head_h + PL.pad_y;
+                if (PL.cols >= 6 && gt + 2 * PL.cell_h < PL.list.y + PL.list.h) {
+                    int gx = PL.list.x + PL.pad_x;
+                    MQ_DRAG(gx + SC(2), gt + PL.cell_h + PL.cell_h / 2,
+                            gx + 2 * PL.cell_w + PL.cell_w / 2,
+                            gt + PL.cell_h / 2, false);
+                    MQ_EXPECT(g_sel_n == 3 && sel_contains(0) &&
+                                  sel_contains(1) && sel_contains(2),
+                              "Icons view: box selects the cells it touches");
+                }
+                set_view_mode(MODE_DETAILS, false);
+            }
+            #undef MQ_DRAG
+            #undef MQ_EXPECT
+            printf("[selftest]   marquee selection %d/%d: %s\n",
+                   mchecks - mfails, mchecks,
+                   ran ? (mfails ? "FAILED" : "ok") : "skipped");
+            if (ran && mfails) printf("[selftest] FAIL: marquee selection\n");
+            sel_clear();
+            g_app.selected = -1;
+            load_dir(platform_get_home_directory());
+            for (int k = 0; k < 6; k++) {
+                char fp[MAX_PATH + 64];
+                snprintf(fp, sizeof fp, "%s\\a%d.txt", td, k);
+                DeleteFileA(fp);
+            }
+            RemoveDirectoryA(td);
+        }
+
+        // ---- (J) tab rename: double-click / menu, Enter, Escape, reset
+        {
+            int tf = 0, tc = 0;
+            #define TR_EXPECT(c, what) do { tc++; if (!(c)) { tf++; \
+                printf("[selftest]   tab rename FAILED: %s\n", what); } } while (0)
+            while (g_ws_n > 1) ws_close(g_ws_n - 1);
+            ws_new(platform_get_home_directory());
+            ws_switch(0);
+            compute_layout(&M, w, h);
+            g_content = M.list;
+            bool ran = g_ws_n == 2 && M.tab_drawn >= 2 && M.tab_rects[0].w > 0;
+            if (ran) {
+                RectI tr = M.tab_rects[0];
+                char autot[256], t[256];
+                ws_title(0, autot, sizeof autot);
+                memset(&f, 0, sizeof f);
+                f.x = tr.x + tr.w / 3;
+                f.y = tr.y + tr.h / 2;
+                f.left_click = f.left_down = f.double_click = true;
+                handle_mouse(&M, &f);
+                f.left_click = f.left_down = f.double_click = false;
+                handle_mouse(&M, &f);
+                TR_EXPECT(g_rename_vi == RENAME_TAB_VI && g_tab_ren == 0 &&
+                              strcmp(g_rename_txt, autot) == 0,
+                          "double-click opens the tab's name field");
+                snprintf(g_rename_txt, sizeof g_rename_txt, "  Renders  ");
+                memset(&f, 0, sizeof f);
+                f.key_code = VK_RETURN;
+                st_input(&M, &f);
+                ws_title(0, t, sizeof t);
+                TR_EXPECT(g_rename_vi < 0 && strcmp(t, "Renders") == 0,
+                          "Enter saves the trimmed name");
+                ws_title(1, t, sizeof t);
+                TR_EXPECT(g_ws[1].name[0] == '\0', "other tab untouched");
+                // the name survives navigation (it no longer follows the folder)
+                load_dir("C:\\");
+                ws_title(0, t, sizeof t);
+                TR_EXPECT(strcmp(t, "Renders") == 0, "name stays on navigation");
+                // menu row opens the same field; Escape keeps the old name
+                ctx_open_tab(0, tr.x + 5, tr.y + 5);
+                ctx_run(CTX_CMD_TAB_RENAME);
+                g_ctx_open = false;
+                TR_EXPECT(g_rename_vi == RENAME_TAB_VI &&
+                              strcmp(g_rename_txt, "Renders") == 0,
+                          "Rename Tab menu row opens the field");
+                snprintf(g_rename_txt, sizeof g_rename_txt, "Nope");
+                memset(&f, 0, sizeof f);
+                f.key_code = VK_ESCAPE;
+                st_input(&M, &f);
+                ws_title(0, t, sizeof t);
+                TR_EXPECT(g_rename_vi < 0 && strcmp(t, "Renders") == 0,
+                          "Escape cancels");
+                // an empty name goes back to the automatic folder name
+                tab_rename_begin(0);
+                g_rename_txt[0] = '\0';
+                memset(&f, 0, sizeof f);
+                f.key_code = VK_RETURN;
+                st_input(&M, &f);
+                ws_title(0, t, sizeof t);
+                TR_EXPECT(g_ws[0].name[0] == '\0' &&
+                              strcmp(t, path_name("C:\\")) == 0,
+                          "empty name = automatic again");
+                // a long UTF-8 label is cut on a character boundary
+                tab_rename_begin(0);
+                char lng[200] = "";
+                for (int k = 0; k < 40; k++) strcat(lng, "\xC3\xA9");  // 80 B
+                snprintf(g_rename_txt, sizeof g_rename_txt, "%s", lng);
+                rename_commit();
+                size_t nl2 = strlen(g_ws[0].name);
+                TR_EXPECT(nl2 == 62, "long UTF-8 name clipped on a char edge");
+                g_ws[0].name[0] = '\0';
+                load_dir(platform_get_home_directory());
+            }
+            #undef TR_EXPECT
+            printf("[selftest]   tab rename %d/%d: %s\n", tc - tf, tc,
+                   ran ? (tf ? "FAILED" : "ok") : "skipped");
+            if (ran && tf) printf("[selftest] FAIL: tab rename\n");
+            while (g_ws_n > 1) ws_close(g_ws_n - 1);
         }
 
         // ---- restore the state everything after this expects ----
@@ -31215,6 +32171,15 @@ static Pane* pane_leaf_other(Pane* p, Pane* keep) {
     return l ? l : pane_leaf_other(p->right, keep);
 }
 
+// Every leaf of the tree, in left-to-right / top-to-bottom order, appended
+// to out[n..max).  Returns the new count.
+static int pane_leaves(Pane* p, Pane** out, int n, int max) {
+    if (!p || n >= max) return n;
+    if (p->kind == PN_LEAF) { out[n++] = p; return n; }
+    n = pane_leaves(p->left, out, n, max);
+    return pane_leaves(p->right, out, n, max);
+}
+
 // Context menu "Open in New Pane": split the active pane to the right and
 // show the requested folder in the NEW pane, leaving the pane it came
 // from exactly as it was. One workspace, two panes - never a second OS
@@ -31622,6 +32587,7 @@ static void render_pane_view(Pane* p, const Layout* win) {
     } else {
         draw_details(&L, in);
     }
+    if (g_mq_on && p == g_mq_pane) draw_marquee(&L);   // selection box
     renderer_reset_scissor(g_app.renderer);
     draw_scrollbar(&L);
 

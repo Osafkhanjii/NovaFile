@@ -41,6 +41,7 @@ echo.
     %RESOBJ% ^
     src\core\memory.c ^
     src\core\indexer.c ^
+    src\core\exr.c ^
     src\platform\window_win.c ^
     src\platform\shell_ole.c ^
     src\renderer\renderer_gl.c ^

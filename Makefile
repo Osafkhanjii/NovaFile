@@ -13,6 +13,7 @@ BUILD_DIR = build
 SOURCES = \
     $(SRC_DIR)/core/memory.c \
     $(SRC_DIR)/core/indexer.c \
+    $(SRC_DIR)/core/exr.c \
     $(SRC_DIR)/platform/window_win.c \
     $(SRC_DIR)/platform/shell_ole.c \
     $(SRC_DIR)/renderer/renderer_gl.c \

@@ -259,6 +259,7 @@ is in this repository. Output: `build\NovaFile.exe` (~955 KB).
 | Ctrl+Q or Esc              | Exit (Esc first leaves a field or closes a menu/popup) |
 | Alt+Left / Alt+Right       | Back / Forward (also the mouse side buttons) |
 | Alt+Up                     | Parent folder                   |
+| Hold Alt + move the mouse  | Left = Back, right = Forward, up = one folder up |
 | Alt+Enter                  | Properties                      |
 | Alt+D                      | Address bar                     |
 | Shift+Delete               | Delete permanently (skips the Recycle Bin) |
@@ -321,7 +322,7 @@ store through the `NOVA_SETTINGS_FILE` environment variable).
 **What persists:** every rebindable shortcut together with its
 enable/disable switch (rename, delete, copy/cut/paste, split, close
 pane, Quick Access wheel, exit, ...) and the feature options -
-thumbnails, Alt corner gesture, the wheel, fast icon preloading and
+thumbnails, Alt + mouse gesture, the wheel, fast icon preloading and
 the four search options (case-sensitive, broad/substring, word-start,
 highlight).
 

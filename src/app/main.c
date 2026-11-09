@@ -1735,13 +1735,13 @@ static SetEnt g_ents[CMD_COUNT] = {
         .cat=SCAT_THUMBS, .kind=EK_DOC },
 
     // ---- Mouse and Pointer Gestures ----
-    [CMD_ALTGEST] = { .id="alt_gesture", .name="Alt + corner Back / Forward",
-        .desc="Hold Alt and push into a top corner: left = Back, right = Forward.",
-        .how="The overlay appears only after the pointer crosses a corner; releasing Alt cancels.",
+    [CMD_ALTGEST] = { .id="alt_gesture", .name="Alt + mouse: Back / Forward / Up",
+        .desc="Hold Alt and move the mouse: left = Back, right = Forward, up = one folder up.",
+        .how="Up works from any folder, visited or not. Small moves (Alt+Tab) do nothing; releasing Alt cancels.",
         .cat=SCAT_GESTURES, .kind=EK_OPTION,
         .has_sw=true, .var=&g_opt_alt_gest, .dval=true },
     [CMD_GESTDOC] = { .id="gestures_doc", .name="Gesture safety",
-        .desc="The corner gesture never starts during a selection, a drag or a resize.",
+        .desc="The Alt gesture never starts during a selection, a drag or a resize.",
         .how="It also stays out of every menu, panel and text field - nothing is stolen.",
         .cat=SCAT_GESTURES, .kind=EK_DOC },
 
@@ -7469,47 +7469,44 @@ static float g_rad_hi[FAV_MAX];      // per-slot highlight easing, 0..1
 static Color mixc(Color a, Color b, float t);
 
 // ------------------------------------------------------------
-// Alt + corner gesture: Back / Forward without touching the bar
+// Alt + mouse gesture: Back / Forward / Up without touching the bar
 // ------------------------------------------------------------
 // Alt is a MODIFIER, so nothing at all happens unless it is held: with
 // Alt up the mouse behaves exactly as it always has.  While Alt is down
-// the pointer is watched relative to where Alt was pressed, and a short
-// deliberate move toward a corner fires the SAME go_back() / go_forward()
-// the toolbar buttons call - never a second history, and never more than
-// one navigation per Alt press.
-//   ↖ top-left     -> Forward   (only if forward history exists)
-//   ↙ bottom-left  -> Back      (only if back history exists)
-// Every other direction (straight lines, the right-hand corners) is
-// ignored, and the cursor never has to reach the screen edge.
-// The two actions live in fixed ANGULAR sectors around the point where
-// Alt was pressed - never around the screen edges.  Screen coords have
-// +y DOWN, so the angle is read as atan2(-dy, dx) to get a Y-up value:
+// the pointer is watched relative to where Alt was pressed, and a
+// deliberate move in one of three directions fires the SAME function the
+// toolbar buttons call - never a second history:
+//   <- left   -> Back      (only if back history exists)
+//   -> right  -> Forward   (only if forward history exists)
+//   ^  up     -> Up one folder: the PARENT folder - it works from any
+//                folder, visited or not (no history needed)
+// Moving down does nothing.  The three arrows sit well away from the
+// point where Alt was pressed (DEAD_ZONE_RADIUS): Alt+Tab, Alt+F4 and
+// the small drift of a hand resting on the mouse never reach them.
+// The directions are 90-degree ANGULAR sectors around that point.  Screen
+// coords have +y DOWN, so the angle is read as atan2(-dy, dx) (Y-up):
 //   0 = right, 90 = up, 180 = left, 270 = down.
-//   ↗ Forward = upper-right  -> center 45°
-//   ↙ Back    = lower-left   -> center 225°
 // Every value is a constant so the feel can be tuned in one place.
-#define FORWARD_CENTER_ANGLE  45.0f    // ↗ upper-right diagonal
-#define FORWARD_SECTOR_SIZE    90.0f    // the FULL upper-right quadrant
-                                        // (0..90 deg): every sweep that goes
-                                        // right+up counts as Forward - the
-                                        // gesture can never disagree with the
-                                        // toolbar's enabled Forward button
-#define BACK_CENTER_ANGLE     225.0f    // ↙ lower-left diagonal
-#define BACK_SECTOR_SIZE       90.0f    // the FULL lower-left quadrant
-                                        // (180..270 deg): left+down = Back
-#define DEAD_ZONE_RADIUS       12       // design px: closer = no selection
+#define FORWARD_CENTER_ANGLE    0.0f    // -> right
+#define FORWARD_SECTOR_SIZE    90.0f
+#define UP_CENTER_ANGLE        90.0f    // ^  up
+#define UP_SECTOR_SIZE         90.0f
+#define BACK_CENTER_ANGLE     180.0f    // <- left
+#define BACK_SECTOR_SIZE       90.0f
+#define DEAD_ZONE_RADIUS       70       // design px: closer = nothing at all
 #define GESTURE_FLASH         12       // confirmation frames after a trigger
 #define GESTURE_COOL          10       // frames between two sector triggers
 
 static bool g_gest_alt = false;           // Alt is down, gesture armed
 static int  g_gest_sx = 0, g_gest_sy = 0; // pointer when Alt was pressed
-static int  g_gest_dir = 0;               // 0 none, 1 forward (↗), 2 back (↙)
+static int  g_gest_dir = 0;               // 0 none, 1 forward, 2 back, 3 up
 static int  g_gest_last = 0;              // sector the pointer was in last
                                            // frame (0 = outside / re-armed)
 static int  g_gest_cool = 0;              // cooldown before the next trigger
 static int  g_gest_flash = 0;             // confirmation animation timer
 
 static bool angle_in_sector(double ang, double center, double size);
+static void go_up(void);                  // ^ Up one folder (defined below)
 
 // The whole wheel for a window of w x h around the pointer (mx, my):
 // item size from the smaller window edge, ring from the item size, and
@@ -7773,9 +7770,11 @@ static void compute_crumbs(Layout* L, const char* path) {
                     len = (int)sizeof(g_crumb_label[0]) - 1;
                 memcpy(g_crumb_label[li], rest + cstart, (size_t)len);
                 g_crumb_label[li][len] = '\0';
-                if (i < rlen) {           // boundary: keep the backslash
+                if (i < rlen) {           // a folder above the current one
+                    // (no trailing backslash: "...\Demo\" made the tab and
+                    //  Recents show the whole path instead of "Demo")
                     snprintf(g_crumb_path[li], sizeof(g_crumb_path[li]),
-                             "%.*s\\%.*s", (int)dl, cp, i + 1, rest);
+                             "%.*s\\%.*s", (int)dl, cp, i, rest);
                 } else {
                     snprintf(g_crumb_path[li], sizeof(g_crumb_path[li]),
                              "%s", cp);
@@ -7801,9 +7800,15 @@ static void compute_crumbs(Layout* L, const char* path) {
                     len = (int)sizeof(g_crumb_label[0]) - 1;
                 memcpy(g_crumb_label[li], cp + cstart, (size_t)len);
                 g_crumb_label[li][len] = '\0';
-                if (i < plen) {           // boundary: keep the backslash
-                    memcpy(g_crumb_path[li], cp, (size_t)(i + 1));
-                    g_crumb_path[li][i + 1] = '\0';
+                if (i < plen) {           // a folder above the current one
+                    // Keep the backslash ONLY for a drive root ("D:\" - a
+                    // bare "D:" means that drive's current directory). A
+                    // folder segment without it: "...\Demo\" made the tab
+                    // and Recents show the whole path instead of "Demo".
+                    bool drive = (len == 2 && cp[cstart + 1] == ':');
+                    int keep = drive ? i + 1 : i;
+                    memcpy(g_crumb_path[li], cp, (size_t)keep);
+                    g_crumb_path[li][keep] = '\0';
                 } else {
                     snprintf(g_crumb_path[li], sizeof(g_crumb_path[li]),
                              "%s", cp);
@@ -13094,23 +13099,42 @@ static void draw_gesture_overlay(const Layout* L) {
     rrect(cx - SC(4), cy - SC(4), SC(8), SC(8), SC(4),
           P->border, P->border, 0.0f);
 
-    // The two sector pills, placed on their angles around the centre.
-    // Screen y is DOWN, so a Y-up angle a maps to (cos a, -sin a).
-    int r = SC(58);
-    double fa = FORWARD_CENTER_ANGLE * RAD_PI / 180.0;
-    double ba = BACK_CENTER_ANGLE * RAD_PI / 180.0;
-    int fpx = cx + (int)(cos(fa) * r + 0.5);
-    int fpy = cy - (int)(sin(fa) * r + 0.5);
-    int bpx = cx + (int)(cos(ba) * r + 0.5);
-    int bpy = cy - (int)(sin(ba) * r + 0.5);
+    // A faint ring: the dead zone - inside it nothing can fire, so a
+    // brief Alt (Alt+Tab, Alt+F4) never navigates anywhere.
+    {
+        // drawn as short segments: a clear-filled rrect paints its inside
+        // black (GDI brushes carry no alpha)
+        int dz = SC(DEAD_ZONE_RADIUS);
+        Color rc = mixc(P->paper, P->border, 0.8f);
+        const int segs = 48;
+        for (int k = 0; k < segs; k++) {
+            double a0 = k * 2.0 * RAD_PI / segs, a1 = (k + 1) * 2.0 * RAD_PI / segs;
+            line(cx + (int)(cos(a0) * dz), cy + (int)(sin(a0) * dz),
+                 cx + (int)(cos(a1) * dz), cy + (int)(sin(a1) * dz), rc, 1.0f);
+        }
+    }
 
-    for (int s = 1; s <= 2; s++) {
-        bool fwd = (s == 1);
-        int px0 = fwd ? fpx : bpx;
-        int py0 = fwd ? fpy : bpy;
-        bool sel = (g_gest_dir == s);
+    // The three direction pills, just outside the dead zone, placed on
+    // their angles: <- Back (left), -> Forward (right), ^ Up (top).
+    int r = SC(DEAD_ZONE_RADIUS) + SC(46);
+    static const struct { int dir; float ang; const char* label; } PILL[3] = {
+        {1, FORWARD_CENTER_ANGLE, "Forward"},
+        {2, BACK_CENTER_ANGLE, "Back"},
+        {3, UP_CENTER_ANGLE, "Up one folder"},
+    };
+    for (int s = 0; s < 3; s++) {
+        int dir = PILL[s].dir;
+        double a = PILL[s].ang * RAD_PI / 180.0;
+        int px0 = cx + (int)(cos(a) * r + 0.5);
+        int py0 = cy - (int)(sin(a) * r + 0.5);
+        bool sel = (g_gest_dir == dir);
         bool hot = fired && sel;
-        int pw = SC(96), ph = SC(30);
+        // greyed when that direction has nowhere to go
+        bool can = dir == 1 ? g_app.fwd_count > 0
+                 : dir == 2 ? g_app.history_count > 0
+                 : !is_this_pc(g_app.current_path);
+        int tw = (int)measure_px(PILL[s].label, L->text_small);
+        int pw = tw + SC(42), ph = SC(30);
         int px = px0 - pw / 2, py = py0 - ph / 2;
         if (px < SC(4)) px = SC(4);
         if (py < SC(4)) py = SC(4);
@@ -13121,22 +13145,27 @@ static void draw_gesture_overlay(const Layout* L) {
                   : (sel ? P->btn : P->panel),
               hot ? P->accent : (sel ? P->accent : P->border),
               (sel || hot) ? 1.5f : 1.0f);
+        Color ac = (sel || hot) ? P->accent : (can ? P->text : P->dim);
         int as = SC(12), ax = px + SC(10), ay = py + (ph - as) / 2;
-        Color ac = (sel || hot) ? P->accent : P->text;
-        if (fwd) {           // ↗  tip up-right
-            line(ax, ay + as, ax + as, ay, ac, 1.8f);
-            line(ax + as, ay, ax + as - SC(4), ay, ac, 1.8f);
-            line(ax + as, ay, ax + as, ay + SC(4), ac, 1.8f);
-        } else {             // ↙  tip down-left
-            line(ax + as, ay, ax, ay + as, ac, 1.8f);
-            line(ax, ay + as, ax + SC(4), ay + as, ac, 1.8f);
-            line(ax, ay + as, ax, ay + as - SC(4), ac, 1.8f);
+        int mx = ax + as / 2, my = ay + as / 2;
+        if (dir == 1) {           // ->
+            line(ax, my, ax + as, my, ac, 1.8f);
+            line(ax + as, my, ax + as - SC(5), my - SC(5), ac, 1.8f);
+            line(ax + as, my, ax + as - SC(5), my + SC(5), ac, 1.8f);
+        } else if (dir == 2) {    // <-
+            line(ax, my, ax + as, my, ac, 1.8f);
+            line(ax, my, ax + SC(5), my - SC(5), ac, 1.8f);
+            line(ax, my, ax + SC(5), my + SC(5), ac, 1.8f);
+        } else {                  // ^
+            line(mx, ay, mx, ay + as, ac, 1.8f);
+            line(mx, ay, mx - SC(5), ay + SC(5), ac, 1.8f);
+            line(mx, ay, mx + SC(5), ay + SC(5), ac, 1.8f);
         }
-        text_px(fwd ? "Forward" : "Back",
-                px + SC(30), py + (ph - L->text_small) / 2,
-                L->text_small, (sel || hot) ? P->accent : P->text);
+        text_px(PILL[s].label, px + SC(30), py + (ph - L->text_small) / 2,
+                L->text_small, (sel || hot) ? P->accent : (can ? P->text : P->dim));
     }
 }
+
 
 static void paint(void);
 static void xm_draw(const Layout* L, const InputState* in);   // system menu
@@ -15110,9 +15139,11 @@ static void gesture_tick(InputState* in) {
 
     int dir = 0;
     if (angle_in_sector(ang, FORWARD_CENTER_ANGLE, FORWARD_SECTOR_SIZE))
-        dir = 1;                                   // ↗ Forward
+        dir = 1;                                   // -> Forward
     else if (angle_in_sector(ang, BACK_CENTER_ANGLE, BACK_SECTOR_SIZE))
-        dir = 2;                                   // ↙ Back
+        dir = 2;                                   // <- Back
+    else if (angle_in_sector(ang, UP_CENTER_ANGLE, UP_SECTOR_SIZE))
+        dir = 3;                                   // ^ Up one folder
     g_gest_dir = dir;
     if (dir == 0) { g_gest_last = 0; return; }     // outside: re-armed
     if (dir == g_gest_last) return;                // still inside: no refire
@@ -15122,12 +15153,21 @@ static void gesture_tick(InputState* in) {
                                                    // moment the cooldown ends
     g_gest_last = dir;                             // ENTERED this sector
 
-    if (dir == 1 && g_app.fwd_count > 0) {          // ↗ = Forward
+    if (dir == 3) {                                 // ^ = parent folder
+        char before[1024];
+        snprintf(before, sizeof before, "%s", g_app.current_path);
+        go_up();                                    // no-op at the top
+        if (strcmp(before, g_app.current_path) != 0) {
+            g_gest_flash = GESTURE_FLASH;
+            g_gest_cool = GESTURE_COOL;
+            printf("[gest] up\n");
+        }
+    } else if (dir == 1 && g_app.fwd_count > 0) {   // -> = Forward
         go_forward();
         g_gest_flash = GESTURE_FLASH;
         g_gest_cool = GESTURE_COOL;
         printf("[gest] forward\n");
-    } else if (dir == 2 && g_app.history_count > 0) {   // ↙ = Back
+    } else if (dir == 2 && g_app.history_count > 0) {   // <- = Back
         go_back();
         g_gest_flash = GESTURE_FLASH;
         g_gest_cool = GESTURE_COOL;
@@ -20317,7 +20357,10 @@ static void handle_mouse(const Layout* L, InputState* in) {
         if (in->key_code == VK_ESCAPE) g_confirm_kind = CONFIRM_NONE;
         // Enter accepts the delete confirmation, like Explorer's dialog
         // (Delete is its default button); the properties sheet closes.
-        else if (in->key_code == VK_RETURN) {
+        // NOT Alt+Enter: that key OPENS the properties sheet in
+        // handle_keys earlier in this very frame - reading it here too
+        // closed the sheet the instant it appeared (it never showed).
+        else if (in->key_code == VK_RETURN && !in->alt_pressed) {
             if (g_confirm_kind == CONFIRM_DELETE) delete_do();
             else g_confirm_kind = CONFIRM_NONE;
         }
@@ -27907,6 +27950,31 @@ static void run_selftest(void) {
             while (g_ws_n > 1) ws_close(g_ws_n - 1);
         }
 
+        // ---- (K0) Alt+Enter opens Properties AND it stays open (the same
+        //      frame's Enter used to close the sheet the instant it opened)
+        {
+            compute_layout(&M, w, h);
+            g_content = M.list;
+            g_confirm_kind = CONFIRM_NONE;
+            memset(&f, 0, sizeof f);
+            f.key_code = VK_RETURN;
+            f.alt_pressed = true;
+            st_input(&M, &f);
+            bool open1 = g_confirm_kind == CONFIRM_PROPS;
+            memset(&f, 0, sizeof f);
+            st_input(&M, &f);                  // a quiet frame after it
+            bool open2 = g_confirm_kind == CONFIRM_PROPS;
+            memset(&f, 0, sizeof f);
+            f.key_code = VK_ESCAPE;
+            st_input(&M, &f);
+            bool closed = g_confirm_kind == CONFIRM_NONE;
+            g_confirm_kind = CONFIRM_NONE;
+            bool ok = open1 && open2 && closed;
+            printf("[selftest]   Alt+Enter properties open=%d stays=%d esc=%d: %s\n",
+                   open1, open2, closed, ok ? "ok" : "FAILED");
+            if (!ok) printf("[selftest] FAIL: Alt+Enter properties\n");
+        }
+
         // ---- (K) Ctrl+Shift+N = New folder here (Ctrl+N stays New tab)
         {
             char td[MAX_PATH + 32];
@@ -30396,7 +30464,7 @@ static void run_selftest(void) {
         if (fails) printf("[selftest] FAIL: radial quick access\n");
     }
 
-    // ---- 6) the Alt + corner gesture (Back / Forward) -------------
+    // ---- 6) the Alt + mouse gesture (Back / Forward / Up) ----------
     // Alt is a modifier: nothing happens without it.  The moment the
     // pointer ENTERS a sector the navigation fires, and it can fire
     // again and again within the SAME Alt hold as often as the user
@@ -30429,31 +30497,35 @@ static void run_selftest(void) {
         if (parent[0]) { navigate(parent, true); navigate(ghome, true); }
         // current = home, history = [home, parent], forward = []
 
+        // Directions from the Alt point (400, 300): 160 px is well past
+        // the dead zone at any UI scale.
+#define G_RIGHT() (gfake.x = 560, gfake.y = 300)
+#define G_LEFT()  (gfake.x = 240, gfake.y = 300)
+#define G_UP()    (gfake.x = 400, gfake.y = 140)
+#define G_DOWN()  (gfake.x = 400, gfake.y = 460)    /* no sector: re-arms */
+#define G_ARM() do { memset(&gfake, 0, sizeof(gfake)); gesture_tick(&gfake); \
+    gfake.alt_pressed = true; gfake.x = 400; gfake.y = 300; gesture_tick(&gfake); } while (0)
+
         // 1. No Alt: a sector move changes nothing.
         gfake.x = 400; gfake.y = 300;
         gesture_tick(&gfake);
-        gfake.x = 460; gfake.y = 240;          // toward upper-right
+        G_LEFT();
         gesture_tick(&gfake);
         GEST_CHECK(strcmp(g_app.current_path, ghome) == 0 && g_gest_dir == 0,
                    "no Alt: a sector move does nothing");
 
-        // 2. Alt + UPPER-RIGHT -> Forward selected; no forward history
-        //    here, so it correctly stays put.
-        memset(&gfake, 0, sizeof(gfake));
-        gfake.alt_pressed = true;
-        gfake.x = 400; gfake.y = 300;
-        gesture_tick(&gfake);                   // arms
-        gfake.x = 460; gfake.y = 240;          // into the Forward sector
+        // 2. Alt + RIGHT -> Forward selected; no forward history here.
+        G_ARM();
+        G_RIGHT();
         gesture_tick(&gfake);
-        GEST_CHECK(g_gest_dir == 1, "Alt + upper-right selects Forward");
+        GEST_CHECK(g_gest_dir == 1, "Alt + right selects Forward");
         GEST_CHECK(strcmp(g_app.current_path, ghome) == 0,
                    "Forward on entry (no history: stays put)");
 
-        // 3. Staying inside the sector does not auto-repeat - only
-        //    LEAVING and re-entering fires again (tested below).
-        gfake.x = 520; gfake.y = 180;
+        // 3. Staying inside the sector does not auto-repeat.
+        gfake.x = 620; gfake.y = 310;
         gesture_tick(&gfake);
-        gfake.x = 580; gfake.y = 120;
+        gfake.x = 700; gfake.y = 290;
         gesture_tick(&gfake);
         GEST_CHECK(strcmp(g_app.current_path, ghome) == 0,
                    "hovering inside a sector does not re-trigger");
@@ -30464,58 +30536,44 @@ static void run_selftest(void) {
         GEST_CHECK(!g_gest_alt && g_gest_dir == 0 && g_gest_last == 0,
                    "release closes the gesture");
 
-        // 5. Alt + LOWER-LEFT -> Back fires on entry (home -> parent).
-        //    Alt stays held for tests 6..9 - no re-press in between.
-        memset(&gfake, 0, sizeof(gfake));
-        gfake.alt_pressed = true;
-        gfake.x = 400; gfake.y = 300;
-        gesture_tick(&gfake);
-        gfake.x = 340; gfake.y = 360;          // into the Back sector
+        // 5. Alt + LEFT -> Back fires on entry (home -> parent).
+        G_ARM();
+        G_LEFT();
         gesture_tick(&gfake);
         GEST_CHECK(parent[0] && strcmp(g_app.current_path, parent) == 0,
-                   "Alt + lower-left = Back, fires on entry");
+                   "Alt + left = Back, fires on entry");
 
-        // 6. SAME Alt hold: leave the sector, come back -> Back fires a
-        //    SECOND time (parent -> home).  This is the repeat the user
-        //    asked for: no Alt re-press needed between actions.
-        gfake.x = 340; gfake.y = 220;          // out: up-left (no sector)
+        // 6. SAME Alt hold: out (down), back in -> a SECOND Back.
+        G_DOWN();
         gesture_tick(&gfake);
-        GEST_CHECK(g_gest_dir == 0, "leaving the sector re-arms it");
-        gfake.x = 340; gfake.y = 360;          // back into the Back sector
-        GEST_HOVER();                          // wait out the cooldown
+        GEST_CHECK(g_gest_dir == 0, "moving down selects nothing (re-arms)");
+        G_LEFT();
+        GEST_HOVER();
         GEST_CHECK(strcmp(g_app.current_path, ghome) == 0 &&
                        g_app.history_count == 0,
                    "second Back in the SAME Alt hold");
 
-        // 7. Third re-entry, but the back stack is empty now: selected,
-        //    highlighted, and correctly inert.
-        gfake.x = 340; gfake.y = 220;          // out: up-left (no sector)
+        // 7. Back stack empty now: selected, but inert.
+        G_DOWN();
         gesture_tick(&gfake);
-        gfake.x = 340; gfake.y = 360;
+        G_LEFT();
         GEST_HOVER();
         GEST_CHECK(g_gest_dir == 2 && g_app.history_count == 0 &&
                        strcmp(g_app.current_path, ghome) == 0,
                    "no back history: sector shows, nothing fires");
 
-        // 8. STILL the same Alt hold -> ↗ Forward now (home -> parent):
-        //    the forward stack holds [home, parent] from the two Backs.
-        //    This is the exact 'This PC > D:' scenario: the toolbar
-        //    Forward button is enabled, so the gesture must fire too.
-        gfake.x = 340; gfake.y = 220;          // out: up-left (no sector)
+        // 8./9. Same hold -> Forward twice (home -> parent -> home).
+        G_DOWN();
         gesture_tick(&gfake);
-        gfake.x = 460; gfake.y = 240;          // into the Forward sector
+        G_RIGHT();
         GEST_HOVER();
-        GEST_CHECK(g_app.fwd_count > 0 &&
-                       strcmp(g_app.current_path, parent) == 0,
+        GEST_CHECK(g_app.fwd_count > 0 && strcmp(g_app.current_path, parent) == 0,
                    "Forward WITH history fires via gesture");
-
-        // 9. ...and a SECOND Forward in the same hold (parent -> home).
-        gfake.x = 340; gfake.y = 220;          // out: up-left (no sector)
+        G_DOWN();
         gesture_tick(&gfake);
-        gfake.x = 460; gfake.y = 240;
+        G_RIGHT();
         GEST_HOVER();
-        GEST_CHECK(strcmp(g_app.current_path, ghome) == 0 &&
-                       g_app.fwd_count == 0,
+        GEST_CHECK(strcmp(g_app.current_path, ghome) == 0 && g_app.fwd_count == 0,
                    "second Forward in the SAME Alt hold");
 
         // 10. Release Alt -> everything resets.
@@ -30524,95 +30582,87 @@ static void run_selftest(void) {
         GEST_CHECK(!g_gest_alt && g_gest_dir == 0 && g_gest_last == 0,
                    "release closes the gesture");
 
-        // 11. Wrong direction (bottom-right): nothing.
-        memset(&gfake, 0, sizeof(gfake));
-        gfake.alt_pressed = true;
-        gfake.x = 400; gfake.y = 300;
-        gesture_tick(&gfake);
-        gfake.x = 460; gfake.y = 360;          // toward bottom-right
-        gesture_tick(&gfake);
-        GEST_CHECK(g_gest_dir == 0, "bottom-right is not a sector");
-
-        // 12. Up-LEFT: the mirror diagonal - no selection.  (Straight up
-        //     and straight right now belong to the Forward quadrant on
-        //     purpose, see test 12b.)
-        memset(&gfake, 0, sizeof(gfake));
-        gfake.alt_pressed = false;
-        gesture_tick(&gfake);
-        gfake.alt_pressed = true;
-        gfake.x = 400; gfake.y = 300;
-        gesture_tick(&gfake);
-        gfake.x = 340; gfake.y = 220;          // out: up-left (no sector)
-        gesture_tick(&gfake);
-        GEST_CHECK(g_gest_dir == 0, "up-left is not a sector");
-
-        // 12b. A flat RIGHTWARD sweep counts as Forward too (the whole
-        //      upper-right quadrant is the sector).  The toolbar Forward
-        //      button being enabled is exactly the condition for this
-        //      to fire - the gesture can never lag behind the toolbar.
-        gfake.x = 460; gfake.y = 300;          // pure right: 0 degrees
-        gesture_tick(&gfake);
-        GEST_CHECK(g_gest_dir == 1, "flat right = Forward quadrant");
-
-        // 13. Dead zone: a tiny move selects nothing.
-        memset(&gfake, 0, sizeof(gfake));
-        gfake.alt_pressed = false;
-        gesture_tick(&gfake);
-        gfake.alt_pressed = true;
-        gfake.x = 400; gfake.y = 300;
-        gesture_tick(&gfake);
-        gfake.x = 404; gfake.y = 296;          // ~6px: inside the dead zone
-        gesture_tick(&gfake);
-        GEST_CHECK(g_gest_dir == 0, "inside the dead zone: no selection");
-
-        // 14. Empty back history: Alt + lower-left does nothing.
-        while (g_app.history_count > 0) go_back();   // drain the back stack
-        memset(&gfake, 0, sizeof(gfake));
-        gfake.alt_pressed = false;
-        gesture_tick(&gfake);
-        gfake.alt_pressed = true;
-        gfake.x = 400; gfake.y = 300;
-        gesture_tick(&gfake);
-        gfake.x = 340; gfake.y = 360;          // Back sector, no back history
+        // 11. Down is not a direction.
+        G_ARM();
+        G_DOWN();
         GEST_HOVER();
-        GEST_CHECK(g_app.history_count == 0,
+        GEST_CHECK(g_gest_dir == 0 && strcmp(g_app.current_path, ghome) == 0,
+                   "down does nothing");
+
+        // 12. UP = the parent folder with NO history at all (never
+        //     visited) - and again in the same hold: one more up.
+        g_app.history_count = 0;
+        g_app.fwd_count = 0;
+        load_dir(ghome);
+        char grand[1024] = "";
+        if (parent[0]) parent_path(parent, grand, sizeof(grand));
+        G_ARM();
+        G_UP();
+        gesture_tick(&gfake);
+        GEST_CHECK(g_gest_dir == 3 && parent[0] &&
+                       strcmp(g_app.current_path, parent) == 0,
+                   "Alt + up = parent folder, no history needed");
+        G_DOWN();
+        gesture_tick(&gfake);
+        G_UP();
+        GEST_HOVER();
+        GEST_CHECK(!grand[0] || strcmp(g_app.current_path, grand) == 0,
+                   "second Up in the same hold: one more folder up");
+        gfake.alt_pressed = false;
+        gesture_tick(&gfake);
+
+        // 13. Dead zone: an Alt+Tab-sized drift (50 px) fires nothing.
+        load_dir(ghome);
+        G_ARM();
+        gfake.x = 350; gfake.y = 300;
+        GEST_HOVER();
+        GEST_CHECK(g_gest_dir == 0 && strcmp(g_app.current_path, ghome) == 0,
+                   "inside the dead zone (Alt+Tab drift): no selection");
+        gfake.x = 400; gfake.y = 250;
+        GEST_HOVER();
+        GEST_CHECK(g_gest_dir == 0 && strcmp(g_app.current_path, ghome) == 0,
+                   "dead zone holds upward too");
+        gfake.alt_pressed = false;
+        gesture_tick(&gfake);
+
+        // 14./15. Empty stacks: Back / Forward do nothing.
+        g_app.history_count = 0;
+        g_app.fwd_count = 0;
+        G_ARM();
+        G_LEFT();
+        GEST_HOVER();
+        GEST_CHECK(g_app.history_count == 0 && strcmp(g_app.current_path, ghome) == 0,
                    "no back history: the gesture does nothing");
-
-        // 15. Empty forward stack: Alt + upper-right does nothing.
-        while (g_app.fwd_count > 0) go_forward();    // drain the forward stack
-        memset(&gfake, 0, sizeof(gfake));
+        G_DOWN();
+        gesture_tick(&gfake);
+        G_RIGHT();
+        GEST_HOVER();
+        GEST_CHECK(g_app.fwd_count == 0 && strcmp(g_app.current_path, ghome) == 0,
+                   "no forward history: the gesture does nothing");
         gfake.alt_pressed = false;
         gesture_tick(&gfake);
-        gfake.alt_pressed = true;
-        gfake.x = 400; gfake.y = 300;
-        gesture_tick(&gfake);
-        gfake.x = 460; gfake.y = 240;
-        GEST_HOVER();
-        GEST_CHECK(g_app.fwd_count == 0,
-                   "no forward history: the gesture does nothing");
 
-        // 16. The exact reported scenario: This PC -> drive -> Back, so
-        //     the top-left toolbar Forward button is ENABLED.  The Alt
-        //     gesture must forward to that drive as well - the gesture
-        //     and the toolbar can never disagree.
+        // 16. This PC -> drive -> Back: toolbar Forward is enabled, so the
+        //     gesture must forward to that drive too.
         g_app.history_count = 0;
         g_app.fwd_count = 0;
         load_dir(THIS_PC);
-        navigate("C:\\", true);              // This PC -> C:
-        go_back();                           // -> This PC, fwd has C:
+        navigate("C:\\", true);
+        go_back();
         GEST_CHECK(g_app.fwd_count > 0 && is_this_pc(g_app.current_path),
                    "toolbar Forward would be enabled at This PC");
-        memset(&gfake, 0, sizeof(gfake));
+        G_ARM();
+        G_RIGHT();
+        GEST_HOVER();
+        GEST_CHECK(g_app.fwd_count == 0 && strcmp(g_app.current_path, "C:\\") == 0,
+                   "gesture Forward matches the enabled toolbar button");
         gfake.alt_pressed = false;
         gesture_tick(&gfake);
-        gfake.alt_pressed = true;
-        gfake.x = 400; gfake.y = 300;
-        gesture_tick(&gfake);
-        gfake.x = 460; gfake.y = 240;        // ↗ toward the drive
-        GEST_HOVER();
-        GEST_CHECK(g_app.fwd_count == 0 &&
-                       strcmp(g_app.current_path, "C:\\") == 0,
-                   "gesture Forward matches the enabled toolbar button");
+#undef G_RIGHT
+#undef G_LEFT
+#undef G_UP
+#undef G_DOWN
+#undef G_ARM
 
         // restore a clean history for anything that follows
         load_dir(ghome);
@@ -33067,8 +33117,16 @@ static void render_pane_view(Pane* p, const Layout* win) {
         RectI xr = pane_close_rect(tt);
         bool ch = inside(&xr, in->x, in->y);
         int cx = xr.x + (xr.w - SC(9)) / 2, cy = xr.y + (xr.h - SC(9)) / 2;
-        line(cx, cy, cx + SC(9), cy + SC(9), ch ? P->text : P->dim, 1.5f);
-        line(cx + SC(9), cy, cx, cy + SC(9), ch ? P->text : P->dim, 1.5f);
+        // Red, so "close this pane" is unmistakable; hovered = a red chip
+        // with a white cross (the window close button's colours).
+        static const Color PANE_X_RED = {0.93f, 0.33f, 0.30f, 1.0f};
+        Color xc = PANE_X_RED;
+        if (ch) {
+            rrect(xr.x, xr.y, xr.w, xr.h, SC(4), CAP_CLOSE_HOV, CAP_CLOSE_HOV, 1.0f);
+            xc = (Color){1.0f, 1.0f, 1.0f, 1.0f};
+        }
+        line(cx, cy, cx + SC(9), cy + SC(9), xc, 1.8f);
+        line(cx + SC(9), cy, cx, cy + SC(9), xc, 1.8f);
     }
     vline(L.list.x, L.list.y, L.list.y + L.list.h, P->border);
     // While the window is split, the active pane's header is tinted so it
@@ -33488,10 +33546,43 @@ static int app_beat_ms(void) {
     return BEAT_IDLE_MS;
 }
 
+#ifdef NOVA_DEMO
+#include "demo_record.c"   // product-video recorder: separate build only
+#endif
+
 static void app_run(bool selftest) {
     int frames = 0;
     DWORD last_active = GetTickCount();
     DWORD last_paint = 0;
+#ifdef NOVA_DEMO
+    if (!selftest && demo_init()) {
+        // scripted, invisible recording at a steady 30 frames a second
+        LARGE_INTEGER qf, t0, tn;
+        QueryPerformanceFrequency(&qf);
+        QueryPerformanceCounter(&t0);
+        long n = 0;
+        while (g_app.running) {
+            if (!platform_poll_events()) break;
+            if (!demo_tick(platform_get_input())) break;
+            handle_input();
+            sug_pump();
+            platform_invalidate();
+            paint();
+            demo_capture();
+            n++;
+            for (;;) {                      // pace to frame n's deadline
+                QueryPerformanceCounter(&tn);
+                double due = n * 1000.0 / 30.0;
+                double now_ms = (tn.QuadPart - t0.QuadPart) * 1000.0 / qf.QuadPart;
+                if (now_ms >= due) break;
+                Sleep((DWORD)(due - now_ms > 2 ? due - now_ms - 1 : 0));
+            }
+        }
+        demo_finish();
+        g_app.running = false;
+        return;
+    }
+#endif
 
     if (selftest && !g_smoke) run_selftest();
     if (g_bench) {                     // benchmark mode: measure, then out

@@ -42,8 +42,10 @@ echo.
     src\core\memory.c ^
     src\core\indexer.c ^
     src\core\exr.c ^
+    src\core\mov.c ^
     src\platform\window_win.c ^
     src\platform\shell_ole.c ^
+    src\platform\video_thumb.c ^
     src\renderer\renderer_gl.c ^
     src\ui\ui_framework.c ^
     src\app\update.c ^
@@ -70,6 +72,7 @@ echo   Bottom bar slider / - +  Size icons (drag the slider line)
 echo   Ctrl+wheel               Size in / out (animated)
 echo   Ctrl+L / Ctrl+F          Focus the search box
 echo   Ctrl+N / Ctrl+Tab        New tab / switch tabs
+echo   Ctrl+Shift+N             New folder
 echo   Hamburger button         Menu: tab, bookmark, refresh, theme, exit
 echo   Breadcrumb click         Jump to that folder segment
 echo   Wheel                    Scrolls the list 2x (sidebar too)

@@ -88,6 +88,8 @@ extern int  WINAPI SHGetPathFromIDListA(const void* pidl, char* path);
 #include "version.h"
 #include "update.h"
 #include "exr.h"        // OpenEXR thumbnails (Windows has no .exr codec)
+#include "mov.h"        // ProRes .mov thumbnails (Windows has no ProRes codec)
+#include "video_thumb.h" // Media Foundation frame when the shell has none
 #include "../platform/shell_ole.h"   // native menu + drag-out
 
 #include <stdarg.h>
@@ -1429,6 +1431,7 @@ static void search_start_deep(void);  // Enter / This PC auto: scan the tree
 static bool g_opt_thumbs = true;      // draw shell thumbnails in the list
 static bool g_opt_burst = true;       // fast icon preload after navigation
 static bool g_opt_alt_gest = true;    // Alt + corner Back/Forward gesture
+static bool g_opt_pane_hover = true;  // the pane under the mouse is active
 static bool g_opt_wheel = true;       // Quick Access wheel on C
 static bool g_opt_restore = true;     // Restore Previous Session (startup)
 
@@ -1501,10 +1504,10 @@ enum {                                  // entry ids (index into g_ents)
     CMD_NEW_TAB, CMD_CYCLE_TAB, CMD_SHIFT_TAB_L, CMD_SHIFT_TAB_R,
     CMD_FOCUS_SEARCH, CMD_FOCUS_ADDR,
     CMD_OPEN, CMD_UP, CMD_HOME, CMD_SEL, CMD_DEEP,
-    CMD_RENAME, CMD_DELETE, CMD_COPY, CMD_CUT, CMD_PASTE, CMD_SELECT_ALL,
+    CMD_RENAME, CMD_NEW_FOLDER, CMD_DELETE, CMD_COPY, CMD_CUT, CMD_PASTE, CMD_SELECT_ALL,
     CMD_THUMBS, CMD_CTDOC,
     CMD_ALTGEST, CMD_GESTDOC,
-    CMD_SPLIT, CMD_CLOSE_PANE,
+    CMD_SPLIT, CMD_CLOSE_PANE, CMD_PANE_HOVER,
     CMD_BOOKMARK, CMD_WHEEL, CMD_STARDOC,
     CMD_BURST,
     CMD_STORE,
@@ -1606,7 +1609,7 @@ static SetEnt g_ents[CMD_COUNT] = {
     // ---- Navigation and Tabs ----
     [CMD_NEW_TAB] = { .id="new_tab", .name="New tab",
         .desc="Open another workspace tab with its own pane and history.",
-        .how="Or the + button in the tab strip. Ctrl+Shift+N works too.",
+        .how="Or the + button in the tab strip.",
         .cat=SCAT_NAV, .kind=EK_ACTION,
         .key='N', .mods=M_CTRL, .dkey='N', .dmods=M_CTRL,
         .rebindable=true, .has_sw=true, .on=true, .don=true },
@@ -1683,6 +1686,12 @@ static SetEnt g_ents[CMD_COUNT] = {
         .cat=SCAT_FILEOPS, .kind=EK_ACTION,
         .key=VK_F2, .dkey=VK_F2,
         .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_NEW_FOLDER] = { .id="new_folder", .name="New folder",
+        .desc="Create a new folder here and start typing its name.",
+        .how="Or right-click empty space -> New -> Folder (same as Explorer).",
+        .cat=SCAT_FILEOPS, .kind=EK_ACTION,
+        .key='N', .mods=M_CTRL | M_SHIFT, .dkey='N', .dmods=M_CTRL | M_SHIFT,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
     [CMD_DELETE] = { .id="delete", .name="Delete",
         .desc="Ask to remove the selection. The confirmation always runs - that is never optional.",
         .how="Turning the shortcut off only removes the key; right-click -> Delete still works.",
@@ -1749,6 +1758,11 @@ static SetEnt g_ents[CMD_COUNT] = {
         .cat=SCAT_PANES, .kind=EK_ACTION,
         .key='W', .mods=M_CTRL, .dkey='W', .dmods=M_CTRL,
         .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_PANE_HOVER] = { .id="pane_hover", .name="Pane follows the mouse",
+        .desc="ON = moving the mouse into a pane makes it the active one - no click needed.",
+        .how="It waits while you type in a field, drag, or have a menu open. OFF = click a pane to activate it.",
+        .cat=SCAT_PANES, .kind=EK_OPTION,
+        .has_sw=true, .var=&g_opt_pane_hover, .dval=true },
 
     // ---- Starred Items and Quick Access ----
     [CMD_BOOKMARK] = { .id="bookmark", .name="Bookmark",
@@ -1951,10 +1965,12 @@ static bool set_mods_match(const InputState* in, unsigned mods) {
 }
 
 // Two bindings clash when they use the same key with the same Ctrl/Alt/
-// Win state - Shift never separates them (it is optional at dispatch).
+// Win AND Shift state.  Shift is optional at dispatch for a binding
+// without it, but an exact Shift binding takes precedence (cmd_hit), so
+// Ctrl+N and Ctrl+Shift+N can belong to two different commands.
 static bool set_clash(int ka, unsigned ma, int kb, unsigned mb) {
     if (!ka || !kb || ka != kb) return false;
-    return ((ma ^ mb) & (M_CTRL | M_ALT | M_WIN)) == 0;
+    return ((ma ^ mb) & (M_CTRL | M_ALT | M_WIN | M_SHIFT)) == 0;
 }
 
 // Which other entry already owns this binding? -1 = free.
@@ -1976,12 +1992,31 @@ static bool cmd_hit(const InputState* in, int id) {
     if (e->kind == EK_ACTION && !e->on) return false;       // switched off
     if (e->kind == EK_OPTION && e->key_gated && e->var && !*e->var)
         return false;                                        // feature off
-    if (in->key_code == e->key && set_mods_match(in, (unsigned)e->mods))
-        return true;
-    if (e->akey && in->key_code == e->akey &&
-        set_mods_match(in, (unsigned)e->amods))
-        return true;
-    return false;
+    bool hit = (in->key_code == e->key && set_mods_match(in, (unsigned)e->mods)) ||
+               (e->akey && in->key_code == e->akey &&
+                set_mods_match(in, (unsigned)e->amods));
+    if (!hit) return false;
+    // Shift is optional for a binding without it (Ctrl+Shift+Tab still
+    // reaches Ctrl+Tab) - UNLESS another live entry is bound to exactly
+    // this Shift combo: then that one owns it (Ctrl+Shift+N = new folder,
+    // Ctrl+N = new tab).
+    if (in->shift_pressed) {
+        bool mine = (in->key_code == e->key && (e->mods & M_SHIFT)) ||
+                    (e->akey && in->key_code == e->akey && (e->amods & M_SHIFT));
+        if (!mine) {
+            for (int j = 0; j < CMD_COUNT; j++) {
+                const SetEnt* o = &g_ents[j];
+                if (j == id || o->kind == EK_DOC) continue;
+                if (o->kind == EK_ACTION && !o->on) continue;
+                if ((o->key == in->key_code && (o->mods & M_SHIFT) &&
+                     set_mods_match(in, (unsigned)o->mods)) ||
+                    (o->akey && o->akey == in->key_code && (o->amods & M_SHIFT) &&
+                     set_mods_match(in, (unsigned)o->amods)))
+                    return false;
+            }
+        }
+    }
+    return true;
 }
 
 // Is a feature currently on? (option value, else the action's switch)
@@ -4809,6 +4844,7 @@ static HDC thumb_dc(void) {
 // Transparent pixels are shown over BLACK, the way Nuke / DJV / RV show a
 // premultiplied EXR: additive elements (sparks, glows: alpha 0, colour
 // > 0) stay visible, and the bitmap never depends on the UI theme.
+static HBITMAP bgra_to_dib(unsigned char* px, int pw, int ph);
 static HBITMAP exr_thumb_bitmap(const char* path, int w, int h) {
     if (!path || !exr_is_exr_name(path)) return NULL;
     if (w < 1) w = 1;
@@ -4821,6 +4857,12 @@ static HBITMAP exr_thumb_bitmap(const char* path, int w, int h) {
     unsigned char* px = NULL;
     int pw = 0, ph = 0;
     if (!exr_preview_file(path, w, h, 0x000000u, &px, &pw, &ph)) return NULL;
+    return bgra_to_dib(px, pw, ph);
+}
+
+// A malloc'ed top-down BGRA buffer -> 32-bit DIB (the buffer is freed).
+static HBITMAP bgra_to_dib(unsigned char* px, int pw, int ph) {
+    if (!px || pw < 1 || ph < 1) { free(px); return NULL; }
     BITMAPINFO bi;
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -4841,10 +4883,32 @@ static HBITMAP exr_thumb_bitmap(const char* path, int w, int h) {
     return dib;
 }
 
+// Files NovaFile decodes ITSELF, fast, on any PC: OpenEXR frames and
+// ProRes .mov (Windows ships a codec for neither).  NULL = not one of
+// those, or a .mov in another codec - the caller goes to the shell.
+static bool fast_thumb_name(const char* path) {
+    return path && (exr_is_exr_name(path) || mov_is_mov_name(path));
+}
+static HBITMAP fast_thumb_bitmap(const char* path, int w, int h) {
+    if (!path) return NULL;
+    if (exr_is_exr_name(path)) return exr_thumb_bitmap(path, w, h);
+    if (!mov_is_mov_name(path)) return NULL;
+    unsigned char* px = NULL;
+    int pw = 0, ph = 0;
+    if (!mov_preview_file(path, w, h, &px, &pw, &ph)) return NULL;
+    return bgra_to_dib(px, pw, ph);
+}
+
 // Ask the shell for a thumbnail (or its icon if the item has no
 // thumbnail). Returns an HBITMAP the caller must NOT free (cached),
-// or NULL if the shell has nothing for this path.
+// or NULL if the shell has nothing for this path.  thumb_only: a real
+// thumbnail or nothing - never the type icon (videos then try Media
+// Foundation before settling for the icon).
+static HBITMAP shell_thumb_ex(const char* path, int w, int h, bool thumb_only);
 static HBITMAP shell_thumb_bitmap(const char* path, int w, int h) {
+    return shell_thumb_ex(path, w, h, false);
+}
+static HBITMAP shell_thumb_ex(const char* path, int w, int h, bool thumb_only) {
     if (!g_tc_on_worker) g_tc_ui_shell++;      // paint() must never get here
     if (!g_sh_create_item || !g_ole_ready || !path || !path[0]) return NULL;
     if (nova_no_shell()) return NULL;        // debug: force the placeholder
@@ -4876,7 +4940,9 @@ static HBITMAP shell_thumb_bitmap(const char* path, int w, int h) {
         // 1 = SIIGBF_BIGGERSIZEOK: let the factory hand back a bigger
         // cached image instead of shrinking to fit the request (a small
         // return upscaled to the cell WAS the blur).
-        if (FAILED(((FactoryObj*)fac)->lpVtbl->GetImage(fac, sz, 1, &hbm)))
+        // 8 = SIIGBF_THUMBNAILONLY
+        if (FAILED(((FactoryObj*)fac)->lpVtbl->GetImage(fac, sz, thumb_only ? 1 | 8 : 1,
+                                                        &hbm)))
             hbm = NULL;
         ((FactoryObj*)fac)->lpVtbl->Release(fac);
     }
@@ -4918,6 +4984,21 @@ static void thumb_box(int* w, int* h) {
     if (*w < 64) { *w = 64; *h = 64; }
 }
 
+// EXR frames use THREE fixed sizes instead of 32px steps: 256 (every
+// normal cell), 512 and 1024 (huge zoom on a 4K screen).  Zooming inside
+// a tier then never decodes again - the one bitmap is scaled down - and
+// the background prefetch (exr_prefetch_tick) knows exactly which size to
+// warm.  Decoding a 4K frame at 256 takes ~13 ms, so the bigger source
+// costs nothing.
+static int exr_tier(int w, int h) {
+    int m = w > h ? w : h;
+    return m <= 256 ? 256 : m <= 512 ? 512 : 1024;
+}
+static void thumb_box_for(const char* path, int* w, int* h) {
+    thumb_box(w, h);
+    if (fast_thumb_name(path)) *w = *h = exr_tier(*w, *h);
+}
+
 // One shell lookup per budgeted call; without budget the entry stays
 // "pending" and is retried on a later frame (icon fallback meanwhile).
 static void tbmp_fetch(ThumbBmp* t, const char* path, int w, int h) {
@@ -4948,7 +5029,7 @@ static void tbmp_fetch(ThumbBmp* t, const char* path, int w, int h) {
         g_tbmp_budget = 0;
         return;                              // keep frame fast
     }
-    t->hbm = exr_thumb_bitmap(path, w, h);   // NULL: not an EXR
+    t->hbm = fast_thumb_bitmap(path, w, h);  // NULL: not EXR / ProRes
     if (!t->hbm) t->hbm = shell_thumb_bitmap(path, w, h);
     {
         static int nlog = 0;
@@ -5073,7 +5154,7 @@ static HBITMAP tbmp_get_async(const char* path, int w, int h) {
     // SHGetFileInfo finds nothing and the row showed NO icon - only the
     // shell thumbnail renders the real My Computer logo.
     if (w <= 20 && h <= 20 && !is_this_pc(path)) return NULL;
-    thumb_box(&w, &h);
+    thumb_box_for(path, &w, &h);
     ThumbBmp* t = tbmp_slot(path, w, h);
     tbmp_service(t, path, w, h);
     return (!t->pending && t->hbm) ? t->hbm : NULL;
@@ -5093,7 +5174,7 @@ static HBITMAP tbmp_get(const char* path, int w, int h) {
     // finds nothing and the row showed NO icon - only the shell thumbnail
     // renders the real My Computer logo, so it must be allowed at 16px too.
     if (w <= 20 && h <= 20 && !is_this_pc(path)) return NULL;
-    thumb_box(&w, &h);
+    thumb_box_for(path, &w, &h);
     ThumbBmp* t = tbmp_slot(path, w, h);
     tbmp_fetch(t, path, w, h);
     return t->hbm;
@@ -5113,12 +5194,30 @@ static HBITMAP tbmp_get(const char* path, int w, int h) {
 // key always embeds src + size: set / change / remove of a custom folder
 // thumbnail changes src, the memo misses by itself and the row
 // re-resolves on the next frame - no manual invalidation anywhere.
+// A ready bitmap of `src` at ANY size other than `self`'s, preferring the
+// largest (it scales down crisply).  Keys are "path|w|h" and '|' can never
+// be part of a Windows path, so the prefix test cannot match another file.
+// Only called while a slot is pending - a short window per cell.
+static HBITMAP tbmp_any_size(const char* src, const ThumbBmp* self) {
+    size_t n = strlen(src);
+    HBITMAP best = NULL;
+    int bw = 0;
+    for (int i = 0; i < THUMB_BMP_CACHE; i++) {
+        const ThumbBmp* t = &g_tbmps[i];
+        if (!t->used || t == self || t->pending || !t->hbm) continue;
+        if (strncmp(t->key, src, n) != 0 || t->key[n] != '|') continue;
+        int kw = atoi(t->key + n + 1);
+        if (!best || kw > bw) { best = t->hbm; bw = kw; }
+    }
+    return best;
+}
+
 static int tbmp_fetch_src(DirEntry* e, int* memo, const char* src, int w, int h,
                           HBITMAP* out) {
     if (out) *out = NULL;
     if (!e || !src || !src[0] || !g_sh_create_item || !g_ole_ready)
         return TBMP_NONE;
-    thumb_box(&w, &h);
+    thumb_box_for(src, &w, &h);
 
     char key[1136];
     snprintf(key, sizeof(key), "%s|%d|%d", src, w, h);
@@ -5134,8 +5233,17 @@ static int tbmp_fetch_src(DirEntry* e, int* memo, const char* src, int w, int h,
         if (memo) *memo = (int)(s - g_tbmps);
     }
     tbmp_service(s, src, w, h);               // queue for the worker if due
-    if (s->pending)
+    if (s->pending) {
+        // While THIS size is on its way, show the same file at any size
+        // that is already decoded (scaled): zooming then never flashes
+        // back to a plain icon - the picture just sharpens a moment later.
+        HBITMAP other = tbmp_any_size(src, s);
+        if (other) {
+            if (out) *out = other;
+            return TBMP_HAVE;
+        }
         return (s->tries >= 5) ? TBMP_NONE : TBMP_PENDING;  // OLE may step in
+    }
     if (out) *out = s->hbm;
     return s->hbm ? TBMP_HAVE : TBMP_NONE;
 }
@@ -5193,7 +5301,8 @@ typedef struct {
     int slot;                // slot the UI expects (validated on drain)
     int w, h;
     int bg;                  // 0xRRGGBB cell colour for the OLE fallback
-    int kind;                // 0 = thumbnail job, 1 = type-icon job
+    int kind;                // 0 = thumbnail job, 1 = type-icon job,
+                             // 2 = prefetch: warm the DISK cache only
 } TcJob;
 
 typedef struct {
@@ -5218,6 +5327,14 @@ static int   g_tc_qh = 0;                  // ring head (oldest job)
 static TcJob g_tc_iq[TC_IMAX];             // type-icon jobs: popped BEFORE
 static int   g_tc_iqn = 0;                 // thumbnails (visible-first)
 static int   g_tc_iqh = 0;
+// Prefetch list (kind 2 jobs): the EXR frames of the folder on screen,
+// handed over by exr_prefetch_tick() and taken by a worker only when BOTH
+// queues above are empty - warming the off-screen frames never delays a
+// visible cell, and it keeps going while the window sits idle.
+#define TC_PF_MAX 1000
+static char** g_pf_paths = NULL;            // owned list (worker reads)
+static int    g_pf_n = 0, g_pf_i = 0;
+static int    g_pf_tier = 256;
 // Idle workers sleep on this event instead of polling every 6 ms (three
 // threads x 166 wake-ups a second while nothing at all was queued).
 static HANDLE g_tc_wake = NULL;
@@ -5243,9 +5360,10 @@ static unsigned long long tc_hash(const char* s) {
     return h;
 }
 
-// An .exr key carries an "exr1" tag: it retires the blank shell icons
-// that older builds cached for EXR frames before NovaFile could decode
-// them (same path, size and mtime - the old id would hit forever).
+// An .exr key carries an "exr1" tag and a video key a "vid1" tag: they
+// retire the blank shell icons that older builds cached for EXR frames
+// and ProRes / thumbnail-less videos before NovaFile could decode them
+// (same path, size and mtime - the old id would hit forever).
 static unsigned long long tc_disk_id(const char* path, int w, int h) {
     if (!g_tc_dir_ok || !path || !path[0]) return 0;
     WIN32_FILE_ATTRIBUTE_DATA fa;
@@ -5257,6 +5375,8 @@ static unsigned long long tc_disk_id(const char* path, int w, int h) {
     char key[1184];
     if (exr_is_exr_name(path))
         snprintf(key, sizeof(key), "%s|%d|%d|%llu|%llu|exr1", path, w, h, m, sz);
+    else if (video_is_video_name(path))
+        snprintf(key, sizeof(key), "%s|%d|%d|%llu|%llu|vid1", path, w, h, m, sz);
     else
         snprintf(key, sizeof(key), "%s|%d|%d|%llu|%llu", path, w, h, m, sz);
     return tc_hash(key);
@@ -5327,6 +5447,13 @@ static void tc_disk_sweep(void) {
         DeleteFileA(f);
     }
     free(arr);
+}
+
+static bool tc_disk_has(unsigned long long id) {
+    if (!g_tc_dir_ok || !id) return false;
+    char f[MAX_PATH + 40];
+    snprintf(f, sizeof(f), "%s\\%016llx.bmp", g_tc_dir, id);
+    return GetFileAttributesA(f) != INVALID_FILE_ATTRIBUTES;
 }
 
 static HBITMAP tc_disk_load(unsigned long long id) {
@@ -5491,10 +5618,23 @@ static HBITMAP tc_decode_image(const char* path, int w, int h, int bg) {
 // correct, folders and videos too), then - only for real image files,
 // only for cells big enough to care - the OLE decoder.
 static HBITMAP tc_extract(const TcJob* j) {
-    // EXR first: the shell has no codec and would "succeed" with a blank
-    // icon. A file NovaFile cannot read still gets that shell icon.
-    HBITMAP ex = exr_thumb_bitmap(j->path, j->w, j->h);
+    // EXR / ProRes first: the shell has no codec and would "succeed" with
+    // a blank icon. A file NovaFile cannot read still gets that shell icon.
+    HBITMAP ex = fast_thumb_bitmap(j->path, j->w, j->h);
     if (ex) return ex;
+    if (video_is_video_name(j->path)) {
+        // Videos: the shell's REAL thumbnail, else one frame through Media
+        // Foundation (some PCs register no .mov thumbnailer although
+        // Windows decodes the H.264 inside), and only then the type icon.
+        HBITMAP v = shell_thumb_ex(j->path, j->w, j->h, true);
+        if (v) return v;
+        unsigned char* px = NULL;
+        int pw = 0, ph = 0;
+        int tw = j->w, th = j->h;
+        if (tw >= 96 && tw < 256) tw = th = 256;   // the HD rule, as above
+        if (video_frame_preview(j->path, tw, th, &px, &pw, &ph))
+            return bgra_to_dib(px, pw, ph);
+    }
     HBITMAP hbm = shell_thumb_bitmap(j->path, j->w, j->h);
     if (!hbm && j->w >= 48 && previewable(j->path))
         hbm = tc_decode_image(j->path, j->w, j->h, j->bg);
@@ -5560,9 +5700,15 @@ static DWORD WINAPI tc_worker(void* arg) {
             g_tc_qh = (g_tc_qh + 1) % TC_QMAX;
             g_tc_qn--;
             got = true;
+        } else if (g_pf_i < g_pf_n) {       // idle: warm the next frames
+            memset(&job, 0, sizeof job);
+            snprintf(job.path, sizeof(job.path), "%s", g_pf_paths[g_pf_i++]);
+            job.kind = 2;
+            job.w = job.h = g_pf_tier;
+            got = true;
         }
         if (got) InterlockedIncrement(&g_tc_inflight);
-        bool more = (g_tc_iqn + g_tc_qn) > 0;
+        bool more = (g_tc_iqn + g_tc_qn) > 0 || g_pf_i < g_pf_n;
         LeaveCriticalSection(&g_tc_cs);
         if (!got) {                         // idle: sleep until work arrives
             if (g_tc_wake) WaitForSingleObject(g_tc_wake, 100);
@@ -5572,6 +5718,22 @@ static DWORD WINAPI tc_worker(void* arg) {
         if (more && g_tc_wake) SetEvent(g_tc_wake);   // wake a sibling too
         if (job.kind == 1) InterlockedIncrement(&g_wpop_i);   // TEMP diag
         else InterlockedIncrement(&g_wpop_t);
+
+        if (job.kind == 2) {
+            // PREFETCH: decode once into the disk cache (skipped when it is
+            // already there), so the frame paints from a plain file read
+            // the moment it scrolls into view.  Nothing goes to the UI.
+            unsigned long long id = tc_disk_id(job.path, job.w, job.h);
+            if (id && !tc_disk_has(id)) {
+                HBITMAP hbm = fast_thumb_bitmap(job.path, job.w, job.h);
+                if (hbm) {
+                    tc_disk_put(id, hbm);
+                    DeleteObject(hbm);
+                }
+            }
+            InterlockedDecrement(&g_tc_inflight);
+            continue;
+        }
 
         TcDone done;
         memset(&done, 0, sizeof(done));
@@ -5638,7 +5800,12 @@ static void tc_init(void) {
     g_tc_running = 0;
     for (int i = 0; i < TC_THREADS; i++) {   // bounded worker pool
         HANDLE t = CreateThread(NULL, 0, tc_worker, NULL, 0, NULL);
-        if (t) g_tc_thread[g_tc_running++] = t;
+        if (t) {
+            // below the UI thread: decoding a folder of frames can use
+            // every core, but the window always gets the CPU first
+            SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL);
+            g_tc_thread[g_tc_running++] = t;
+        }
     }
 }
 
@@ -5661,6 +5828,10 @@ static void tc_shutdown(void) {
     g_tc_qn = 0;
     g_tc_iqn = 0;
     g_tc_qh = g_tc_iqh = 0;
+    for (int i = 0; i < g_pf_n; i++) free(g_pf_paths[i]);
+    free(g_pf_paths);
+    g_pf_paths = NULL;
+    g_pf_n = g_pf_i = 0;
     DeleteCriticalSection(&g_tc_cs);
     if (g_tc_wake) { CloseHandle(g_tc_wake); g_tc_wake = NULL; }
 }
@@ -5766,6 +5937,48 @@ static void icon_apply(const TcDone* d) {
         if (++e->tries >= 5) e->pending = false;
         else e->retry_at = g_app.frame + 8;
     }
+}
+
+// Folder open = every EXR frame in it starts decoding in the background
+// (at the 256 tier every normal cell uses), so scrolling through a long
+// sequence paints from the disk cache instead of waiting.  Runs once per
+// frame on the UI thread but only rebuilds the list when the folder or
+// its item count changes; the workers then walk it on their own, idle
+// window or not.  Visible cells are always served first (see tc_worker).
+static char   g_pf_dir[1104];
+static size_t g_pf_seen = (size_t)-1;
+static void exr_prefetch_tick(void) {
+    if (!g_tc_running || !cmd_enabled(CMD_THUMBS)) return;
+    if (g_pf_seen == g_app.view_count &&
+        strcmp(g_pf_dir, g_app.current_path) == 0)
+        return;
+    snprintf(g_pf_dir, sizeof g_pf_dir, "%s", g_app.current_path);
+    g_pf_seen = g_app.view_count;
+    char** list = NULL;
+    int n = 0;
+    for (size_t vi = 0; vi < g_app.view_count && n < TC_PF_MAX; vi++) {
+        int ei = g_app.view[vi];
+        if (ei < 0 || (size_t)ei >= g_app.count) continue;
+        const DirEntry* e = &g_app.entries[ei];
+        if (e->is_directory || !fast_thumb_name(e->path)) continue;
+        if (!list) {
+            list = (char**)malloc(sizeof(char*) * TC_PF_MAX);
+            if (!list) return;
+        }
+        char* c = _strdup(e->path);
+        if (c) list[n++] = c;
+    }
+    EnterCriticalSection(&g_tc_cs);
+    char** old = g_pf_paths;
+    int oldn = g_pf_n;
+    g_pf_paths = list;            // a worker copies its path under this
+    g_pf_n = n;                   // lock, so the old strings are free to go
+    g_pf_i = 0;
+    g_pf_tier = 256;
+    LeaveCriticalSection(&g_tc_cs);
+    for (int i = 0; i < oldn; i++) free(old[i]);
+    free(old);
+    if (n > 0 && g_tc_wake) SetEvent(g_tc_wake);
 }
 
 // Pull finished jobs into the caches. Once per frame, on the UI thread -
@@ -13084,6 +13297,7 @@ static void paint(void) {
     // apply now instead of waiting for the next frame's start - icons
     // turn sharp one frame earlier and the sharp/scroll tail shrinks.
     tc_drain();
+    exr_prefetch_tick();           // queue this folder's EXR frames (cheap)
     renderer_end_paint();
     g_app.frame++;
 }
@@ -17869,6 +18083,22 @@ static void handle_keys(InputState* in, const Layout* L) {
         platform_window_maximize_toggle();
         return;
     }
+    if (cmd_hit(in, CMD_NEW_FOLDER)) {
+        // Explorer's Ctrl+Shift+N: "New folder" here, then type its name
+        if (!g_app.current_path[0] || is_this_pc(g_app.current_path)) {
+            set_status("Open a folder first to create a new folder in it");
+            return;
+        }
+        char err[256] = {0};
+        if (fs_new_folder(g_app.current_path, err, sizeof(err))) {
+            load_dir(g_app.current_path);
+            set_status("Folder created");
+            new_item_select_rename();
+        } else {
+            set_status("%s", err[0] ? err : "Cannot create a folder here");
+        }
+        return;
+    }
     if (cmd_hit(in, CMD_NEW_TAB)) { ws_new(g_app.current_path); return; }
     if (cmd_hit(in, CMD_CYCLE_TAB)) {
         ws_cycle(in->shift_pressed ? -1 : 1);        // Ctrl+Tab / Ctrl+Shift+Tab
@@ -19890,6 +20120,35 @@ static void draw_marquee(const Layout* L) {
     fill(sx + w - 1, sy, 1, h, P->accent);
 }
 
+// Focus follows the mouse between panes (see the call in handle_mouse).
+// L = the WINDOW layout (the pane rects are fresh from this frame).
+static int g_ph_x = -1, g_ph_y = -1;
+static void pane_hover_tick(const Layout* L, const InputState* in) {
+    bool moved = in->x != g_ph_x || in->y != g_ph_y;
+    g_ph_x = in->x;
+    g_ph_y = in->y;
+    if (!moved || !g_opt_pane_hover || !g_pane_root) return;
+    if (pane_count(g_pane_root) < 2) return;
+    if (in->left_down || in->left_click || in->right_click || in->middle_click)
+        return;
+    if (g_drag_split || g_drag_split_armed || g_splitter_drag || g_tab_drag ||
+        g_tab_armed || g_mq_armed || g_fdrag_armed || g_sb_drag || g_size_drag)
+        return;
+    if (g_app.addr_focused || g_app.search_focused) return;   // typing
+    if (overlay_owns_input() || g_search_popup_open || g_addr_popup_open)
+        return;
+    Pane* hit = NULL;
+    if (in->x >= g_content.x && in->x < g_content.x + g_content.w &&
+        in->y >= g_content.y && in->y < g_content.y + g_content.h) {
+        if (pane_tree_splitter_at(g_pane_root, in->x, in->y)) return;  // divider
+        hit = pane_at_point(g_pane_root, in->x, in->y);
+    } else if (in->y >= SC(TAB_H) && in->y < L->toolbar_h &&
+               in->x >= g_content.x && in->x < g_content.x + g_content.w) {
+        hit = nav_pane_at(g_pane_root, in->x);  // a top-row pane's nav row
+    }
+    if (hit && hit->kind == PN_LEAF && hit != g_active_pane) activate_pane(hit);
+}
+
 static void handle_mouse(const Layout* L, InputState* in) {
     // A close is pending (X just clicked): the window is inert for one
     // double-click interval so the trailing click of a double-click is
@@ -20448,6 +20707,14 @@ static void handle_mouse(const Layout* L, InputState* in) {
             break;
         }
     }
+    // ---- the pane under a MOVING mouse becomes the active pane (Settings
+    //      -> Panes -> "Pane follows the mouse").  Only on real movement,
+    //      so a pane chosen from the keyboard or a menu is never yanked
+    //      back by a pointer that just sits there; and never while the
+    //      user types in a field, holds a button (drag / selection box /
+    //      resize) or has a menu / panel / popup open.
+    pane_hover_tick(L, in);
+
     // From here on every list hit-test (items, headers, scrollbar, wheel
     // scrolling, keyboard rows) uses the ACTIVE pane's layout; all the
     // chrome rects below are unchanged copies of the window layout.
@@ -22689,6 +22956,98 @@ static size_t st_exr_build(unsigned char* b, int comp) {
     return n;
 }
 
+// ---- ProRes .mov: a hand-built 16x16 ProRes 422 frame in a minimal
+//      QuickTime container (mdat + moov/trak/mdia/hdlr/minf/stbl).  Every
+//      luma block's DC is +10 at quant 64 (mean 512 + 10*8 = 592), chroma
+//      neutral (512): the decoder must return a 2x2 grey of 154.
+static size_t st_box(unsigned char* o, const char* type, const unsigned char* pay,
+                     size_t n) {
+    st_le32(o, 0);
+    o[0] = (unsigned char)((n + 8) >> 24); o[1] = (unsigned char)((n + 8) >> 16);
+    o[2] = (unsigned char)((n + 8) >> 8);  o[3] = (unsigned char)(n + 8);
+    memcpy(o + 4, type, 4);
+    if (n) memmove(o + 8, pay, n);
+    return n + 8;
+}
+static size_t st_mov_build(unsigned char* out) {
+    unsigned char fr[64];
+    memset(fr, 0, sizeof fr);
+    // frame: size, 'icpf', 20-byte header
+    fr[3] = 50; memcpy(fr + 4, "icpf", 4);
+    unsigned char* h = fr + 8;
+    h[1] = 20;                              // header size
+    memcpy(h + 4, "test", 4);
+    h[9] = 16; h[11] = 16;                  // 16 x 16
+    h[12] = 0x80;                           // 4:2:2, progressive
+    h[14] = h[15] = h[16] = 1;              // BT.709
+    // picture header: size 8, 22 bytes, 1 slice of 1 MB
+    unsigned char* p = h + 20;
+    p[0] = 8 << 3; p[4] = 22; p[6] = 1; p[7] = 0;
+    p[9] = 12;                              // slice index: 12 bytes
+    unsigned char* s = p + 10;
+    s[0] = 6 << 3; s[1] = 64;               // slice header, quant 64
+    s[3] = 2; s[5] = 2;                     // Y 2 bytes, Cb 2 (Cr = rest)
+    s[6] = 0xD2; s[7] = 0x30;               // Y: '110100' '1000' '1' '1'
+    s[8] = 0x82; s[9] = 0x00;               // Cb: '100000' '1000'
+    s[10] = 0x82; s[11] = 0x00;             // Cr: same
+    size_t n = 0;
+    n += st_box(out + n, "mdat", fr, 50);   // the frame sits at offset 8
+    unsigned char stbl[128], tmp[256];
+    size_t sn = 0;
+    unsigned char sd[24] = {0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16, 'a', 'p', 'c', 'n', 0, 0, 0, 0, 0, 0, 0, 1};
+    sn += st_box(stbl + sn, "stsd", sd, 24);
+    unsigned char sz[12] = {0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 1};
+    sn += st_box(stbl + sn, "stsz", sz, 12);
+    unsigned char sc[20] = {0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1};
+    sn += st_box(stbl + sn, "stsc", sc, 20);
+    unsigned char co[12] = {0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 8};
+    sn += st_box(stbl + sn, "stco", co, 12);
+    size_t t = st_box(tmp, "stbl", stbl, sn);           // minf { stbl }
+    memcpy(stbl, tmp, t);
+    t = st_box(tmp, "minf", stbl, t);
+    unsigned char md[512];
+    size_t mn = 0;
+    unsigned char hd[24] = {0, 0, 0, 0, 0, 0, 0, 0, 'v', 'i', 'd', 'e'};
+    mn += st_box(md + mn, "hdlr", hd, 24);
+    memcpy(md + mn, tmp, t);
+    mn += t;
+    t = st_box(tmp, "mdia", md, mn);
+    memcpy(md, tmp, t);
+    t = st_box(tmp, "trak", md, t);
+    memcpy(md, tmp, t);
+    n += st_box(out + n, "moov", md, t);
+    return n;
+}
+
+static void st_mov(void) {
+    printf("[selftest] ProRes .mov thumbnails...\n");
+    unsigned char buf[1024];
+    size_t n = st_mov_build(buf);
+    unsigned char* px = NULL;
+    int w = 0, h = 0;
+    bool dec = mov_preview_mem(buf, n, 256, 256, &px, &w, &h);
+    int b = -1, g = -1, r = -1;
+    if (dec && px) { b = px[0]; g = px[1]; r = px[2]; }
+    bool ok = dec && w == 2 && h == 2 && abs(b - 154) <= 1 && abs(g - 154) <= 1 &&
+              abs(r - 154) <= 1;
+    free(px);
+    // a damaged copy (cut inside the frame) is refused, never read past
+    unsigned char* px2 = NULL;
+    bool cut = mov_preview_mem(buf, 40, 256, 256, &px2, &w, &h);
+    free(px2);
+    // names: .mov is decoded by NovaFile, other videos use the shell / MF
+    bool names = mov_is_mov_name("C:\\a\\B.MOV") && !mov_is_mov_name("C:\\a\\b.mp4") &&
+                 video_is_video_name("x.mp4") && video_is_video_name("x.MOV") &&
+                 !video_is_video_name("x.exr");
+    int a1 = 100, a2 = 100;
+    thumb_box_for("C:\\v\\clip.mov", &a1, &a2);
+    bool tier = a1 == 256;
+    ok = ok && !cut && names && tier;
+    printf("[selftest]   16x16 ProRes 422 -> %dx%d bgr=%d,%d,%d cut=%s names=%d tier=%d -> %s\n",
+           w, h, b, g, r, cut ? "decoded!" : "refused", names, tier, ok ? "ok" : "FAILED");
+    if (!ok) printf("[selftest] FAIL: ProRes .mov thumbnails\n");
+}
+
 static void st_exr(void) {
     printf("[selftest] EXR thumbnails...\n");
     bool ok = true;
@@ -22743,6 +23102,55 @@ static void st_exr(void) {
     printf("[selftest]   file -> worker bitmap %dx%d -> %s\n", bw, bh,
            (bw == 4 && bh == 2) ? "ok" : "FAILED");
     if (bw != 4 || bh != 2) ok = false;
+
+    // zoom tiers: every normal cell shares ONE decoded size, so zooming
+    // inside a tier never decodes again; other files keep 32px buckets
+    {
+        int a = 40, b = 40, c = 150, d = 150, e = 300, g = 300, x = 150, y = 150;
+        thumb_box_for("C:\\seq\\shot.0001.exr", &a, &b);
+        thumb_box_for("C:\\seq\\shot.0001.EXR", &c, &d);
+        thumb_box_for("C:\\seq\\shot.0001.exr", &e, &g);
+        thumb_box_for("C:\\pics\\photo.jpg", &x, &y);
+        bool tok = a == 256 && b == 256 && c == 256 && e == 512 && x == 160;
+        printf("[selftest]   zoom tiers 40->%d 150->%d 300->%d jpg150->%d -> %s\n",
+               a, c, e, x, tok ? "ok" : "FAILED");
+        if (!tok) ok = false;
+    }
+    // a pending size borrows any ready size of the SAME file (zoom never
+    // flashes to an icon) - and never another file's whose name starts
+    // the same
+    {
+        int s0 = -1, s1 = -1, s2 = -1;
+        for (int i = 0; i < THUMB_BMP_CACHE && s2 < 0; i++) {
+            if (g_tbmps[i].used) continue;
+            if (s0 < 0) s0 = i; else if (s1 < 0) s1 = i; else s2 = i;
+        }
+        bool fok = false;
+        if (s2 >= 0) {
+            HBITMAP b256 = CreateBitmap(4, 4, 1, 32, NULL);
+            HBITMAP bx = CreateBitmap(4, 4, 1, 32, NULL);
+            ThumbBmp* t0 = &g_tbmps[s0];
+            ThumbBmp* t1 = &g_tbmps[s1];
+            ThumbBmp* t2 = &g_tbmps[s2];
+            snprintf(t0->key, sizeof t0->key, "C:\\st\\a.exr|256|256");
+            t0->used = true; t0->hbm = b256; t0->pending = false;
+            snprintf(t1->key, sizeof t1->key, "C:\\st\\a.exr|512|512");
+            t1->used = true; t1->pending = true;
+            snprintf(t2->key, sizeof t2->key, "C:\\st\\a.exr.bak|512|512");
+            t2->used = true; t2->hbm = bx; t2->pending = false;
+            HBITMAP got = tbmp_any_size("C:\\st\\a.exr", t1);
+            HBITMAP none = tbmp_any_size("C:\\st\\b.exr", NULL);
+            fok = got == b256 && none == NULL;
+            DeleteObject(b256);
+            DeleteObject(bx);
+            memset(t0, 0, sizeof *t0);
+            memset(t1, 0, sizeof *t1);
+            memset(t2, 0, sizeof *t2);
+        }
+        printf("[selftest]   pending size shows a ready size: %s\n",
+               fok ? "ok" : "FAILED");
+        if (!fok) ok = false;
+    }
     if (!ok) printf("[selftest] FAIL: EXR thumbnails\n");
 }
 
@@ -25283,6 +25691,7 @@ static void run_selftest(void) {
     }
 
     st_exr();                                // OpenEXR thumbnails
+    st_mov();                                // ProRes .mov thumbnails
 
     // Round 10: pressing back re-selects the folder we came OUT of
     printf("[selftest] back restores selection...\n");
@@ -27496,6 +27905,111 @@ static void run_selftest(void) {
                    ran ? (tf ? "FAILED" : "ok") : "skipped");
             if (ran && tf) printf("[selftest] FAIL: tab rename\n");
             while (g_ws_n > 1) ws_close(g_ws_n - 1);
+        }
+
+        // ---- (K) Ctrl+Shift+N = New folder here (Ctrl+N stays New tab)
+        {
+            char td[MAX_PATH + 32];
+            GetTempPathA(MAX_PATH, td);
+            strcat(td, "nova_nf_selftest");
+            CreateDirectoryA(td, NULL);
+            load_dir(td);
+            int tabs0 = g_ws_n;
+            compute_layout(&M, w, h);
+            g_content = M.list;
+            memset(&f, 0, sizeof f);
+            f.key_code = 'N';
+            f.ctrl_pressed = f.shift_pressed = true;
+            st_input(&M, &f);
+            char nf[MAX_PATH + 64];
+            snprintf(nf, sizeof nf, "%s\\New folder", td);
+            DWORD at = GetFileAttributesA(nf);
+            bool made = at != INVALID_FILE_ATTRIBUTES &&
+                        (at & FILE_ATTRIBUTE_DIRECTORY);
+            bool ok = made && g_ws_n == tabs0;
+            rename_cancel();
+            memset(&f, 0, sizeof f);
+            f.key_code = 'N';
+            f.ctrl_pressed = true;
+            st_input(&M, &f);
+            bool tab = g_ws_n == tabs0 + 1;
+            while (g_ws_n > tabs0) ws_close(g_ws_n - 1);
+            printf("[selftest]   Ctrl+Shift+N folder=%d, Ctrl+N tab=%d: %s\n",
+                   made, tab, ok && tab ? "ok" : "FAILED");
+            if (!(ok && tab)) printf("[selftest] FAIL: new folder / new tab keys\n");
+            load_dir(platform_get_home_directory());
+            RemoveDirectoryA(nf);
+            RemoveDirectoryA(td);
+        }
+
+        // ---- (L) the pane under a MOVING mouse becomes active, no click -
+        //      but never while typing, holding a button, or switched off
+        {
+            while (pane_count(g_pane_root) > 1) {
+                activate_pane(first_leaf(g_pane_root));
+                pane_close_active();
+            }
+            compute_layout(&M, w, h);
+            g_content = M.list;
+            compute_pane_tree_layout(g_pane_root, M.list);
+            pane_apply_drop(g_active_pane, g_active_pane, DZ_RIGHT);
+            compute_layout(&M, w, h);
+            g_content = M.list;
+            compute_pane_tree_layout(g_pane_root, M.list);
+            bool ran = g_pane_root && g_pane_root->kind == PN_SPLIT_V;
+            int hf = 0, hc = 0;
+            #define PH_EXPECT(c, what) do { hc++; if (!(c)) { hf++; \
+                printf("[selftest]   pane hover FAILED: %s\n", what); } } while (0)
+            if (ran) {
+                Pane* A = g_pane_root->left;
+                Pane* B = g_pane_root->right;
+                activate_pane(A);
+                int bx = B->rect.x + B->rect.w / 2, by = B->rect.y + B->rect.h / 2;
+                int ax = A->rect.x + A->rect.w / 2, ay = A->rect.y + A->rect.h / 2;
+                memset(&f, 0, sizeof f);
+                f.x = bx; f.y = by;
+                handle_mouse(&M, &f);
+                PH_EXPECT(g_active_pane == B, "moving into a pane activates it");
+                f.x = ax; f.y = ay;
+                handle_mouse(&M, &f);
+                PH_EXPECT(g_active_pane == A, "moving back activates the first");
+                handle_mouse(&M, &f);              // no movement: nothing
+                activate_pane(B);                  // e.g. chosen from a menu
+                handle_mouse(&M, &f);              // pointer still on A
+                PH_EXPECT(g_active_pane == B,
+                          "a still pointer never takes focus back");
+                activate_pane(A);
+                // nav band of the other pane (top bar) counts too
+                f.x = bx; f.y = nav_row_y() + SC(10);
+                handle_mouse(&M, &f);
+                PH_EXPECT(g_active_pane == B, "the pane's top-bar nav row too");
+                activate_pane(A);
+                g_app.addr_focused = true;         // typing in A's address bar
+                f.x = bx - 3; f.y = by;
+                handle_mouse(&M, &f);
+                PH_EXPECT(g_active_pane == A, "no switch while typing");
+                g_app.addr_focused = false;
+                f.left_down = true;                // a held button = a drag
+                f.x = bx - 6;
+                handle_mouse(&M, &f);
+                f.left_down = false;
+                g_mq_armed = g_mq_on = false;
+                g_drag_split = g_drag_split_armed = false;
+                PH_EXPECT(g_active_pane == A, "no switch while a button is held");
+                g_opt_pane_hover = false;          // Settings switch OFF
+                f.x = bx - 9;
+                handle_mouse(&M, &f);
+                PH_EXPECT(g_active_pane == A, "switched off = click to activate");
+                g_opt_pane_hover = true;
+            }
+            #undef PH_EXPECT
+            printf("[selftest]   pane follows the mouse %d/%d: %s\n", hc - hf, hc,
+                   ran ? (hf ? "FAILED" : "ok") : "skipped");
+            if (ran && hf) printf("[selftest] FAIL: pane follows the mouse\n");
+            while (pane_count(g_pane_root) > 1) {
+                activate_pane(first_leaf(g_pane_root));
+                pane_close_active();
+            }
         }
 
         // ---- restore the state everything after this expects ----
@@ -30282,20 +30796,34 @@ static void run_selftest(void) {
                   renderer_text_height(g_app.renderer, 14) <= 23,
                   "settings: line height comes from real font metrics");
 
-            // New tab on Ctrl+Shift+N: Shift is OPTIONAL at dispatch (the
-            // recorded binding stays Ctrl+N), so the browser habit works
-            // without a second binding that could clash with anything.
+            // Ctrl+N = new tab, Ctrl+Shift+N = new folder (Explorer): an
+            // exact Shift binding owns its combo, while Shift stays
+            // optional for every binding nobody else claims with Shift.
             {
                 InputState kn; memset(&kn, 0, sizeof kn);
                 kn.key_code = 'N'; kn.ctrl_pressed = true;
-                S_EXP(cmd_hit(&kn, CMD_NEW_TAB),
+                S_EXP(cmd_hit(&kn, CMD_NEW_TAB) && !cmd_hit(&kn, CMD_NEW_FOLDER),
                       "settings: Ctrl+N is the new-tab key");
                 kn.shift_pressed = true;
-                S_EXP(cmd_hit(&kn, CMD_NEW_TAB),
-                      "settings: Ctrl+Shift+N opens a new tab too");
+                S_EXP(cmd_hit(&kn, CMD_NEW_FOLDER) && !cmd_hit(&kn, CMD_NEW_TAB),
+                      "settings: Ctrl+Shift+N is New folder, not a tab");
                 kn.ctrl_pressed = false; kn.shift_pressed = false;
-                S_EXP(!cmd_hit(&kn, CMD_NEW_TAB),
-                      "settings: a lone N never opens a tab");
+                S_EXP(!cmd_hit(&kn, CMD_NEW_TAB) && !cmd_hit(&kn, CMD_NEW_FOLDER),
+                      "settings: a lone N never opens a tab or a folder");
+                // New folder switched off: Ctrl+Shift+N falls back to the
+                // new tab (Shift optional again)
+                g_ents[CMD_NEW_FOLDER].on = false;
+                kn.key_code = 'N'; kn.ctrl_pressed = true; kn.shift_pressed = true;
+                S_EXP(cmd_hit(&kn, CMD_NEW_TAB),
+                      "settings: New folder off -> Ctrl+Shift+N opens a tab");
+                g_ents[CMD_NEW_FOLDER].on = true;
+                // Ctrl+Shift+Tab still reaches the Ctrl+Tab binding
+                InputState kt; memset(&kt, 0, sizeof kt);
+                kt.key_code = g_ents[CMD_CYCLE_TAB].key;
+                kt.ctrl_pressed = (g_ents[CMD_CYCLE_TAB].mods & M_CTRL) != 0;
+                kt.shift_pressed = true;
+                S_EXP(cmd_hit(&kt, CMD_CYCLE_TAB),
+                      "settings: Shift stays optional where nobody claims it");
             }
 
             // ---- New Tab duplicates the ACTIVE tab's folder ----

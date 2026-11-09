@@ -59,10 +59,24 @@ is in this repository. Output: `build\NovaFile.exe` (~955 KB).
   part), HALF / FLOAT / UINT channels, and every standard compression -
   NONE, RLE, ZIPS, ZIP, PIZ, PXR24, B44, B44A, DWAA, DWAB. It shows RGB(A),
   else the first layer's RGB (`beauty.R` ...), else Y as grey, framed by
-  the display window, shown in sRGB over black like Nuke / DJV. Decoding
-  runs on the thumbnail workers (a 4K DWAA frame takes ~0.15 s) and
-  lands in the disk cache like every other thumbnail. Deep or damaged
-  files keep the normal icon
+  the display window, shown in sRGB over black like Nuke / DJV. Fast: a
+  thumbnail of a 4K DWA frame is built from its 8x8 block averages alone
+  (~13 ms), bigger previews decode on several cores, and EXR thumbnails
+  use three fixed sizes (256 / 512 / 1024) so zooming never decodes
+  again - while a new size loads, the one already decoded stays on
+  screen. Opening a folder starts decoding all its frames (up to 1000)
+  in the background, below the UI's priority, into the disk cache.
+  Deep or damaged files keep the normal icon
+- **ProRes .mov thumbnails** - Windows has no ProRes codec either, so a
+  ProRes .mov showed a blank icon on most PCs. NovaFile reads the
+  QuickTime container and decodes one frame (10% in) of the ProRes track
+  itself (`src/core/mov.c`, pure C): every profile (Proxy, LT, 422, HQ,
+  4444, 4444 XQ), progressive or interlaced, from the 8x8 block averages
+  alone - ~1.4 ms for HD, ~5 ms for 4K. Same fixed sizes, instant zoom and
+  folder prefetch as EXR. Other videos (.mov / .mp4 / .m4v in H.264 etc.)
+  use the shell's thumbnail, and when a PC has none, one frame through
+  Windows Media Foundation (`src/platform/video_thumb.c`, loaded at run
+  time so the app still starts on Windows "N" editions)
 - **Five view modes** - from the **one corner control** in the bottom bar
   (right of the Hidden toggle): a plain **click steps automatically**
   through **Details** (Name / Size / Modified / Type columns) -> **List**
@@ -226,7 +240,8 @@ is in this repository. Output: `build\NovaFile.exe` (~955 KB).
 | Ctrl+T                     | Dark <-> Light theme            |
 | Ctrl+B                     | Bookmark the current folder     |
 | Ctrl+H                     | Show / hide hidden + system files |
-| Ctrl+N (also Ctrl+Shift+N) | New tab                         |
+| Ctrl+N                     | New tab                         |
+| Ctrl+Shift+N               | New folder here (type its name) |
 | Ctrl+Tab / Ctrl+Shift+Tab  | Next / previous tab             |
 | Ctrl+Shift+PgUp / PgDn     | Shift the active tab left/right |
 | Tab                         | Address bar (breadcrumb)        |
@@ -238,6 +253,7 @@ is in this repository. Output: `build\NovaFile.exe` (~955 KB).
 | F5                          | Refresh the current folder      |
 | Ctrl+E                      | Split the pane to the right     |
 | Ctrl+W                      | Close the focused pane          |
+| Move the mouse into a pane  | Make it the active pane (Settings -> Panes -> Pane follows the mouse) |
 | C                           | Quick Access wheel (radial menu of starred folders) |
 | Ctrl+,                      | Open Settings (gear panel)      |
 | Ctrl+Q or Esc              | Exit (Esc first leaves a field or closes a menu/popup) |

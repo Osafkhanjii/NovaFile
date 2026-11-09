@@ -479,6 +479,8 @@ typedef struct {
     uint8_t*  tmp3; size_t tmp3_cap;   // third scratch (DWA)
     int*      rowc;          // per-channel row counters (lines -> planar)
     bool      dc_only;       // DWA: use only the 8x8 block averages
+    bool      dc_sparse;     // ...and write only each block's top-left
+                             // pixel (accumulate_dc reads just those)
 } XDec;
 
 static uint8_t* grow(uint8_t** p, size_t* cap, size_t need) {
@@ -1030,7 +1032,10 @@ static void idct8x8(float* data) {
 static bool dwa_lossy(int ncomp, uint8_t* const planes[3], const int types[3],
                       int w, int h, const uint16_t** ac, const uint16_t* ac_end,
                       const uint16_t** dc, const uint16_t* dc_end, const bool lin[3],
-                      bool dc_only) {
+                      int dc_mode) {
+    // dc_mode: 0 = full decode, 1 = block averages written to every pixel,
+    //          2 = block averages written to each block's top-left pixel only
+    bool dc_only = dc_mode != 0;
     if (w < 1 || h < 1) return true;
     int nbx = (w + 7) / 8, nby = (h + 7) / 8;
     size_t nblk = (size_t)nbx * nby;
@@ -1046,6 +1051,13 @@ static bool dwa_lossy(int ncomp, uint8_t* const planes[3], const int types[3],
             int maxx = (bx == nbx - 1) ? w - bx * 8 : 8;
             bool constant = true;
             for (int c = 0; c < ncomp; c++) {
+                if (dc_only) {
+                    // thumbnail: the block average is all we need, and the
+                    // AC stream was never even decompressed (dwa_decode)
+                    float v = g_h2f[*dcp[c]++] * 3.535536e-01f * 3.535536e-01f;
+                    blk[c][0] = v;
+                    continue;
+                }
                 memset(zig, 0, sizeof zig);
                 zig[0] = *dcp[c]++;
                 int k = 1, last = 0;
@@ -1062,7 +1074,7 @@ static bool dwa_lossy(int ncomp, uint8_t* const planes[3], const int types[3],
                         k++;
                     }
                 }
-                if (last == 0 || dc_only) {
+                if (last == 0) {
                     float v = g_h2f[zig[0]] * 3.535536e-01f * 3.535536e-01f;
                     for (int i = 0; i < 64; i++) blk[c][i] = v;
                 } else {
@@ -1084,9 +1096,11 @@ static bool dwa_lossy(int ncomp, uint8_t* const planes[3], const int types[3],
                 // a constant block converts its one value once, not 64 times
                 uint16_t cv = f2h(blk[c][0]);
                 if (lin[c]) cv = g_dwa_lin[cv];
-                for (int yy = 0; yy < maxy; yy++) {
+                int ey = (dc_mode == 2) ? 1 : maxy;
+                int ex = (dc_mode == 2) ? 1 : maxx;
+                for (int yy = 0; yy < ey; yy++) {
                     size_t row = (size_t)(by * 8 + yy) * w + (size_t)bx * 8;
-                    for (int xx = 0; xx < maxx; xx++) {
+                    for (int xx = 0; xx < ex; xx++) {
                         uint16_t hv = cv;
                         if (!constant) {
                             hv = f2h(blk[c][yy * 8 + xx]);
@@ -1225,7 +1239,8 @@ static bool dwa_decode(const XHdr* h, XDec* D, const uint8_t* in, size_t n,
     if (ac_total > lossy_blocks * 63 || dc_total > lossy_blocks) goto done;
     if (rle_unc_sz > (uint64_t)rle_total * 2 + 64) goto done;
     size_t need1 = (size_t)unk_total + (size_t)rle_total;
-    size_t need2 = (size_t)(ac_total + dc_total) * 2;
+    size_t ac_keep = D->dc_only ? 0 : (size_t)ac_total;  // DC-only: no AC
+    size_t need2 = (ac_keep + (size_t)dc_total) * 2;
     uint8_t* b1 = grow(&D->tmp, &D->tmp_cap, need1 + (size_t)rle_unc_sz);
     uint8_t* b2 = grow(&D->tmp2, &D->tmp2_cap, need2);
     if (!b1 || !b2) goto done;
@@ -1233,14 +1248,16 @@ static bool dwa_decode(const XHdr* h, XDec* D, const uint8_t* in, size_t n,
     uint8_t* rle_plane = b1 + unk_total;
     uint8_t* rle_tmp = b1 + need1;
     uint16_t* acv = (uint16_t*)b2;
-    uint16_t* dcv = acv + ac_total;
+    uint16_t* dcv = acv + ac_keep;
     memset(unk_plane, 0, need1);
 
     if (unk_c > 0) {
         long long got = zinflate(unk_buf, (size_t)unk_c, unk_plane, (size_t)unk_unc);
         if (got != (long long)unk_unc) goto done;
     }
-    if (ac_c > 0) {
+    // DC-only (a thumbnail 8x+ smaller than the frame): the AC stream - by
+    // far the biggest and slowest part of a DWA chunk - is skipped whole.
+    if (ac_c > 0 && !D->dc_only) {
         if (ac_comp == 0) {
             if (!huf_uncompress(D, ac_buf, (size_t)ac_c, acv, (size_t)ac_total)) goto done;
         } else if (ac_comp == 1) {
@@ -1266,7 +1283,7 @@ static bool dwa_decode(const XHdr* h, XDec* D, const uint8_t* in, size_t n,
     }
 
     const uint16_t* acp = acv;
-    const uint16_t* ace = acv + ac_total;
+    const uint16_t* ace = acv + ac_keep;
     const uint16_t* dcp = dcv;
     const uint16_t* dce = dcv + dc_total;
     bool* done_ch = (bool*)calloc((size_t)h->nch, sizeof(bool));
@@ -1286,7 +1303,7 @@ static bool dwa_decode(const XHdr* h, XDec* D, const uint8_t* in, size_t n,
         int types[3] = {h->ch[r].type, h->ch[g].type, h->ch[b].type};
         bool lin[3] = {true, true, true};
         fine = dwa_lossy(3, planes, types, pl[r].nx, pl[r].ny, &acp, ace, &dcp, dce, lin,
-                         D->dc_only);
+                         D->dc_only ? (D->dc_sparse ? 2 : 1) : 0);
         done_ch[r] = done_ch[g] = done_ch[b] = true;
     }
     for (int c = 0; c < h->nch && fine; c++) {
@@ -1295,7 +1312,7 @@ static bool dwa_decode(const XHdr* h, XDec* D, const uint8_t* in, size_t n,
         int types[3] = {h->ch[c].type, 0, 0};
         bool lin[3] = {!h->ch[c].plin, false, false};
         fine = dwa_lossy(1, planes, types, pl[c].nx, pl[c].ny, &acp, ace, &dcp, dce, lin,
-                         D->dc_only);
+                         D->dc_only ? (D->dc_sparse ? 2 : 1) : 0);
     }
     free(done_ch);
     if (!fine) goto done;
@@ -1546,6 +1563,74 @@ static void accumulate(const XHdr* h, XAcc* A, const XPlane* pl, const uint8_t* 
     }
 }
 
+// Up to two (output index, pixel count) runs for one 8-pixel block span.
+// A preview pixel covers >= 6 source pixels in DC mode, so a block can
+// straddle at most two of them; -1 entries (outside the display window)
+// carry no weight.
+static int block_runs(const int* map, int start, int n, int idx[2], int cnt[2]) {
+    int r = 0;
+    for (int i = 0; i < n; i++) {
+        int o = map[start + i];
+        if (o < 0) continue;
+        if (r > 0 && idx[r - 1] == o) { cnt[r - 1]++; continue; }
+        if (r == 2) { cnt[1]++; continue; }      // cannot happen; stay safe
+        idx[r] = o;
+        cnt[r] = 1;
+        r++;
+    }
+    return r;
+}
+
+// DC-only twin of accumulate(): every 8x8 block holds ONE value (written to
+// its top-left pixel by dwa_lossy mode 2), so it is read once and added
+// with the block's pixel count as weight - 1/64 of the reads, the same sums.
+// Only used when every selected channel is unsampled (xs = ys = 1).
+static void accumulate_dc(const XHdr* h, XAcc* A, const XPlane* pl, const uint8_t* out,
+                          int x0, int x1, int y0, int y1) {
+    for (int y = y0; y <= y1; y += 8) {
+        int bh = (y1 - y + 1) < 8 ? (y1 - y + 1) : 8;
+        int oyi[2], oyc[2];
+        int ny = block_runs(A->ymap, y - A->dy0, bh, oyi, oyc);
+        if (ny == 0) continue;
+        const uint8_t* rows[4] = {NULL, NULL, NULL, NULL};
+        int types[4] = {0, 0, 0, 0};
+        for (int k = 0; k < 4; k++) {
+            int c = A->sel[k];
+            if (c < 0 || y - y0 >= pl[c].ny) continue;
+            rows[k] = out + pl[c].off + (size_t)(y - y0) * pl[c].nx * tsize(h->ch[c].type);
+            types[k] = h->ch[c].type;
+        }
+        for (int x = x0; x <= x1; x += 8) {
+            int bw = (x1 - x + 1) < 8 ? (x1 - x + 1) : 8;
+            int oxi[2], oxc[2];
+            int nx = block_runs(A->xmap, x - A->dx0, bw, oxi, oxc);
+            if (nx == 0) continue;
+            float v[4];
+            for (int k = 0; k < 4; k++) {
+                if (rows[k] && x - x0 < pl[A->sel[k]].nx) {
+                    if (types[k] == PT_HALF)
+                        v[k] = g_h2f_safe[rd16(rows[k] + 2 * (size_t)(x - x0))];
+                    else
+                        v[k] = fetch(rows[k], x - x0, types[k]);
+                } else {
+                    v[k] = (k == 3) ? 1.0f : 0.0f;    // no alpha = opaque
+                }
+            }
+            for (int a = 0; a < ny; a++) {
+                float* arow = A->acc + (size_t)oyi[a] * A->ow * 4;
+                for (int b = 0; b < nx; b++) {
+                    float wgt = (float)(oyc[a] * oxc[b]);
+                    float* acc = arow + (size_t)oxi[b] * 4;
+                    acc[0] += v[0] * wgt;
+                    acc[1] += v[1] * wgt;
+                    acc[2] += v[2] * wgt;
+                    acc[3] += v[3] * wgt;
+                }
+            }
+        }
+    }
+}
+
 static int find_ch(const XHdr* h, const char* prefix, const char* const* names) {
     size_t pn = strlen(prefix);
     for (int i = 0; names[i]; i++) {
@@ -1598,6 +1683,178 @@ static void pick_channels(const XHdr* h, XAcc* A) {
     if (A->sel[0] >= 0) return;
     A->sel[0] = 0;                // anything at all: the first channel as grey
     A->sel[3] = -1;
+}
+
+// ------------------------------------------------------------ chunk runner
+// Chunks are independent, so one frame decodes on several cores at once.
+// Each thread owns its decoder scratch (XDec), plane table and accumulator;
+// the maps, header and file bytes are shared read-only.  Thread k takes
+// chunks k, k+T, k+2T... (interleaved: equal work for every thread even
+// when one end of the frame is empty).  The partial sums are added at the
+// end, so the result is the same as a one-thread run (up to float order).
+typedef struct {
+    const XHdr* h;
+    const uint8_t* data;
+    size_t size;
+    const uint8_t* end;
+    const uint8_t* table;
+    bool multipart, tiled;
+    int ncx, cw, chh;
+    long long nchunks;
+    int dx0, dy0, dx1, dy1;
+    XAcc* A;                 // shared maps; A->acc is thread 0's sum buffer
+    bool dc_only, dc_sparse;
+} XRun;
+
+typedef struct {
+    const XRun* R;
+    int tid, nt;
+    float* acc;              // this thread's sums (ow * oh * 4)
+    int decoded;
+    bool ok;                 // its scratch allocated (else it did nothing)
+} XWork;
+
+static void run_slice(XWork* w) {
+    const XRun* R = w->R;
+    const XHdr* h = R->h;
+    XAcc A = *R->A;
+    A.acc = w->acc;
+    XDec D;
+    memset(&D, 0, sizeof D);
+    D.dc_only = R->dc_only;
+    D.dc_sparse = R->dc_sparse;
+    XPlane* pl = (XPlane*)malloc((size_t)h->nch * sizeof(XPlane));
+    D.rowc = (int*)malloc((size_t)h->nch * sizeof(int));
+    w->ok = pl && D.rowc;
+    for (long long ci = w->tid; w->ok && ci < R->nchunks; ci += w->nt) {
+        int tx = (int)(ci % R->ncx), ty = (int)(ci / R->ncx);
+        int x0 = R->dx0 + tx * R->cw, y0 = R->dy0 + ty * R->chh;
+        int x1 = x0 + R->cw - 1, y1 = y0 + R->chh - 1;
+        if (x1 > R->dx1) x1 = R->dx1;
+        if (y1 > R->dy1) y1 = R->dy1;
+        // nothing of this chunk lands in the preview: skip the decode
+        bool any = false;
+        for (int y = y0; y <= y1 && !any; y++) any = A.ymap[y - R->dy0] >= 0;
+        if (!any) continue;
+        uint64_t off = rd64(R->table + 8 * ci);
+        if (off < 8 || off >= R->size) continue;
+        const uint8_t* c = R->data + off;
+        size_t room = (size_t)(R->end - c);
+        if (R->multipart) {
+            if (room < 4 || rd32(c) != 0) continue;
+            c += 4;
+            room -= 4;
+        }
+        uint32_t dsz;
+        if (R->tiled) {
+            if (room < 20) continue;
+            if ((int)rd32(c) != tx || (int)rd32(c + 4) != ty || rd32(c + 8) || rd32(c + 12))
+                continue;
+            dsz = rd32(c + 16);
+            c += 20;
+            room -= 20;
+        } else {
+            if (room < 8 || (int)rd32(c) != y0) continue;
+            dsz = rd32(c + 4);
+            c += 8;
+            room -= 8;
+        }
+        if (dsz > room) continue;
+        uint8_t* planes = NULL;
+        bool good = decode_chunk(h, &D, c, dsz, x0, x1, y0, y1, pl, &planes);
+        if (good) {
+            if (D.dc_sparse) accumulate_dc(h, &A, pl, planes, x0, x1, y0, y1);
+            else accumulate(h, &A, pl, planes, x0, x1, y0, y1);
+            w->decoded++;
+        }
+        free(planes);
+    }
+    free(pl);
+    free(D.rowc);
+    free(D.huf);
+    free(D.lut);
+    free(D.tmp);
+    free(D.tmp2);
+    free(D.tmp3);
+}
+
+static DWORD WINAPI run_slice_thread(LPVOID p) {
+    run_slice((XWork*)p);
+    return 0;
+}
+
+static int exr_cpu_count(void) {
+    static volatile LONG n = 0;
+    if (n == 0) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        InterlockedExchange(&n, si.dwNumberOfProcessors > 0 ? (LONG)si.dwNumberOfProcessors : 1);
+    }
+    return (int)n;
+}
+
+#define EXR_MAX_THREADS 8
+
+// Decode every chunk that reaches the preview; returns how many decoded.
+static int exr_run_chunks(const XRun* R, long long W, long long H) {
+    XAcc* A = R->A;
+    size_t accn = (size_t)A->ow * A->oh * 4;
+    // threads: one per ~1 Mpx of real decode work, at most the cores
+    // (one left for the UI) and EXR_MAX_THREADS; extra accumulators are
+    // capped at ~64 MB so a huge preview never balloons memory
+    double work = (double)W * (double)H / (R->dc_only ? 64.0 : 1.0);
+    int nt = (int)(work / (1024.0 * 1024.0)) + 1;
+    int cpus = exr_cpu_count() - 1;
+    if (cpus < 1) cpus = 1;
+    if (nt > cpus) nt = cpus;
+    if (nt > EXR_MAX_THREADS) nt = EXR_MAX_THREADS;
+    if (nt > R->nchunks) nt = (int)R->nchunks;
+    size_t accb = accn * sizeof(float);
+    if (accb > 0 && (size_t)(nt - 1) * accb > (size_t)64 * 1024 * 1024)
+        nt = (int)((size_t)64 * 1024 * 1024 / accb) + 1;
+    if (nt < 1) nt = 1;
+
+    XWork wk[EXR_MAX_THREADS];
+    HANDLE th[EXR_MAX_THREADS];
+    memset(wk, 0, sizeof wk);
+    memset(th, 0, sizeof th);
+    int prio = GetThreadPriority(GetCurrentThread());
+    for (int t = 0; t < nt; t++) {
+        wk[t].R = R;
+        wk[t].tid = t;
+        wk[t].nt = nt;
+        wk[t].acc = (t == 0) ? A->acc : (float*)calloc(accn, sizeof(float));
+    }
+    // a helper that cannot get its buffer or thread: its slice runs here
+    for (int t = 1; t < nt; t++) {
+        if (!wk[t].acc) continue;
+        th[t] = CreateThread(NULL, 0, run_slice_thread, &wk[t], CREATE_SUSPENDED, NULL);
+        if (th[t]) {
+            if (prio != THREAD_PRIORITY_ERROR_RETURN) SetThreadPriority(th[t], prio);
+            ResumeThread(th[t]);
+        }
+    }
+    run_slice(&wk[0]);
+    for (int t = 1; t < nt; t++) {
+        if (th[t]) {
+            WaitForSingleObject(th[t], INFINITE);
+            CloseHandle(th[t]);
+        } else {
+            float* own = wk[t].acc;
+            wk[t].acc = own ? own : A->acc;   // no buffer: sum straight in
+            run_slice(&wk[t]);
+            if (!own) wk[t].acc = NULL;
+        }
+    }
+    int decoded = 0;
+    for (int t = 0; t < nt; t++) {
+        decoded += wk[t].decoded;
+        if (t > 0 && wk[t].acc) {
+            for (size_t i = 0; i < accn; i++) A->acc[i] += wk[t].acc[i];
+            free(wk[t].acc);
+        }
+    }
+    return decoded;
 }
 
 static bool exr_preview_impl(const uint8_t* data, size_t size, int max_w, int max_h,
@@ -1662,6 +1919,20 @@ static bool exr_preview_impl(const uint8_t* data, size_t size, int max_w, int ma
     if (oh < 1) oh = 1;
     if (ow > fw) ow = fw;
     if (oh > fh) oh = fh;
+    // DWA frame 6x+ bigger than the preview: build it from the 8x8 block
+    // averages alone (no AC data, no inverse DCT - ~10x faster) and cap the
+    // preview at that 1/8 resolution. The cap costs at most 25% size versus
+    // the request, invisible in a cell that size.
+    bool dwa = (h->comp == C_DWAA || h->comp == C_DWAB);
+    if (dwa && fw >= ow * 6 && fh >= oh * 6 && (ow * 8 > fw || oh * 8 > fh)) {
+        double s8 = s;
+        if (dispw * s8 > fw / 8.0) s8 = (fw / 8.0) / dispw;
+        if (disph * s8 > fh / 8.0) s8 = (fh / 8.0) / disph;
+        ow = (int)(dispw * s8);
+        oh = (int)(disph * s8);
+        if (ow < 1) ow = 1;
+        if (oh < 1) oh = 1;
+    }
 
     A.dx0 = dx0;
     A.dy0 = dy0;
@@ -1670,9 +1941,7 @@ static bool exr_preview_impl(const uint8_t* data, size_t size, int max_w, int ma
     A.xmap = (int*)malloc((size_t)W * sizeof(int));
     A.ymap = (int*)malloc((size_t)H * sizeof(int));
     A.acc = (float*)calloc((size_t)ow * oh * 4, sizeof(float));
-    pl = (XPlane*)malloc((size_t)h->nch * sizeof(XPlane));
-    D.rowc = (int*)malloc((size_t)h->nch * sizeof(int));
-    if (!A.xmap || !A.ymap || !A.acc || !pl || !D.rowc) goto fail;
+    if (!A.xmap || !A.ymap || !A.acc) goto fail;
     for (long long x = 0; x < W; x++) {
         long long fx = dx0 + x - fx0;
         A.xmap[x] = (fx < 0 || fx >= fw) ? -1 : (int)(fx * ow / fw);
@@ -1683,6 +1952,10 @@ static bool exr_preview_impl(const uint8_t* data, size_t size, int max_w, int ma
     }
     pick_channels(h, &A);
     D.dc_only = (h->comp == C_DWAA || h->comp == C_DWAB) && fw >= ow * 8 && fh >= oh * 8;
+    D.dc_sparse = D.dc_only;
+    for (int k = 0; k < 4; k++)
+        if (A.sel[k] >= 0 && (h->ch[A.sel[k]].xs != 1 || h->ch[A.sel[k]].ys != 1))
+            D.dc_sparse = false;
 
     // chunk list
     int ncx = 1, ncy;
@@ -1699,49 +1972,15 @@ static bool exr_preview_impl(const uint8_t* data, size_t size, int max_w, int ma
     long long nchunks = (long long)ncx * ncy;
     if (nchunks > 64 * 1024 * 1024 || (size_t)(end - p) / 8 < (size_t)nchunks) goto fail;
     const uint8_t* table = p;
-    int decoded = 0;
-    for (long long ci = 0; ci < nchunks; ci++) {
-        int tx = (int)(ci % ncx), ty = (int)(ci / ncx);
-        int x0 = dx0 + tx * cw, y0 = dy0 + ty * chh;
-        int x1 = x0 + cw - 1, y1 = y0 + chh - 1;
-        if (x1 > dx1) x1 = dx1;
-        if (y1 > dy1) y1 = dy1;
-        // nothing of this chunk lands in the preview: skip the decode
-        bool any = false;
-        for (int y = y0; y <= y1 && !any; y++) any = A.ymap[y - dy0] >= 0;
-        if (!any) continue;
-        uint64_t off = rd64(table + 8 * ci);
-        if (off < 8 || off >= size) continue;
-        const uint8_t* c = data + off;
-        size_t room = (size_t)(end - c);
-        if (multipart) {
-            if (room < 4 || rd32(c) != 0) continue;
-            c += 4;
-            room -= 4;
-        }
-        uint32_t dsz;
-        if (tiled) {
-            if (room < 20) continue;
-            if ((int)rd32(c) != tx || (int)rd32(c + 4) != ty || rd32(c + 8) || rd32(c + 12))
-                continue;
-            dsz = rd32(c + 16);
-            c += 20;
-            room -= 20;
-        } else {
-            if (room < 8 || (int)rd32(c) != y0) continue;
-            dsz = rd32(c + 4);
-            c += 8;
-            room -= 8;
-        }
-        if (dsz > room) continue;
-        uint8_t* planes = NULL;
-        bool good = decode_chunk(h, &D, c, dsz, x0, x1, y0, y1, pl, &planes);
-        if (good) {
-            accumulate(h, &A, pl, planes, x0, x1, y0, y1);
-            decoded++;
-        }
-        free(planes);
-    }
+    XRun run;
+    memset(&run, 0, sizeof run);
+    run.h = h; run.data = data; run.size = size; run.end = end; run.table = table;
+    run.multipart = multipart; run.tiled = tiled;
+    run.ncx = ncx; run.cw = cw; run.chh = chh; run.nchunks = nchunks;
+    run.dx0 = dx0; run.dy0 = dy0; run.dx1 = dx1; run.dy1 = dy1;
+    run.A = &A;
+    run.dc_only = D.dc_only; run.dc_sparse = D.dc_sparse;
+    int decoded = exr_run_chunks(&run, W, H);
     if (!decoded) goto fail;
 
     // average, composite over the cell colour, encode sRGB

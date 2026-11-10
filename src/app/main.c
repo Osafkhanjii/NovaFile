@@ -3069,8 +3069,9 @@ static bool valid_name(const char* name, char* err, size_t en) {
 //   UNDO_NEW     to = created item   (sent to the Recycle Bin)
 //   UNDO_COPY    to = created copies (sent to the Recycle Bin)
 //   UNDO_MOVE    to -> from          (moved back where it came from)
-// Recycle-Bin deletes are not undone here - the bin itself restores them.
-enum { UNDO_NONE = 0, UNDO_RENAME, UNDO_NEW, UNDO_COPY, UNDO_MOVE };
+//   UNDO_RECYCLE from = deleted item (restored out of the Recycle Bin)
+// A permanent delete (Shift+Delete) can never be undone.
+enum { UNDO_NONE = 0, UNDO_RENAME, UNDO_NEW, UNDO_COPY, UNDO_MOVE, UNDO_RECYCLE };
 #define UNDO_MAX 512
 typedef struct { char from[1024]; char to[1024]; } UndoPair;
 static int g_undo_kind = UNDO_NONE;
@@ -3611,6 +3612,61 @@ static char g_rename_txt[512];
 static int g_rename_caret = 0;
 static int g_rename_sel0 = 0, g_rename_sel1 = 0;   // the part selected
 
+// Ctrl+Z / Ctrl+Y inside the field.  Every edit (typing run, Backspace,
+// Delete, cut, paste) first saves the text it is about to change, so
+// Ctrl+Z steps back through the edits - all the way to the original name -
+// and Ctrl+Y (or Ctrl+Shift+Z) steps forward again.  A run of typed
+// characters is ONE step, like any text box.  Lives in .bss: no exe size.
+#define REN_UNDO_MAX 64
+typedef struct { char txt[512]; int s0, s1; } RenSnap;
+static RenSnap g_ren_hist[REN_UNDO_MAX];
+static int g_ren_hist_n = 0;              // saved states (undo depth)
+static int g_ren_redo_n = 0;              // states above it (redo depth)
+static int g_ren_last_op = 0;             // 1 = typing run, 2 = deleting run
+
+static void ren_hist_reset(void) { g_ren_hist_n = g_ren_redo_n = 0; g_ren_last_op = 0; }
+static void ren_snap(RenSnap* d) {
+    snprintf(d->txt, sizeof d->txt, "%s", g_rename_txt);
+    d->s0 = g_rename_sel0; d->s1 = g_rename_sel1;
+}
+static void ren_load(const RenSnap* d) {
+    snprintf(g_rename_txt, sizeof g_rename_txt, "%s", d->txt);
+    g_rename_sel0 = d->s0; g_rename_sel1 = d->s1;
+    g_rename_caret = g_rename_sel1;
+}
+// Call BEFORE an edit.  op 1/2 = typing/deleting (a run of the same kind
+// is merged into one step), 0 = a one-off edit (cut, paste).
+static void ren_save(int op) {
+    if (op && op == g_ren_last_op) return;
+    g_ren_last_op = op;
+    if (g_ren_hist_n == REN_UNDO_MAX) {   // full: drop the oldest step
+        memmove(&g_ren_hist[0], &g_ren_hist[1], (REN_UNDO_MAX - 1) * sizeof(RenSnap));
+        g_ren_hist_n--;
+    }
+    ren_snap(&g_ren_hist[g_ren_hist_n++]);
+    g_ren_redo_n = 0;                     // a new edit ends the redo chain
+}
+static void ren_undo(void) {
+    if (g_ren_hist_n <= 0) return;
+    RenSnap cur;
+    ren_snap(&cur);
+    RenSnap prev = g_ren_hist[--g_ren_hist_n];
+    g_ren_hist[g_ren_hist_n] = cur;       // slot above the depth = redo
+    g_ren_redo_n++;
+    ren_load(&prev);
+    g_ren_last_op = 0;
+}
+static void ren_redo(void) {
+    if (g_ren_redo_n <= 0) return;
+    RenSnap cur;
+    ren_snap(&cur);
+    RenSnap next = g_ren_hist[g_ren_hist_n];
+    g_ren_hist[g_ren_hist_n++] = cur;
+    g_ren_redo_n--;
+    ren_load(&next);
+    g_ren_last_op = 0;
+}
+
 static void rename_begin(DirEntry* e) {
     if (!e) return;
     int vi = -1;
@@ -3623,6 +3679,7 @@ static void rename_begin(DirEntry* e) {
     g_rename_sel0 = 0;
     g_rename_sel1 = name_body_len(e->name);
     g_rename_caret = g_rename_sel1;
+    ren_hist_reset();
     blur_fields();
 }
 
@@ -3646,6 +3703,7 @@ static void tab_rename_begin(int i) {
     g_rename_sel0 = 0;                    // whole label selected: typing
     g_rename_sel1 = (int)strlen(g_rename_txt);   // replaces it
     g_rename_caret = g_rename_sel1;
+    ren_hist_reset();
     blur_fields();
 }
 
@@ -3765,6 +3823,119 @@ static bool fs_recycle_one(const char* path, char* err, size_t en) {
     return true;
 }
 
+#include <sddl.h>       // ConvertSidToStringSidW: the user's bin folder
+// SHChangeNotify lives in shlobj.h, which clashes with this file's own
+// shell declarations: declare just the one call it needs.
+#ifndef SHCNE_UPDATEDIR
+#define SHCNE_UPDATEDIR 0x00001000L
+#define SHCNF_PATHW     0x0005
+DECLSPEC_IMPORT void WINAPI SHChangeNotify(LONG, UINT, LPCVOID, LPCVOID);
+#endif
+// Take ONE item back out of the Recycle Bin to where it was deleted from
+// (Ctrl+Z after Delete).  Each recycled item is a pair in
+//   <drive>:\$Recycle.Bin\<user SID>
+// "$Ixxxx" = a small record (version, size, deletion time, original path)
+// and "$Rxxxx" = the item itself (file or whole folder).  Restoring is a
+// rename of $R back to the original path plus removing its $I record -
+// exactly what the bin's own "Restore" does.  The newest record for that
+// path wins (the same name may have been deleted before).
+static bool fs_unrecycle_one(const char* path) {
+    if (!path || !path[0] || path[1] != ':' ||
+        GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
+        return false;                   // not a drive path / name taken again
+    wchar_t want[2048];
+    if (MultiByteToWideChar(CP_ACP, 0, path, -1, want, 2048) <= 0) return false;
+    // The bin records the LONG path ("C:\Users\Jonathan\..."), while
+    // the caller may hold a short 8.3 one ("C:\Users\JONATH~1\..."):
+    // compare against the long form of the (still existing) parent folder.
+    wchar_t longw[2048];
+    lstrcpynW(longw, want, 2048);
+    wchar_t* cut = wcsrchr(longw, L'\\');
+    if (cut) {
+        wchar_t name[600];
+        lstrcpynW(name, cut + 1, 600);
+        *cut = 0;
+        wchar_t lp[2048];
+        DWORD ln = GetLongPathNameW(longw, lp, 2048);
+        if (ln > 0 && ln < 2048 - 600)
+            _snwprintf(longw, 2048, L"%ls\\%ls", lp, name);
+        else
+            lstrcpynW(longw, want, 2048);
+        longw[2047] = 0;
+    }
+    wchar_t sid[256] = L"";
+    HANDLE tok = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        union { TOKEN_USER tu; BYTE b[512]; } ub;
+        DWORD got = 0;
+        if (GetTokenInformation(tok, TokenUser, &ub, sizeof ub, &got)) {
+            LPWSTR str = NULL;
+            if (ConvertSidToStringSidW(ub.tu.User.Sid, &str)) {
+                lstrcpynW(sid, str, 256);
+                LocalFree(str);
+            }
+        }
+        CloseHandle(tok);
+    }
+    if (!sid[0]) return false;
+    wchar_t dir[300];
+    _snwprintf(dir, 300, L"%c:\\$Recycle.Bin\\%ls", (wchar_t)path[0], sid);
+    dir[299] = 0;
+    wchar_t pat[320];
+    _snwprintf(pat, 320, L"%ls\\$I*", dir);
+    pat[319] = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    wchar_t best[MAX_PATH] = L"";
+    unsigned long long best_t = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        wchar_t ip[600];
+        _snwprintf(ip, 600, L"%ls\\%ls", dir, fd.cFileName);
+        ip[599] = 0;
+        HANDLE f = CreateFileW(ip, GENERIC_READ, FILE_SHARE_READ, NULL,
+                               OPEN_EXISTING, 0, NULL);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        BYTE rec[24 + 4 + 2 * 2048];
+        DWORD rd = 0;
+        ReadFile(f, rec, sizeof rec - 2, &rd, NULL);
+        CloseHandle(f);
+        if (rd < 24 + 2) continue;
+        rec[rd] = rec[rd + 1] = 0;
+        unsigned long long ver, t;
+        memcpy(&ver, rec, 8);
+        memcpy(&t, rec + 16, 8);
+        // v1 (Vista..8.1): the path follows at once, MAX_PATH chars;
+        // v2 (Windows 10+): a 4-byte character count comes first.
+        const BYTE* pp = (ver >= 2) ? rec + 28 : rec + 24;
+        if (pp >= rec + rd) continue;
+        wchar_t orig[2048];
+        size_t room = (size_t)(rec + rd - pp) / 2;
+        if (room > 2047) room = 2047;
+        memcpy(orig, pp, room * 2);
+        orig[room] = 0;
+        if ((lstrcmpiW(orig, want) == 0 || lstrcmpiW(orig, longw) == 0) &&
+            t >= best_t) {
+            best_t = t;
+            lstrcpynW(best, fd.cFileName, MAX_PATH);
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    if (!best[0]) return false;
+    wchar_t ifile[600], rfile[600];
+    _snwprintf(ifile, 600, L"%ls\\%ls", dir, best);
+    ifile[599] = 0;
+    lstrcpynW(rfile, ifile, 600);
+    wchar_t* mark = wcsrchr(rfile, L'\\');
+    if (!mark || mark[1] != L'$' || mark[2] != L'I') return false;
+    mark[2] = L'R';
+    if (!MoveFileExW(rfile, want, MOVEFILE_COPY_ALLOWED)) return false;
+    DeleteFileW(ifile);
+    SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, dir, NULL);
+    return true;
+}
+
 static void delete_confirm_mode(bool permanent);
 static void delete_confirm(void) {
     // Shift held = permanent (Shift+Delete, or Shift + the menu row).
@@ -3796,7 +3967,15 @@ static void delete_do(void) {
     for (int i = 0; i < g_del_n; i++) {
         bool ok = recycle ? fs_recycle_one(g_del_paths[i], err, sizeof(err))
                           : fs_delete_one(g_del_paths[i], err, sizeof(err));
-        if (ok) done++;
+        if (ok) {
+            // Ctrl+Z brings recycled items back (a permanent delete
+            // leaves nothing to bring back, so it records nothing).
+            if (recycle) {
+                if (done == 0) undo_begin(UNDO_RECYCLE);
+                undo_add(g_del_paths[i], "");
+            }
+            done++;
+        }
         else set_status("%s", err);
     }
     for (int i = 0; i < g_del_n; i++) free(g_del_paths[i]);
@@ -11277,6 +11456,23 @@ static void draw_props_panel(const Layout* L, const InputState* in) {
 // places the caret.
 static RectI g_rename_rect = {0, 0, 0, 0};
 static int   g_rename_tx = 0, g_rename_px = 0;
+static bool  g_rename_drag = false;     // mouse held after a press in the field
+
+// The caret index (byte offset, whole UTF-8 characters) nearest to the
+// pointer's x inside the rename field.
+static int rename_caret_at(int mx) {
+    int best = 0, bestd = 1 << 30;
+    int len = (int)strlen(g_rename_txt);
+    for (int i = 0; i <= len; i = (i < len) ? utf8_next(g_rename_txt, i) : len + 1) {
+        char pre[512];
+        snprintf(pre, sizeof pre, "%.*s", i, g_rename_txt);
+        int d = g_rename_tx + (int)measure_px(pre, g_rename_px) - mx;
+        if (d < 0) d = -d;
+        if (d < bestd) { bestd = d; best = i; }
+        if (i >= len) break;
+    }
+    return best;
+}
 
 static void draw_rename_overlay(const Layout* L, const InputState* in) {
     (void)in;                   // the overlay is driven by g_rename_vi alone
@@ -16763,11 +16959,14 @@ static void undo_run(void) {
                              : fs_recycle_one(v[i].to, err, sizeof err))
                 ok++;
             break;
+        case UNDO_RECYCLE:
+            if (fs_unrecycle_one(v[i].from)) ok++;
+            break;
         }
     }
     free(v);
     load_dir(g_app.current_path);
-    static const char* what[] = {"", "Rename", "New item", "Copy", "Move"};
+    static const char* what[] = {"", "Rename", "New item", "Copy", "Move", "Delete"};
     if (ok == n)
         set_status("Undo %s (%d item%s)", what[kind], ok, ok == 1 ? "" : "s");
     else
@@ -17791,6 +17990,18 @@ static void handle_keys(InputState* in, const Layout* L) {
     // instead of vanishing into an open menu.
     if (g_ctx_open && ctx_handle_key(in)) return;
 
+    // Alt+E / Alt+D: the address bar with the WHOLE path selected, ready
+    // to copy (Ctrl+C) or to overwrite by typing.  Checked before any text
+    // field takes the key, so pressing it again while the bar is already
+    // open selects everything again.
+    if (in->alt_pressed && !in->ctrl_pressed && !in->win_pressed &&
+        (in->key_code == 'E' || in->key_code == 'D') &&
+        g_confirm_kind == CONFIRM_NONE && g_rename_vi < 0) {
+        focus_address();
+        g_app.addr_anchor = 0;
+        g_app.addr_caret = (int)strlen(g_app.addr_buf);
+        return;
+    }
     bool editing = g_app.addr_focused || g_app.search_focused;
     bool is_addr = g_app.addr_focused;
     bool is_search = g_app.search_focused;
@@ -19405,11 +19616,11 @@ static void help_build(void) {
     help_add(G1, "Backspace", "Parent folder");
     help_add(G1, "Alt+Left  /  Alt+Right", "Back / Forward");
     help_add(G1, "Alt+Up", "One level up");
-    help_add(G1, "Alt+D", "Type a path in the address bar");
+    help_add(G1, "Alt+E  /  Alt+D", "Address bar, whole path selected (copy / type)");
     help_add(G1, "Type a name", "Jump to the item that starts with it");
     const char* G2 = "Files";
     help_add(G2, "Shift+Delete", "Delete permanently (skips the Recycle Bin)");
-    help_add(G2, "Ctrl+Z", "Undo the last rename / new item / paste");
+    help_add(G2, "Ctrl+Z", "Undo the last rename / delete / new item / paste");
     help_add(G2, "Alt+Enter", "Properties");
     help_add(G2, "Menu key  /  Shift+F10", "Context menu of the selection");
     help_add(G2, "Type in a menu", "Search every command in it");
@@ -20210,28 +20421,36 @@ static void handle_mouse(const Layout* L, InputState* in) {
     //      row under it, opens a menu...), so a rename opened by accident
     //      (F2 or the menu) never traps the user until Enter.  A click
     //      INSIDE places the caret; a double click there selects the name.
+    // Drag inside the rename field = select part of the name (like any
+    // text box): the press set the anchor, the held pointer moves the end.
+    if (g_rename_vi >= 0 && g_rename_drag) {
+        if (!in->left_down) {
+            g_rename_drag = false;
+        } else if (!in->left_click) {
+            g_rename_caret = g_rename_sel1 = rename_caret_at(in->x);
+            return;
+        }
+    }
     if (g_rename_vi >= 0 &&
         (in->left_click || in->right_click || in->middle_click)) {
         bool in_field = g_rename_rect.w > 0 &&
                         inside(&g_rename_rect, in->x, in->y);
         if (!in_field) {
+            g_rename_drag = false;
             rename_commit();            // unchanged text = nothing happens
         } else if (in->double_click) {
+            g_rename_drag = false;
             g_rename_sel0 = 0;
             g_rename_sel1 = g_rename_caret = (int)strlen(g_rename_txt);
             return;
         } else if (in->left_click) {
-            int best = 0, bestd = 1 << 30;
-            int len = (int)strlen(g_rename_txt);
-            for (int i = 0; i <= len; i = (i < len) ? utf8_next(g_rename_txt, i) : len + 1) {
-                char pre[512];
-                snprintf(pre, sizeof pre, "%.*s", i, g_rename_txt);
-                int d = g_rename_tx + (int)measure_px(pre, g_rename_px) - in->x;
-                if (d < 0) d = -d;
-                if (d < bestd) { bestd = d; best = i; }
-                if (i >= len) break;
+            int best = rename_caret_at(in->x);
+            if (in->shift_pressed) {          // Shift+click extends
+                g_rename_caret = g_rename_sel1 = best;
+            } else {
+                g_rename_caret = g_rename_sel0 = g_rename_sel1 = best;
             }
-            g_rename_caret = g_rename_sel0 = g_rename_sel1 = best;
+            g_rename_drag = true;
             caret_touch();
             return;
         } else {
@@ -20295,6 +20514,11 @@ static void handle_mouse(const Layout* L, InputState* in) {
     // never one shape for the whole popup.  The magnifier is a BUTTON (it
     // activates search) and the (x) clears the query: both get the pointing
     // hand FIRST, and only the editable run of text between them the I-beam.
+    // The inline RENAME box (F2, or a tab being renamed) is a text field
+    // too: I-beam over it, and for the whole of a selection drag.
+    if (g_rename_vi >= 0 && g_rename_rect.w > 0 &&
+        (g_rename_drag || inside(&g_rename_rect, in->x, in->y)))
+        platform_set_cursor(NOVA_CURSOR_IBEAM);
     if (!overlay_owns_input()) {
         bool hand = false;
         if (g_addr_popup_open && g_addr_popup_pane) {
@@ -20377,8 +20601,47 @@ static void handle_mouse(const Layout* L, InputState* in) {
                      : (in->key_repeat != VK_ESCAPE &&
                         in->key_repeat != VK_RETURN)
                            ? in->key_repeat : 0;
+        // Clipboard + select-all, like every other text box.  The field's
+        // anchor is sel0 and its moving end is sel1 (== caret), which is
+        // exactly the caret/anchor pair the shared text helpers expect.
+        if (in->ctrl_pressed && in->key_code) {
+            int kc = in->key_code;
+            g_rename_caret = g_rename_sel1;
+            if (kc == 'Z' && !in->shift_pressed) { ren_undo(); return; }
+            if (kc == 'Y' || (kc == 'Z' && in->shift_pressed)) { ren_redo(); return; }
+            if (kc == 'A') {
+                text_select_all(g_rename_txt, &g_rename_caret, &g_rename_sel0);
+            } else if (kc == 'C' || kc == 'X') {
+                if (kc == 'X' && g_rename_sel0 != g_rename_caret) ren_save(0);
+                text_copy(g_rename_txt, &g_rename_caret, &g_rename_sel0, kc == 'X');
+            } else if (kc == 'V') {
+                ren_save(0);
+                text_paste(g_rename_txt, sizeof g_rename_txt, &g_rename_caret, &g_rename_sel0);
+            } else {
+                return;                   // other Ctrl keys: the field has them
+            }
+            g_rename_sel1 = g_rename_caret;
+            return;
+        }
+        // Shift + arrows / Home / End grow the selection from its anchor.
+        if (in->shift_pressed &&
+            (k2 == VK_LEFT || k2 == VK_RIGHT || k2 == VK_HOME || k2 == VK_END)) {
+            int len = (int)strlen(g_rename_txt);
+            int c = g_rename_sel1;
+            if (k2 == VK_LEFT && c > 0) c = utf8_prev(g_rename_txt, c);
+            else if (k2 == VK_RIGHT && c < len) c = utf8_next(g_rename_txt, c);
+            else if (k2 == VK_HOME) c = 0;
+            else if (k2 == VK_END) c = len;
+            g_rename_caret = g_rename_sel1 = c;
+            return;
+        }
         int lo = g_rename_sel0, hi = g_rename_sel1;
         if (lo > hi) { int t = lo; lo = hi; hi = t; }
+        if ((k2 == VK_BACK && (lo < hi || g_rename_caret > 0)) ||
+            (k2 == VK_DELETE && (lo < hi || g_rename_caret < (int)strlen(g_rename_txt))))
+            ren_save(lo < hi ? 0 : 2);
+        else if (k2 == VK_LEFT || k2 == VK_RIGHT || k2 == VK_HOME || k2 == VK_END)
+            g_ren_last_op = 0;            // caret moved: the next edit is a new step
         if (k2 == VK_BACK) {
             if (lo < hi) { memmove(g_rename_txt + lo, g_rename_txt + hi,
                                    strlen(g_rename_txt + hi) + 1);
@@ -20428,6 +20691,8 @@ static void handle_mouse(const Layout* L, InputState* in) {
             return;
         }
         if (in->char_pressed >= 32) {
+            ren_save(lo < hi ? 0 : 1);
+            if (lo < hi) g_ren_last_op = 1;   // typing on after the replace joins it
             int len = (int)strlen(g_rename_txt);
             if (lo < hi) {                 // replace the selection
                 memmove(g_rename_txt + lo, g_rename_txt + hi,
@@ -23318,6 +23583,15 @@ static void st_explorer_parity(void) {
         undo_run();
         X_EXP(GetFileAttributesA(b) == INVALID_FILE_ATTRIBUTES &&
               GetFileAttributesA(a) != INVALID_FILE_ATTRIBUTES, "undo copy keeps source");
+        // Delete to the Recycle Bin, then Ctrl+Z: the file comes back.
+        // (Uses the real bin: the item is restored, nothing is left in it.)
+        if (a[1] == ':' && fs_recycle_one(a, err, sizeof err)) {
+            undo_begin(UNDO_RECYCLE);
+            undo_add(a, "");
+            X_EXP(GetFileAttributesA(a) == INVALID_FILE_ATTRIBUTES, "deleted to the bin");
+            undo_run();
+            X_EXP(GetFileAttributesA(a) != INVALID_FILE_ATTRIBUTES, "undo delete restores it");
+        }
         load_dir(keep[0] ? keep : platform_get_home_directory());
     }
 
@@ -27948,6 +28222,124 @@ static void run_selftest(void) {
                    ran ? (tf ? "FAILED" : "ok") : "skipped");
             if (ran && tf) printf("[selftest] FAIL: tab rename\n");
             while (g_ws_n > 1) ws_close(g_ws_n - 1);
+        }
+
+        // ---- (K00) Alt+E / Alt+D: address bar open, WHOLE path selected -
+        //      also when the bar is already open with the caret elsewhere
+        {
+            compute_layout(&M, w, h);
+            g_content = M.list;
+            blur_fields();
+            memset(&f, 0, sizeof f);
+            f.key_code = 'E';
+            f.alt_pressed = true;
+            st_input(&M, &f);
+            int len = (int)strlen(g_app.addr_buf);
+            bool e1 = g_app.addr_focused && len > 0 && g_app.addr_anchor == 0 &&
+                      g_app.addr_caret == len &&
+                      strcmp(g_app.addr_buf, g_app.current_path) == 0;
+            g_app.addr_caret = g_app.addr_anchor = 3;     // user moved the caret
+            memset(&f, 0, sizeof f);
+            f.key_code = 'D';
+            f.alt_pressed = true;
+            st_input(&M, &f);
+            bool d2 = g_app.addr_focused && g_app.addr_anchor == 0 &&
+                      g_app.addr_caret == (int)strlen(g_app.addr_buf);
+            blur_fields();
+            bool ok = e1 && d2;
+            printf("[selftest]   Alt+E selects the whole path=%d, Alt+D again=%d: %s\n",
+                   e1, d2, ok ? "ok" : "FAILED");
+            if (!ok) printf("[selftest] FAIL: Alt+E / Alt+D select all\n");
+        }
+
+        // ---- (K01) the inline RENAME field behaves like a text box:
+        //      Ctrl+A, Shift+Home, mouse-drag selection, Ctrl+X.  Nothing is
+        //      ever committed: the rename is cancelled at the end.
+        if (g_app.view_count > 0) {
+            compute_layout(&M, w, h);
+            g_content = M.list;
+            rename_begin(&g_app.entries[g_app.view[0]]);
+            int len = (int)strlen(g_rename_txt);
+            bool open = g_rename_vi == 0 && len > 1;
+            memset(&f, 0, sizeof f);
+            f.key_code = 'A'; f.ctrl_pressed = true;
+            st_input(&M, &f);
+            bool all = g_rename_sel0 == 0 && g_rename_sel1 == len;
+            memset(&f, 0, sizeof f);
+            f.key_code = VK_END;
+            st_input(&M, &f);                      // caret to the end
+            memset(&f, 0, sizeof f);
+            f.key_code = VK_HOME; f.shift_pressed = true;
+            st_input(&M, &f);
+            bool shome = g_rename_sel0 == len && g_rename_sel1 == 0;
+            // drag from the first character to the end of the second
+            g_rename_rect = (RectI){100, 100, 600, 30};
+            g_rename_tx = 106;
+            g_rename_px = 16;
+            int two = utf8_next(g_rename_txt, utf8_next(g_rename_txt, 0));
+            char pre[512];
+            snprintf(pre, sizeof pre, "%.*s", two, g_rename_txt);
+            memset(&f, 0, sizeof f);
+            f.x = 106; f.y = 110; f.left_click = f.left_down = true;
+            handle_mouse(&M, &f);
+            f.left_click = false;
+            f.x = 106 + (int)measure_px(pre, 16);
+            handle_mouse(&M, &f);
+            bool drag = g_rename_sel0 == 0 && g_rename_sel1 == two && g_rename_vi == 0;
+            f.left_down = false;
+            handle_mouse(&M, &f);
+            memset(&f, 0, sizeof f);
+            f.key_code = 'X'; f.ctrl_pressed = true;
+            st_input(&M, &f);
+            bool cut = (int)strlen(g_rename_txt) == len - two;
+            // Ctrl+Z puts the cut text back; type "ab", Backspace, then
+            // Ctrl+Z twice = back to the original; Ctrl+Y redoes.
+            char orig[512];
+            snprintf(orig, sizeof orig, "%s", g_app.entries[g_app.view[0]].name);
+            memset(&f, 0, sizeof f);
+            f.key_code = 'Z'; f.ctrl_pressed = true;
+            st_input(&M, &f);
+            bool und1 = strcmp(g_rename_txt, orig) == 0;
+            memset(&f, 0, sizeof f);
+            f.key_code = VK_END;
+            st_input(&M, &f);
+            memset(&f, 0, sizeof f);
+            f.char_pressed = 'a';
+            st_input(&M, &f);
+            f.char_pressed = 'b';
+            st_input(&M, &f);
+            memset(&f, 0, sizeof f);
+            f.key_code = VK_BACK;
+            st_input(&M, &f);
+            char typed[600];
+            snprintf(typed, sizeof typed, "%sa", orig);
+            bool tb = strcmp(g_rename_txt, typed) == 0;
+            memset(&f, 0, sizeof f);
+            f.key_code = 'Z'; f.ctrl_pressed = true;
+            st_input(&M, &f);                      // undo the Backspace
+            snprintf(typed, sizeof typed, "%sab", orig);
+            bool und2 = strcmp(g_rename_txt, typed) == 0;
+            st_input(&M, &f);                      // undo the typing run
+            bool und3 = strcmp(g_rename_txt, orig) == 0;
+            memset(&f, 0, sizeof f);
+            f.key_code = 'Y'; f.ctrl_pressed = true;
+            st_input(&M, &f);
+            bool redo = strcmp(g_rename_txt, typed) == 0 && g_rename_vi == 0;
+            // the I-beam over the field
+            memset(&f, 0, sizeof f);
+            f.x = 150; f.y = 110;
+            handle_mouse(&M, &f);
+            bool ibeam = platform_get_cursor() == NOVA_CURSOR_IBEAM;
+            printf("[selftest]   rename undo: cut=%d type+bs=%d undo=%d,%d redo=%d ibeam=%d\n",
+                   und1, tb, und2, und3, redo, ibeam);
+            if (!(und1 && tb && und2 && und3 && redo && ibeam))
+                printf("[selftest] FAIL: rename field undo / cursor\n");
+            rename_cancel();
+            g_rename_rect = (RectI){0, 0, 0, 0};
+            bool ok = open && all && shome && drag && cut && g_rename_vi < 0;
+            printf("[selftest]   rename field: Ctrl+A=%d Shift+Home=%d drag=%d Ctrl+X=%d: %s\n",
+                   all, shome, drag, cut, ok ? "ok" : "FAILED");
+            if (!ok) printf("[selftest] FAIL: rename field selection\n");
         }
 
         // ---- (K0) Alt+Enter opens Properties AND it stays open (the same

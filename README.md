@@ -261,7 +261,7 @@ is in this repository. Output: `build\NovaFile.exe` (~955 KB).
 | Alt+Up                     | Parent folder                   |
 | Hold Alt + move the mouse  | Left = Back, right = Forward, up = one folder up |
 | Alt+Enter                  | Properties                      |
-| Alt+D                      | Address bar                     |
+| Alt+E or Alt+D             | Address bar with the whole path selected (copy or type a new one) |
 | Shift+Delete               | Delete permanently (skips the Recycle Bin) |
 | Ctrl+Z                     | Undo the last rename / new item / paste |
 | F11                        | Maximize / restore              |

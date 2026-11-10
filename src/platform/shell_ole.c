@@ -268,6 +268,42 @@ static HRESULT STDMETHODCALLTYPE ds_feedback(IDropSource* This, DWORD eff) {
 static IDropSourceVtbl g_ds_vtbl = {ds_qi, ds_addref, ds_release, ds_continue,
                                     ds_feedback};
 
+// SHMultiFileProperties takes the items as a data object (from the
+// shell itself, like the drag below) and opens the sheet on its own
+// thread.  It needs no context menu, so no shell extension is loaded:
+// the dialog shows at once.  Looked up at run time - old import
+// libraries do not list it.
+bool shell_properties(void* hwnd, char** paths, int n) {
+    (void)hwnd;
+    if (!paths || n <= 0) return false;
+    if (n > 512) n = 512;
+    typedef HRESULT (WINAPI *MultiProps)(IDataObject*, DWORD);
+    MultiProps fn = (MultiProps)(void*)GetProcAddress(
+        GetModuleHandleA("shell32.dll"), "SHMultiFileProperties");
+    if (!fn) return false;
+    PIDLIST_ABSOLUTE* abs = (PIDLIST_ABSOLUTE*)calloc((size_t)n, sizeof *abs);
+    PCUITEMID_CHILD* kids = (PCUITEMID_CHILD*)calloc((size_t)n, sizeof *kids);
+    bool ok = false;
+    if (abs && kids) {
+        IShellFolder* parent = items_of(paths, n, abs, kids);
+        if (parent) {
+            IDataObject* data = NULL;
+            if (SUCCEEDED(IShellFolder_GetUIObjectOf(parent, (HWND)hwnd,
+                                                     (UINT)n, kids,
+                                                     &IID_IDataObject, NULL,
+                                                     (void**)&data)) && data) {
+                ok = SUCCEEDED(fn(data, 0));
+                IDataObject_Release(data);
+            }
+            IShellFolder_Release(parent);
+        }
+        free_pidls(abs, n);
+    }
+    free(abs);
+    free(kids);
+    return ok;
+}
+
 int shell_drag_files(void* hwnd, char** paths, int n) {
     if (!paths || n <= 0) return 0;
     if (n > 4096) n = 4096;

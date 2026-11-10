@@ -184,7 +184,7 @@ is in this repository. Output: `build\NovaFile.exe` (~955 KB).
   overwrites: a copy in the same folder becomes `name - Copy`, a taken
   name becomes `name (2)`, and a folder can never be pasted into itself.
   Copies run on a **background thread** (progress in the status bar, Esc
-  cancels), and **Ctrl+Z** undoes the last rename, new item or paste
+  cancels), and **Ctrl+Z** undoes renames, deletes, new items and pastes, one step per press
 - **Drag and drop with Windows** - drag files **out** to Explorer, the
   desktop or any app, and drop files **in** from them (same drive moves,
   another drive copies; Ctrl = copy, Shift = move); a drop lands in the
@@ -263,7 +263,7 @@ is in this repository. Output: `build\NovaFile.exe` (~955 KB).
 | Alt+Enter                  | Properties                      |
 | Alt+E or Alt+D             | Address bar with the whole path selected (copy or type a new one) |
 | Shift+Delete               | Delete permanently (skips the Recycle Bin) |
-| Ctrl+Z                     | Undo the last rename / new item / paste |
+| Ctrl+Z                     | Undo rename / delete / new item / paste (press again for more) |
 | F11                        | Maximize / restore              |
 | Menu key / Shift+F10       | Context menu of the selection   |
 | F1                         | Keyboard shortcuts guide (searchable) |
@@ -394,7 +394,7 @@ four-tap bilinear guess).
 
 - **No silent damage**: every delete is confirmed and goes to the
   Recycle Bin unless you hold Shift; paste never overwrites an existing
-  file; Ctrl+Z takes the last rename / new item / paste back.
+  file; Ctrl+Z takes renames, deletes, new items and pastes back, one step per press.
 - Files are handed to the OS default handler (`ShellExecuteA`); Nova File
   never parses or executes them itself.
 - All strings bounded (`snprintf` / `strncpy`), allocations checked,

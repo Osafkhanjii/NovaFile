@@ -1402,7 +1402,12 @@ static void rebuild_view(void);
 static void set_sort(int key);
 static void load_dir(const char* path);
 static void folder_watch_poke(void);   // auto-refresh soon (shell verb ran)
+static void folder_watch_quiet(void);  // our own change: no second reload
 static void folder_refresh_keep(void); // reload, keeping scroll + selection
+static void new_snap_take(void);       // note the listing before a menu verb
+static void new_snap_clear(void);
+static bool new_snap_apply(void);
+static bool g_new_snap_rename;          // (defined with the snapshot code)
 static void blur_fields(void);
 static void focus_search(void);        // the search popup draws auto-focused
 static void search_restore(void);     // cancel scan / swap the real listing back
@@ -3063,20 +3068,24 @@ static bool valid_name(const char* name, char* err, size_t en) {
 }
 
 // ---- UNDO (Ctrl+Z) -------------------------------------------------------
-// One level, like most people use Explorer's: the LAST rename, new item
-// or paste can be taken back.  Each record is a list of (from, to) pairs:
+// MANY levels, like Explorer: every rename, delete, new item or paste is
+// one record on a stack, and each Ctrl+Z takes the newest one back - so
+// three deletes in a row come back with three Ctrl+Z.  Each record is a
+// list of (from, to) pairs:
 //   UNDO_RENAME  to -> from          (rename back)
 //   UNDO_NEW     to = created item   (sent to the Recycle Bin)
 //   UNDO_COPY    to = created copies (sent to the Recycle Bin)
 //   UNDO_MOVE    to -> from          (moved back where it came from)
-//   UNDO_RECYCLE from = deleted item (restored out of the Recycle Bin)
+//   UNDO_RECYCLE from = deleted item, to = the delete's time stamp
+//                (restored out of the Recycle Bin)
 // A permanent delete (Shift+Delete) can never be undone.
 enum { UNDO_NONE = 0, UNDO_RENAME, UNDO_NEW, UNDO_COPY, UNDO_MOVE, UNDO_RECYCLE };
-#define UNDO_MAX 512
-typedef struct { char from[1024]; char to[1024]; } UndoPair;
-static int g_undo_kind = UNDO_NONE;
-static UndoPair* g_undo = NULL;          // UNDO_MAX pairs, allocated once
-static int g_undo_n = 0;
+#define UNDO_LEVELS 64                   // oldest record dropped past this
+typedef struct { char* from; char* to; } UndoPair;
+typedef struct { int kind, id, n, cap; UndoPair* v; } UndoRec;
+static UndoRec g_ustack[UNDO_LEVELS];
+static int g_ustack_n = 0;
+static int g_undo_next_id = 1;
 static CRITICAL_SECTION g_undo_cs;       // the paste worker records too
 static bool g_undo_cs_ok = false;
 
@@ -3086,21 +3095,92 @@ static void undo_lock(void) {
 }
 static void undo_unlock(void) { LeaveCriticalSection(&g_undo_cs); }
 
-static void undo_begin(int kind) {
+static void undo_rec_free(UndoRec* r) {
+    for (int i = 0; i < r->n; i++) { free(r->v[i].from); free(r->v[i].to); }
+    free(r->v);
+    memset(r, 0, sizeof *r);
+}
+// Open a new record on top of the stack; returns its id (a worker that
+// keeps adding to it later uses undo_add_id with that id).
+static int undo_begin(int kind) {
     undo_lock();
-    if (!g_undo) g_undo = (UndoPair*)calloc(UNDO_MAX, sizeof(UndoPair));
-    g_undo_kind = g_undo ? kind : UNDO_NONE;
-    g_undo_n = 0;
+    // records that never received an item (a paste that copied nothing)
+    // are dropped first so they never cost a level
+    while (g_ustack_n > 0 && g_ustack[g_ustack_n - 1].n == 0)
+        undo_rec_free(&g_ustack[--g_ustack_n]);
+    if (g_ustack_n == UNDO_LEVELS) {
+        undo_rec_free(&g_ustack[0]);
+        memmove(&g_ustack[0], &g_ustack[1], (UNDO_LEVELS - 1) * sizeof(UndoRec));
+        g_ustack_n--;
+        memset(&g_ustack[g_ustack_n], 0, sizeof(UndoRec));
+    }
+    UndoRec* r = &g_ustack[g_ustack_n++];
+    memset(r, 0, sizeof *r);
+    r->kind = kind;
+    r->id = g_undo_next_id++;
+    int id = r->id;
+    undo_unlock();
+    return id;
+}
+static void undo_add_id(int id, const char* from, const char* to) {
+    undo_lock();
+    for (int k = g_ustack_n - 1; k >= 0; k--) {
+        UndoRec* r = &g_ustack[k];
+        if (r->id != id) continue;
+        if (r->n == r->cap) {
+            int nc = r->cap ? r->cap * 2 : 8;
+            UndoPair* nv = (UndoPair*)realloc(r->v, (size_t)nc * sizeof(UndoPair));
+            if (!nv) break;
+            r->v = nv;
+            r->cap = nc;
+        }
+        r->v[r->n].from = _strdup(from ? from : "");
+        r->v[r->n].to = _strdup(to ? to : "");
+        if (r->v[r->n].from && r->v[r->n].to) r->n++;
+        else { free(r->v[r->n].from); free(r->v[r->n].to); }
+        break;
+    }
     undo_unlock();
 }
 static void undo_add(const char* from, const char* to) {
     undo_lock();
-    if (g_undo && g_undo_kind != UNDO_NONE && g_undo_n < UNDO_MAX) {
-        snprintf(g_undo[g_undo_n].from, sizeof g_undo[0].from, "%s", from ? from : "");
-        snprintf(g_undo[g_undo_n].to, sizeof g_undo[0].to, "%s", to ? to : "");
-        g_undo_n++;
+    int id = g_ustack_n > 0 ? g_ustack[g_ustack_n - 1].id : 0;
+    undo_unlock();
+    if (id) undo_add_id(id, from, to);
+}
+// The `to` of item i of the newest record, when that record is `kind`.
+static bool undo_top_to(int kind, int i, char* out, size_t cap) {
+    bool ok = false;
+    undo_lock();
+    if (g_ustack_n > 0) {
+        UndoRec* r = &g_ustack[g_ustack_n - 1];
+        if (r->kind == kind && i >= 0 && i < r->n) {
+            snprintf(out, cap, "%s", r->v[i].to);
+            ok = true;
+        }
     }
     undo_unlock();
+    return ok;
+}
+// A copy of one side (`to` or `from`) of record `id`; free with
+// sel_paths_free().  NULL when the record is gone or empty.
+static char** undo_rec_paths(int id, bool to_side, int* n_out) {
+    char** out = NULL;
+    *n_out = 0;
+    undo_lock();
+    for (int k = g_ustack_n - 1; k >= 0; k--) {
+        UndoRec* r = &g_ustack[k];
+        if (r->id != id) continue;
+        if (r->n > 0 && (out = (char**)calloc((size_t)r->n, sizeof(char*)))) {
+            for (int i = 0; i < r->n; i++) {
+                out[*n_out] = _strdup(to_side ? r->v[i].to : r->v[i].from);
+                if (out[*n_out]) (*n_out)++;
+            }
+        }
+        break;
+    }
+    undo_unlock();
+    return out;
 }
 
 // Rename one entry to `new_name` - the FULL name as the inline field shows
@@ -3184,12 +3264,15 @@ static bool fs_delete_one(const char* path, char* err, size_t en) {
 
 // ---- new ----
 static char g_new_item_path[2048];     // the item the last "New" created
+// The parent may be a drive root ("D:\"): path_sep() adds a backslash
+// only when one is missing.  "D:\\New folder" never matched the
+// listing, so the new item was not selected - the TOP row was.
 static bool fs_new_folder(const char* parent, char* err, size_t en) {
     char path[2048];
     int n = 1;
     for (;;) {
-        if (n == 1) snprintf(path, sizeof(path), "%s\\New folder", parent);
-        else snprintf(path, sizeof(path), "%s\\New folder (%d)", parent, n);
+        if (n == 1) snprintf(path, sizeof(path), "%s%sNew folder", parent, path_sep(parent));
+        else snprintf(path, sizeof(path), "%s%sNew folder (%d)", parent, path_sep(parent), n);
         if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) break;
         n++;
         if (n > 999) { snprintf(err, en, "Too many \"New folder\" entries"); return false; }
@@ -3208,8 +3291,8 @@ static bool fs_new_text(const char* parent, char* err, size_t en) {
     char path[2048];
     int n = 1;
     for (;;) {
-        if (n == 1) snprintf(path, sizeof(path), "%s\\New Text Document.txt", parent);
-        else snprintf(path, sizeof(path), "%s\\New Text Document (%d).txt", parent, n);
+        if (n == 1) snprintf(path, sizeof(path), "%s%sNew Text Document.txt", parent, path_sep(parent));
+        else snprintf(path, sizeof(path), "%s%sNew Text Document (%d).txt", parent, path_sep(parent), n);
         if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) break;
         n++;
         if (n > 999) { snprintf(err, en, "Too many entries"); return false; }
@@ -3323,6 +3406,7 @@ static bool fs_copy_to(const char* src, const char* dst, char* err, size_t en) {
     return true;
 }
 
+static int g_paste_undo_id = 0;           // the undo record a paste fills
 static bool fs_paste_one(const char* src, const char* dst_dir, bool move,
                          char* err, size_t en) {
     DWORD a = GetFileAttributesA(src);
@@ -3348,19 +3432,21 @@ static bool fs_paste_one(const char* src, const char* dst_dir, bool move,
     }
     if (move) {
         if (MoveFileExA(src, dst, MOVEFILE_COPY_ALLOWED)) {
-            undo_add(src, dst);
+            undo_add_id(g_paste_undo_id, src, dst);
             return true;
         }
         // A folder across volumes: copy it, then remove the original.
         if (!fs_copy_to(src, dst, err, en)) return false;
-        undo_add(src, dst);
+        undo_add_id(g_paste_undo_id, src, dst);
         return fs_delete_one(src, err, en);
     }
     if (!fs_copy_to(src, dst, err, en)) return false;
-    undo_add(src, dst);
+    undo_add_id(g_paste_undo_id, src, dst);
     return true;
 }
 
+static void select_paths_in_view(char** paths, int n);
+static void sel_paths_free(char** paths, int n);
 // ---- background paste ---------------------------------------------------
 // A big copy used to run on the UI thread: the window froze until the
 // last byte was written.  The job now runs on a worker; the status bar
@@ -3429,7 +3515,16 @@ static void paste_pump(void) {
     InterlockedExchange(&g_paste_running, 0);
     int done = (int)g_paste_done;
     bool cancelled = InterlockedCompareExchange(&g_paste_cancel, 0, 0) != 0;
-    if (done > 0) load_dir(g_app.current_path);
+    if (done > 0) {
+        load_dir(g_app.current_path);
+        // Explorer selects what was just pasted - never the top row.
+        int pn = 0;
+        char** pp = undo_rec_paths(g_paste_undo_id, true, &pn);
+        if (pp) {
+            select_paths_in_view(pp, pn);
+            sel_paths_free(pp, pn);
+        }
+    }
     if (cancelled)
         set_status("Cancelled after %d item%s", done, done == 1 ? "" : "s");
     else if (g_paste_err[0] && done < g_paste.count)
@@ -3472,7 +3567,7 @@ static bool paste_start(char** paths, int count, bool move, const char* dst) {
     InterlockedExchange(&g_paste_done, 0);
     InterlockedExchange(&g_paste_cur, 0);
     InterlockedExchange(&g_paste_running, 1);
-    undo_begin(move ? UNDO_MOVE : UNDO_COPY);
+    g_paste_undo_id = undo_begin(move ? UNDO_MOVE : UNDO_COPY);
     if (!g_st_running)
         g_paste_thread = CreateThread(NULL, 0, paste_worker, NULL, 0, NULL);
     if (!g_paste_thread) {                  // selftest, or no thread: inline
@@ -3541,10 +3636,10 @@ static bool fs_create_shortcut_at(const char* target, const char* dir,
     int n = 1;
     for (;;) {
         if (n == 1)
-            snprintf(dst, sizeof(dst), "%s\\%s - Shortcut.lnk", dir, base);
+            snprintf(dst, sizeof(dst), "%s%s%s - Shortcut.lnk", dir, path_sep(dir), base);
         else
-            snprintf(dst, sizeof(dst), "%s\\%s - Shortcut (%d).lnk", dir,
-                     base, n);
+            snprintf(dst, sizeof(dst), "%s%s%s - Shortcut (%d).lnk", dir,
+                     path_sep(dir), base, n);
         if (GetFileAttributesA(dst) == INVALID_FILE_ATTRIBUTES) break;
         n++;
         if (n > 999) { snprintf(err, en, "Too many shortcuts"); return false; }
@@ -3755,15 +3850,22 @@ static bool rename_commit(void) {
     char body[512];
     snprintf(body, sizeof(body), "%s", g_rename_txt);
     char err[256] = {0};
+    char oldp[1024];
+    snprintf(oldp, sizeof oldp, "%s", e->path);
+    int rec_before = g_undo_next_id;
     bool ok = fs_rename(e->path, body, err, sizeof(err));
     g_rename_vi = -1;
     if (ok) {
         // The new name comes from the undo record: load_dir() below frees
         // the listing `e` points into (reading e->path afterwards was a
-        // use-after-free - and it printed the OLD name anyway).
+        // use-after-free - and it printed the OLD name anyway).  A name
+        // left as it was (Enter on a fresh "New folder") makes no record:
+        // the item keeps its old path - and must STAY selected, not drop
+        // the selection back to the top row.
         char newp[1024] = "";
-        if (g_undo_kind == UNDO_RENAME && g_undo_n > 0)
-            snprintf(newp, sizeof newp, "%s", g_undo[0].to);
+        if (g_undo_next_id != rec_before)
+            undo_top_to(UNDO_RENAME, 0, newp, sizeof newp);
+        if (!newp[0]) snprintf(newp, sizeof newp, "%s", oldp);
         load_dir(g_app.current_path);
         set_status("Renamed to %s", newp[0] ? file_name_of(newp) : body);
         // keep the renamed item selected, like Explorer
@@ -3794,35 +3896,6 @@ static bool g_del_confirmed = false;
 // is about to happen.
 static bool g_del_permanent = false;
 
-// Send ONE item to the Recycle Bin through the shell (the same call
-// Explorer uses).  False when the shell refused - the caller then
-// reports the item instead of silently deleting it for good.
-static bool fs_recycle_one(const char* path, char* err, size_t en) {
-    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
-        snprintf(err, en, "Not found: %s", file_name_of(path));
-        return false;
-    }
-    wchar_t w[2048 + 2];
-    int n = MultiByteToWideChar(CP_ACP, 0, path, -1, w, 2048);
-    if (n <= 0) { snprintf(err, en, "Path too long"); return false; }
-    w[n] = L'\0';                       // double-NUL list terminator
-    SHFILEOPSTRUCTW op;
-    memset(&op, 0, sizeof op);
-    op.hwnd = (HWND)g_app.hwnd;
-    op.wFunc = FO_DELETE;
-    op.pFrom = w;
-    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT |
-                FOF_NOERRORUI;
-    int rc = SHFileOperationW(&op);
-    if (rc != 0 || op.fAnyOperationsAborted ||
-        GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
-        snprintf(err, en, "Could not delete \"%s\" (in use?)",
-                 file_name_of(path));
-        return false;
-    }
-    return true;
-}
-
 #include <sddl.h>       // ConvertSidToStringSidW: the user's bin folder
 // SHChangeNotify lives in shlobj.h, which clashes with this file's own
 // shell declarations: declare just the one call it needs.
@@ -3839,101 +3912,177 @@ DECLSPEC_IMPORT void WINAPI SHChangeNotify(LONG, UINT, LPCVOID, LPCVOID);
 // rename of $R back to the original path plus removing its $I record -
 // exactly what the bin's own "Restore" does.  The newest record for that
 // path wins (the same name may have been deleted before).
-static bool fs_unrecycle_one(const char* path) {
-    if (!path || !path[0] || path[1] != ':' ||
-        GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
-        return false;                   // not a drive path / name taken again
-    wchar_t want[2048];
-    if (MultiByteToWideChar(CP_ACP, 0, path, -1, want, 2048) <= 0) return false;
-    // The bin records the LONG path ("C:\Users\Jonathan\..."), while
-    // the caller may hold a short 8.3 one ("C:\Users\JONATH~1\..."):
-    // compare against the long form of the (still existing) parent folder.
-    wchar_t longw[2048];
-    lstrcpynW(longw, want, 2048);
-    wchar_t* cut = wcsrchr(longw, L'\\');
-    if (cut) {
-        wchar_t name[600];
-        lstrcpynW(name, cut + 1, 600);
-        *cut = 0;
-        wchar_t lp[2048];
-        DWORD ln = GetLongPathNameW(longw, lp, 2048);
-        if (ln > 0 && ln < 2048 - 600)
-            _snwprintf(longw, 2048, L"%ls\\%ls", lp, name);
-        else
-            lstrcpynW(longw, want, 2048);
-        longw[2047] = 0;
-    }
-    wchar_t sid[256] = L"";
-    HANDLE tok = NULL;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
-        union { TOKEN_USER tu; BYTE b[512]; } ub;
-        DWORD got = 0;
-        if (GetTokenInformation(tok, TokenUser, &ub, sizeof ub, &got)) {
-            LPWSTR str = NULL;
-            if (ConvertSidToStringSidW(ub.tu.User.Sid, &str)) {
-                lstrcpynW(sid, str, 256);
-                LocalFree(str);
+//
+// SPEED: the bin may hold thousands of items.  The bin folder is listed
+// ONCE per drive for the whole undo, and only "$I" records written at or
+// after the delete (the stamp; their write time is in the listing itself,
+// no file is opened for it) are read - so an undo opens a handful of tiny
+// files, never every record in the bin.  restored[i] = item i is back.
+static int fs_unrecycle_many(char** paths, int n, unsigned long long stamp,
+                             bool* restored) {
+    static wchar_t sid[256] = L"";        // the user's SID never changes
+    if (!sid[0]) {
+        HANDLE tok = NULL;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+            union { TOKEN_USER tu; BYTE b[512]; } ub;
+            DWORD got = 0;
+            if (GetTokenInformation(tok, TokenUser, &ub, sizeof ub, &got)) {
+                LPWSTR str = NULL;
+                if (ConvertSidToStringSidW(ub.tu.User.Sid, &str)) {
+                    lstrcpynW(sid, str, 256);
+                    LocalFree(str);
+                }
             }
+            CloseHandle(tok);
         }
-        CloseHandle(tok);
     }
-    if (!sid[0]) return false;
-    wchar_t dir[300];
-    _snwprintf(dir, 300, L"%c:\\$Recycle.Bin\\%ls", (wchar_t)path[0], sid);
-    dir[299] = 0;
-    wchar_t pat[320];
-    _snwprintf(pat, 320, L"%ls\\$I*", dir);
-    pat[319] = 0;
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW(pat, &fd);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    wchar_t best[MAX_PATH] = L"";
-    unsigned long long best_t = 0;
-    do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        wchar_t ip[600];
-        _snwprintf(ip, 600, L"%ls\\%ls", dir, fd.cFileName);
-        ip[599] = 0;
-        HANDLE f = CreateFileW(ip, GENERIC_READ, FILE_SHARE_READ, NULL,
-                               OPEN_EXISTING, 0, NULL);
-        if (f == INVALID_HANDLE_VALUE) continue;
-        BYTE rec[24 + 4 + 2 * 2048];
-        DWORD rd = 0;
-        ReadFile(f, rec, sizeof rec - 2, &rd, NULL);
-        CloseHandle(f);
-        if (rd < 24 + 2) continue;
-        rec[rd] = rec[rd + 1] = 0;
-        unsigned long long ver, t;
-        memcpy(&ver, rec, 8);
-        memcpy(&t, rec + 16, 8);
-        // v1 (Vista..8.1): the path follows at once, MAX_PATH chars;
-        // v2 (Windows 10+): a 4-byte character count comes first.
-        const BYTE* pp = (ver >= 2) ? rec + 28 : rec + 24;
-        if (pp >= rec + rd) continue;
-        wchar_t orig[2048];
-        size_t room = (size_t)(rec + rd - pp) / 2;
-        if (room > 2047) room = 2047;
-        memcpy(orig, pp, room * 2);
-        orig[room] = 0;
-        if ((lstrcmpiW(orig, want) == 0 || lstrcmpiW(orig, longw) == 0) &&
-            t >= best_t) {
-            best_t = t;
-            lstrcpynW(best, fd.cFileName, MAX_PATH);
+    for (int i = 0; i < n; i++) restored[i] = false;
+    if (!sid[0] || n <= 0) return 0;
+    typedef struct { wchar_t want[1024], longw[1024], best[MAX_PATH];
+                     unsigned long long best_t; bool on; } Want;
+    Want* w = (Want*)calloc((size_t)n, sizeof(Want));
+    if (!w) return 0;
+    for (int i = 0; i < n; i++) {
+        const char* path = paths[i];
+        if (!path || !path[0] || path[1] != ':' ||
+            GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
+            continue;                   // not a drive path / name taken again
+        if (MultiByteToWideChar(CP_ACP, 0, path, -1, w[i].want, 1024) <= 0)
+            continue;
+        w[i].on = true;
+        // The bin records the LONG path ("C:\Users\Jonathan\..."), while
+        // the caller may hold a short 8.3 one ("C:\Users\JONATH~1\..."):
+        // compare against the long form of the (still existing) parent.
+        lstrcpynW(w[i].longw, w[i].want, 1024);
+        wchar_t* cutp = wcsrchr(w[i].longw, L'\\');
+        if (cutp) {
+            wchar_t name[600], lp[1024];
+            lstrcpynW(name, cutp + 1, 600);
+            *cutp = 0;
+            DWORD ln = GetLongPathNameW(w[i].longw, lp, 1024);
+            if (ln > 0 && ln < 1024 - 600)
+                _snwprintf(w[i].longw, 1024, L"%ls\\%ls", lp, name);
+            else
+                lstrcpynW(w[i].longw, w[i].want, 1024);
+            w[i].longw[1023] = 0;
         }
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-    if (!best[0]) return false;
-    wchar_t ifile[600], rfile[600];
-    _snwprintf(ifile, 600, L"%ls\\%ls", dir, best);
-    ifile[599] = 0;
-    lstrcpynW(rfile, ifile, 600);
-    wchar_t* mark = wcsrchr(rfile, L'\\');
-    if (!mark || mark[1] != L'$' || mark[2] != L'I') return false;
-    mark[2] = L'R';
-    if (!MoveFileExW(rfile, want, MOVEFILE_COPY_ALLOWED)) return false;
-    DeleteFileW(ifile);
-    SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, dir, NULL);
-    return true;
+    }
+    // 2 s of slack: the stamp is taken just BEFORE the delete starts
+    unsigned long long from_t = stamp > 20000000ULL ? stamp - 20000000ULL : 0;
+    bool scanned[26] = {false};
+    int count = 0;
+    for (int i = 0; i < n; i++) {
+        if (!w[i].on) continue;
+        wchar_t dl = towupper(w[i].want[0]);
+        if (dl < L'A' || dl > L'Z' || scanned[dl - L'A']) continue;
+        scanned[dl - L'A'] = true;
+        wchar_t dir[300], pat[320];
+        _snwprintf(dir, 300, L"%c:\\$Recycle.Bin\\%ls", dl, sid);
+        dir[299] = 0;
+        _snwprintf(pat, 320, L"%ls\\$I*", dir);
+        pat[319] = 0;
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileExW(pat, FindExInfoBasic, &fd,
+                                    FindExSearchNameMatch, NULL, 2 /* LARGE_FETCH */);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            unsigned long long wt =
+                ((unsigned long long)fd.ftLastWriteTime.dwHighDateTime << 32) |
+                fd.ftLastWriteTime.dwLowDateTime;
+            if (wt < from_t) continue;  // older than this delete: skip unread
+            wchar_t ip[600];
+            _snwprintf(ip, 600, L"%ls\\%ls", dir, fd.cFileName);
+            ip[599] = 0;
+            HANDLE f = CreateFileW(ip, GENERIC_READ, FILE_SHARE_READ, NULL,
+                                   OPEN_EXISTING, 0, NULL);
+            if (f == INVALID_HANDLE_VALUE) continue;
+            BYTE rec[24 + 4 + 2 * 1024 + 2];
+            DWORD rd = 0;
+            ReadFile(f, rec, sizeof rec - 2, &rd, NULL);
+            CloseHandle(f);
+            if (rd < 24 + 2) continue;
+            rec[rd] = rec[rd + 1] = 0;
+            unsigned long long ver, t;
+            memcpy(&ver, rec, 8);
+            memcpy(&t, rec + 16, 8);
+            // v1 (Vista..8.1): the path follows at once, MAX_PATH chars;
+            // v2 (Windows 10+): a 4-byte character count comes first.
+            const BYTE* pp = (ver >= 2) ? rec + 28 : rec + 24;
+            if (pp >= rec + rd) continue;
+            wchar_t orig[1024];
+            size_t room = (size_t)(rec + rd - pp) / 2;
+            if (room > 1023) room = 1023;
+            memcpy(orig, pp, room * 2);
+            orig[room] = 0;
+            for (int j = 0; j < n; j++) {
+                if (!w[j].on || towupper(w[j].want[0]) != dl) continue;
+                if ((lstrcmpiW(orig, w[j].want) == 0 ||
+                     lstrcmpiW(orig, w[j].longw) == 0) && t >= w[j].best_t) {
+                    w[j].best_t = t;   // the newest record for that path
+                    lstrcpynW(w[j].best, fd.cFileName, MAX_PATH);
+                }
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+        // restore every match found on this drive
+        for (int j = 0; j < n; j++) {
+            if (!w[j].on || !w[j].best[0] || towupper(w[j].want[0]) != dl) continue;
+            wchar_t ifile[600], rfile[600];
+            _snwprintf(ifile, 600, L"%ls\\%ls", dir, w[j].best);
+            ifile[599] = 0;
+            lstrcpynW(rfile, ifile, 600);
+            wchar_t* mark = wcsrchr(rfile, L'\\');
+            if (!mark || mark[1] != L'$' || mark[2] != L'I') continue;
+            mark[2] = L'R';
+            if (!MoveFileExW(rfile, w[j].want, MOVEFILE_COPY_ALLOWED)) continue;
+            DeleteFileW(ifile);
+            restored[j] = true;
+            count++;
+        }
+        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, dir, NULL);
+    }
+    free(w);
+    return count;
+}
+
+// Send MANY items to the Recycle Bin in ONE shell call (what Explorer
+// does: one operation instead of one per item - much faster for a big
+// selection).  gone[i] = item i really left its folder.  Returns how many.
+static int fs_recycle_many(char** paths, int n, bool* gone, char* err, size_t en) {
+    if (n <= 0) return 0;
+    size_t total = 1;
+    for (int i = 0; i < n; i++) total += strlen(paths[i]) + 1;
+    wchar_t* list = (wchar_t*)calloc(total + 1, sizeof(wchar_t));
+    if (!list) { snprintf(err, en, "Out of memory"); return 0; }
+    size_t at = 0;
+    for (int i = 0; i < n; i++) {
+        gone[i] = false;
+        if (GetFileAttributesA(paths[i]) == INVALID_FILE_ATTRIBUTES) continue;
+        int w = MultiByteToWideChar(CP_ACP, 0, paths[i], -1, list + at,
+                                    (int)(total - at));
+        if (w > 0) at += (size_t)w;     // includes the NUL separator
+    }
+    list[at] = L'\0';                    // double-NUL list terminator
+    int done = 0;
+    if (at > 0) {
+        SHFILEOPSTRUCTW op;
+        memset(&op, 0, sizeof op);
+        op.hwnd = (HWND)g_app.hwnd;
+        op.wFunc = FO_DELETE;
+        op.pFrom = list;
+        op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT |
+                    FOF_NOERRORUI;
+        SHFileOperationW(&op);
+    }
+    free(list);
+    for (int i = 0; i < n; i++) {
+        gone[i] = GetFileAttributesA(paths[i]) == INVALID_FILE_ATTRIBUTES;
+        if (gone[i]) done++;
+        else snprintf(err, en, "Could not delete \"%s\" (in use?)",
+                      file_name_of(paths[i]));
+    }
+    return done;
 }
 
 static void delete_confirm_mode(bool permanent);
@@ -3964,19 +4113,31 @@ static void delete_do(void) {
     int done = 0;
     char err[256] = {0};
     bool recycle = !g_del_permanent && !g_st_running;
-    for (int i = 0; i < g_del_n; i++) {
-        bool ok = recycle ? fs_recycle_one(g_del_paths[i], err, sizeof(err))
-                          : fs_delete_one(g_del_paths[i], err, sizeof(err));
-        if (ok) {
+    if (recycle) {
+        // stamp first: the undo only reads bin records from here on
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        char stamp[32];
+        snprintf(stamp, sizeof stamp, "%llu",
+                 ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+        bool* gone = (bool*)calloc((size_t)g_del_n, sizeof(bool));
+        if (gone) {
+            done = fs_recycle_many(g_del_paths, g_del_n, gone, err, sizeof err);
             // Ctrl+Z brings recycled items back (a permanent delete
             // leaves nothing to bring back, so it records nothing).
-            if (recycle) {
-                if (done == 0) undo_begin(UNDO_RECYCLE);
-                undo_add(g_del_paths[i], "");
+            if (done > 0) {
+                int id = undo_begin(UNDO_RECYCLE);
+                for (int i = 0; i < g_del_n; i++)
+                    if (gone[i]) undo_add_id(id, g_del_paths[i], stamp);
             }
-            done++;
+            if (done < g_del_n && err[0]) set_status("%s", err);
+            free(gone);
         }
-        else set_status("%s", err);
+    } else {
+        for (int i = 0; i < g_del_n; i++) {
+            if (fs_delete_one(g_del_paths[i], err, sizeof(err))) done++;
+            else set_status("%s", err);
+        }
     }
     for (int i = 0; i < g_del_n; i++) free(g_del_paths[i]);
     free(g_del_paths);
@@ -3985,6 +4146,7 @@ static void delete_do(void) {
     g_confirm_kind = CONFIRM_NONE;
     if (done > 0) {
         load_dir(g_app.current_path);
+        folder_watch_quiet();
         if (recycle)
             set_status("Moved %d item%s to the Recycle Bin", done,
                        done == 1 ? "" : "s");
@@ -4033,6 +4195,35 @@ static void props_show(void) {
     g_confirm_kind = CONFIRM_PROPS;
     g_modal_click_latch = true;        // ctx/menu click: not the panel's
     props_size_worker(g_app.current_path);
+}
+
+// Alt+Enter / "Properties": the REAL Windows Properties dialog - exactly
+// what Explorer shows (size on disk, attributes, Security, Details,
+// Previous Versions..., and the combined totals of a multi-selection).
+// Nothing selected = the folder itself.  The in-app panel is only the
+// fallback (the shell refused, This PC, or a test run, which must never
+// open a system window).
+static void props_real_paths(char** paths, int n) {
+    if (!g_st_running && n > 0 &&
+        shell_properties(g_app.hwnd, paths, n)) {
+        g_app.menu_open = false;
+        set_status("Properties");
+        return;
+    }
+    props_show();
+}
+static void props_real(void) {
+    int n = 0;
+    char** ps = sel_paths(&n);
+    if (n > 0) {
+        props_real_paths(ps, n);
+    } else if (g_app.current_path[0] && !is_this_pc(g_app.current_path)) {
+        char* one[1] = {g_app.current_path};
+        props_real_paths(one, 1);
+    } else {
+        props_show();
+    }
+    sel_paths_free(ps, n);
 }
 
 // ---- async folder size (properties) ------------------------------------
@@ -16929,43 +17120,100 @@ static void new_item_select_rename(void) {
     g_new_item_path[0] = '\0';
 }
 
-// Ctrl+Z: take the last rename / new item / paste back.
-static void undo_run(void) {
-    if (paste_busy()) { set_status("Wait for the copy to finish"); return; }
-    undo_lock();
-    int kind = g_undo_kind, n = g_undo_n;
-    UndoPair* v = NULL;
-    if (kind != UNDO_NONE && n > 0) {
-        v = (UndoPair*)malloc((size_t)n * sizeof(UndoPair));
-        if (v) memcpy(v, g_undo, (size_t)n * sizeof(UndoPair));
-    }
-    g_undo_kind = UNDO_NONE;
-    g_undo_n = 0;
-    undo_unlock();
-    if (!v) { set_status("Nothing to undo"); return; }
-    int ok = 0;
-    char err[256] = {0};
-    for (int i = n - 1; i >= 0; i--) {     // newest first
-        switch (kind) {
-        case UNDO_RENAME:
-        case UNDO_MOVE:
-            if (GetFileAttributesA(v[i].from) == INVALID_FILE_ATTRIBUTES &&
-                MoveFileExA(v[i].to, v[i].from, MOVEFILE_COPY_ALLOWED))
-                ok++;
-            break;
-        case UNDO_NEW:
-        case UNDO_COPY:
-            if (g_st_running ? fs_delete_one(v[i].to, err, sizeof err)
-                             : fs_recycle_one(v[i].to, err, sizeof err))
-                ok++;
-            break;
-        case UNDO_RECYCLE:
-            if (fs_unrecycle_one(v[i].from)) ok++;
+// Select exactly these paths in the current listing (pasted items,
+// restored items...) and scroll to them - never the top row.
+static void select_paths_in_view(char** paths, int n) {
+    if (!paths || n <= 0) return;
+    bool any = false;
+    for (size_t vi = 0; vi < g_app.view_count; vi++) {
+        const char* vp = g_app.entries[g_app.view[vi]].path;
+        for (int i = 0; i < n; i++) {
+            if (!paths[i] || _stricmp(vp, paths[i]) != 0) continue;
+            if (!any) { sel_clear(); g_app.selected = (int)vi; any = true; }
+            sel_add((int)vi);
             break;
         }
     }
-    free(v);
+    if (any) g_scroll_to_sel = true;
+}
+
+// Ctrl+Z: take the newest rename / delete / new item / paste back.  Each
+// press takes ONE more record off the stack.
+static void undo_run(void) {
+    if (paste_busy()) { set_status("Wait for the copy to finish"); return; }
+    undo_lock();
+    while (g_ustack_n > 0 && g_ustack[g_ustack_n - 1].n == 0)
+        undo_rec_free(&g_ustack[--g_ustack_n]);
+    UndoRec r;
+    memset(&r, 0, sizeof r);
+    if (g_ustack_n > 0) {
+        r = g_ustack[--g_ustack_n];       // the record now belongs to us
+        memset(&g_ustack[g_ustack_n], 0, sizeof(UndoRec));
+    }
+    undo_unlock();
+    if (r.n <= 0) { set_status("Nothing to undo"); return; }
+    int n = r.n, kind = r.kind, ok = 0;
+    char err[256] = {0};
+    char** list = (char**)calloc((size_t)n, sizeof(char*));
+    bool* flag = (bool*)calloc((size_t)n, sizeof(bool));
+    int ln = 0;
+    if (list && flag) {
+        switch (kind) {
+        case UNDO_RENAME:
+        case UNDO_MOVE:
+            for (int i = n - 1; i >= 0; i--)          // newest first
+                if (GetFileAttributesA(r.v[i].from) == INVALID_FILE_ATTRIBUTES &&
+                    MoveFileExA(r.v[i].to, r.v[i].from, MOVEFILE_COPY_ALLOWED)) {
+                    ok++;
+                    list[ln++] = r.v[i].from;          // select them back
+                }
+            break;
+        case UNDO_NEW:
+        case UNDO_COPY: {
+            int m = n;                                 // left to remove
+            for (int i = 0; i < n; i++) list[i] = r.v[i].to;
+            if (kind == UNDO_NEW) {
+                // A new item that is STILL empty holds nothing to keep:
+                // remove it at once instead of a Recycle Bin trip (the
+                // shell's first recycle of a session takes ~0.7 s).
+                int k = 0;
+                for (int i = 0; i < m; i++) {
+                    WIN32_FILE_ATTRIBUTE_DATA fa;
+                    bool gone_now =
+                        GetFileAttributesExA(list[i], GetFileExInfoStandard, &fa) &&
+                        ((fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                             ? RemoveDirectoryA(list[i])     // fails if not empty
+                             : (!fa.nFileSizeLow && !fa.nFileSizeHigh &&
+                                DeleteFileA(list[i])));
+                    if (gone_now) ok++;
+                    else list[k++] = list[i];               // has content: bin
+                }
+                m = k;
+            }
+            if (g_st_running) {
+                for (int i = 0; i < m; i++)
+                    if (fs_delete_one(list[i], err, sizeof err)) ok++;
+            } else {
+                ok += fs_recycle_many(list, m, flag, err, sizeof err);
+            }
+            break;
+        }
+        case UNDO_RECYCLE: {
+            for (int i = 0; i < n; i++) list[i] = r.v[i].from;
+            unsigned long long stamp = strtoull(r.v[0].to, NULL, 10);
+            ok = fs_unrecycle_many(list, n, stamp, flag);
+            for (int i = 0; i < n; i++)
+                if (flag[i]) list[ln++] = list[i];     // select the restored
+            break;
+        }
+        }
+    }
     load_dir(g_app.current_path);
+    folder_watch_quiet();
+    if (ln > 0) select_paths_in_view(list, ln);
+    free(list);
+    free(flag);
+    undo_rec_free(&r);
     static const char* what[] = {"", "Rename", "New item", "Copy", "Move", "Delete"};
     if (ok == n)
         set_status("Undo %s (%d item%s)", what[kind], ok, ok == 1 ? "" : "s");
@@ -17006,6 +17254,7 @@ static void ctx_run(int cmd) {
     }
     case CTX_CMD_SHELL_MENU: {
         // The native menu opens where the right-click happened.
+        new_snap_take();                 // what is here BEFORE a verb runs
         POINT pt;
         GetCursorPos(&pt);
         bool ext = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -17022,6 +17271,7 @@ static void ctx_run(int cmd) {
         }
         if (r == SHELL_MENU_RENAME && e) rename_begin(e);
         else if (r == SHELL_MENU_INVOKED) folder_watch_poke();
+        if (r != SHELL_MENU_INVOKED) new_snap_clear();
         break;
     }
     case CTX_CMD_OPEN:
@@ -17149,9 +17399,9 @@ static void ctx_run(int cmd) {
         delete_confirm();
         break;
     case CTX_CMD_PROPERTIES:
-        if (g_sel_n > 0) props_show();
-        else if (e) props_show_one(e);
-        else props_show();               // background: the folder itself
+        if (g_sel_n > 0) props_real();
+        else if (e) { char* one[1] = {e->path}; props_real_paths(one, 1); }
+        else props_real();               // background: the folder itself
         break;
     case CTX_CMD_NEW_FOLDER:
         if (fs_new_folder(g_app.current_path, err, sizeof(err))) {
@@ -18302,7 +18552,7 @@ static void handle_keys(InputState* in, const Layout* L) {
         if (k == VK_LEFT)   { go_back(); return; }
         if (k == VK_RIGHT)  { go_forward(); return; }
         if (k == VK_UP)     { go_up(); return; }
-        if (k == VK_RETURN) { props_show(); return; }
+        if (k == VK_RETURN) { props_real(); return; }
         if (k == 'D')       { focus_address(); return; }
     }
     // Menu key / Shift+F10: the context menu of the selection (or of the
@@ -19198,6 +19448,11 @@ static void xm_run(int node) {
     xm_free_shell();
     if (nd.act == XA_SHELL) {
         g_xm_gen = 0;
+        // whatever the verb creates gets selected when it shows up; an
+        // item under "New" also opens for naming (Explorer does both)
+        new_snap_take();
+        g_new_snap_rename = nd.parent >= 0 && nd.parent < g_xn_n &&
+                            _stricmp(g_xn[nd.parent].label, "New") == 0;
         shmsvc_invoke(gen, nd.sid, sp.x, sp.y);
         shmsvc_release(gen);                // runs after the invoke (FIFO)
         folder_watch_poke();                // whatever it changed shows up
@@ -19214,8 +19469,17 @@ static void xm_run(int node) {
         return;
     }
     if (nd.cmd == CTX_CMD_PROPERTIES) {
-        if (g_xm_bg) props_show();
-        else if (ctx_target()) props_show_one(ctx_target());
+        if (g_xm_bg) {                    // background: the folder itself
+            char* cur[1] = {g_app.current_path};
+            if (g_app.current_path[0] && !is_this_pc(g_app.current_path))
+                props_real_paths(cur, 1);
+            else
+                props_show();
+        } else if (ctx_target()) {
+            char* one[1] = {ctx_target()->path};
+            if (g_sel_n > 1) props_real();
+            else props_real_paths(one, 1);
+        }
         return;
     }
     ctx_run(nd.cmd);
@@ -19620,7 +19884,7 @@ static void help_build(void) {
     help_add(G1, "Type a name", "Jump to the item that starts with it");
     const char* G2 = "Files";
     help_add(G2, "Shift+Delete", "Delete permanently (skips the Recycle Bin)");
-    help_add(G2, "Ctrl+Z", "Undo the last rename / delete / new item / paste");
+    help_add(G2, "Ctrl+Z", "Undo rename / delete / new item / paste (press again for more)");
     help_add(G2, "Alt+Enter", "Properties");
     help_add(G2, "Menu key  /  Shift+F10", "Context menu of the selection");
     help_add(G2, "Type in a menu", "Search every command in it");
@@ -21850,6 +22114,72 @@ static void folder_watch_close(void) {
 }
 
 static void folder_watch_poke(void) { g_fw_due = tick_in(150); }
+// The app itself just changed the folder AND reloaded it (delete, undo):
+// drop the change notice it caused, or the watch reloads it all again
+// 0.4 s later for nothing.  A fresh watch is opened on the next frame.
+static void folder_watch_quiet(void) { folder_watch_close(); g_fw_due = 0; }
+
+// Items made by a Windows menu verb ("New > Folder", "Compressed (zipped)
+// folder"...) appear a moment later through the folder watch.  Explorer
+// selects them; so do we: the listing's names are noted before the verb
+// runs, and the first refresh that shows NEW names selects exactly those.
+static char** g_new_snap = NULL;         // sorted names before the verb
+static int g_new_snap_n = 0;
+static char g_new_snap_dir[1024];
+static unsigned long g_new_snap_until = 0;
+static bool g_new_snap_rename = false;   // a "New >" verb: name it at once
+
+static int snap_cmp(const void* a, const void* b) {
+    return _stricmp(*(char* const*)a, *(char* const*)b);
+}
+static void new_snap_clear(void) {
+    g_new_snap_rename = false;
+    for (int i = 0; i < g_new_snap_n; i++) free(g_new_snap[i]);
+    free(g_new_snap);
+    g_new_snap = NULL;
+    g_new_snap_n = 0;
+}
+static void new_snap_take(void) {
+    new_snap_clear();
+    if (!g_app.current_path[0] || is_this_pc(g_app.current_path)) return;
+    g_new_snap = (char**)calloc(g_app.count + 1, sizeof(char*));
+    if (!g_new_snap) return;
+    for (size_t i = 0; i < g_app.count; i++)
+        if ((g_new_snap[g_new_snap_n] = _strdup(g_app.entries[i].path)))
+            g_new_snap_n++;
+    qsort(g_new_snap, (size_t)g_new_snap_n, sizeof(char*), snap_cmp);
+    snprintf(g_new_snap_dir, sizeof g_new_snap_dir, "%s", g_app.current_path);
+    g_new_snap_until = tick_in(10000);   // a verb's result shows up soon
+}
+// After a reload: select the items that were not there before.
+static bool new_snap_apply(void) {
+    if (!g_new_snap) return false;
+    if (!tick_before(g_new_snap_until) ||
+        _stricmp(g_new_snap_dir, g_app.current_path) != 0) {
+        new_snap_clear();
+        return false;
+    }
+    bool any = false;
+    int first_vi = -1, made = 0;
+    for (size_t vi = 0; vi < g_app.view_count; vi++) {
+        const char* ep = g_app.entries[g_app.view[vi]].path;
+        if (bsearch(&ep, g_new_snap, (size_t)g_new_snap_n, sizeof(char*), snap_cmp))
+            continue;
+        if (!any) { sel_clear(); g_app.selected = (int)vi; any = true; first_vi = (int)vi; }
+        sel_add((int)vi);
+        made++;
+    }
+    if (any) {
+        g_scroll_to_sel = true;
+        // "New > Word document" etc.: like Explorer, the one new item
+        // opens for naming straight away.
+        bool name_it = g_new_snap_rename && made == 1 && !g_st_running &&
+                       g_rename_vi < 0;
+        new_snap_clear();
+        if (name_it) rename_begin(&g_app.entries[g_app.view[first_vi]]);
+    }
+    return any;
+}
 
 static void folder_refresh_keep(void) {
     // remember what the user is looking at, by PATH (indices change)
@@ -21883,6 +22213,7 @@ static void folder_refresh_keep(void) {
     }
     g_app.scroll = scroll;            // clamped by the next layout pass
     g_scroll_to_sel = false;          // never jump to the selection
+    new_snap_apply();                 // ...except to what a menu verb made
 }
 
 static bool g_bench;                     // (defined with the bench code)
@@ -23585,12 +23916,96 @@ static void st_explorer_parity(void) {
               GetFileAttributesA(a) != INVALID_FILE_ATTRIBUTES, "undo copy keeps source");
         // Delete to the Recycle Bin, then Ctrl+Z: the file comes back.
         // (Uses the real bin: the item is restored, nothing is left in it.)
-        if (a[1] == ':' && fs_recycle_one(a, err, sizeof err)) {
-            undo_begin(UNDO_RECYCLE);
-            undo_add(a, "");
-            X_EXP(GetFileAttributesA(a) == INVALID_FILE_ATTRIBUTES, "deleted to the bin");
+        // Two deletes in a row, then two Ctrl+Z: BOTH come back (a
+        // stack, like Explorer), newest first.
+        if (a[1] == ':') {
+            char c2[MAX_PATH + 128];
+            snprintf(c2, sizeof c2, "%s\\second.txt", base);
+            FILE* fp = fopen(c2, "wb");
+            if (fp) { fputs("two", fp); fclose(fp); }
+            char* d1[1] = {a};
+            char* d2[1] = {c2};
+            bool g1 = false, g2 = false;
+            FILETIME ft;
+            GetSystemTimeAsFileTime(&ft);
+            char stamp[32];
+            snprintf(stamp, sizeof stamp, "%llu",
+                     ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+            if (fs_recycle_many(d1, 1, &g1, err, sizeof err) == 1) {
+                undo_add_id(undo_begin(UNDO_RECYCLE), a, stamp);
+            }
+            if (fs_recycle_many(d2, 1, &g2, err, sizeof err) == 1) {
+                undo_add_id(undo_begin(UNDO_RECYCLE), c2, stamp);
+            }
+            X_EXP(g1 && g2 && GetFileAttributesA(a) == INVALID_FILE_ATTRIBUTES &&
+                      GetFileAttributesA(c2) == INVALID_FILE_ATTRIBUTES,
+                  "two deletes to the bin");
             undo_run();
-            X_EXP(GetFileAttributesA(a) != INVALID_FILE_ATTRIBUTES, "undo delete restores it");
+            X_EXP(GetFileAttributesA(c2) != INVALID_FILE_ATTRIBUTES &&
+                      GetFileAttributesA(a) == INVALID_FILE_ATTRIBUTES,
+                  "first Ctrl+Z restores the newest delete");
+            undo_run();
+            X_EXP(GetFileAttributesA(a) != INVALID_FILE_ATTRIBUTES,
+                  "second Ctrl+Z restores the earlier delete too");
+            DeleteFileA(c2);
+        }
+        // A new folder whose name is kept (Enter right away) stays
+        // selected - the selection must not jump to the top row.
+        {
+            load_dir(base);
+            if (fs_new_folder(base, err, sizeof err)) {
+                char nf[1024];
+                snprintf(nf, sizeof nf, "%s", g_new_item_path);
+                load_dir(base);
+                new_item_select_rename();
+                int vi_nf = g_app.selected;
+                bool sel_ok = vi_nf >= 0 && (size_t)vi_nf < g_app.view_count &&
+                    _stricmp(g_app.entries[g_app.view[vi_nf]].path, nf) == 0;
+                if (sel_ok) {
+                    rename_begin(&g_app.entries[g_app.view[vi_nf]]);
+                    rename_commit();                   // name unchanged
+                }
+                int vi2 = g_app.selected;
+                X_EXP(sel_ok && g_sel_n == 1 && vi2 >= 0 &&
+                          (size_t)vi2 < g_app.view_count &&
+                          _stricmp(g_app.entries[g_app.view[vi2]].path, nf) == 0,
+                      "new folder stays selected after Enter");
+                fs_delete_one(nf, err, sizeof err);
+                load_dir(base);
+            }
+        }
+        // A Windows menu verb's new item ("New > Folder") is selected
+        // when the refresh shows it.
+        {
+            load_dir(base);
+            new_snap_take();
+            char vf[MAX_PATH + 128];
+            snprintf(vf, sizeof vf, "%s\\Verb folder", base);
+            CreateDirectoryA(vf, NULL);
+            folder_refresh_keep();
+            int vi3 = g_app.selected;
+            X_EXP(g_sel_n == 1 && vi3 >= 0 && (size_t)vi3 < g_app.view_count &&
+                      _stricmp(g_app.entries[g_app.view[vi3]].path, vf) == 0,
+                  "menu-made item is selected after the refresh");
+            RemoveDirectoryA(vf);
+            load_dir(base);
+        }
+        // Paste selects what was pasted, not the top row.
+        {
+            char* one2[1] = {a};
+            load_dir(base);
+            paste_start(one2, 1, false, base);      // "doc - Copy.txt"-style
+            int sn = 0;
+            char** sp = sel_paths(&sn);
+            char got[1024] = "";
+            if (sn == 1) snprintf(got, sizeof got, "%s", sp[0]);
+            sel_paths_free(sp, sn);
+            X_EXP(sn == 1 && _stricmp(got, a) != 0 &&
+                      GetFileAttributesA(got) != INVALID_FILE_ATTRIBUTES,
+                  "paste selects the pasted copy");
+            undo_run();
+            X_EXP(GetFileAttributesA(got) == INVALID_FILE_ATTRIBUTES,
+                  "undo paste removes the copy");
         }
         load_dir(keep[0] ? keep : platform_get_home_directory());
     }

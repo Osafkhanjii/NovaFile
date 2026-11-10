@@ -25,6 +25,11 @@ int shell_background_menu(void* hwnd, const char* folder, int sx, int sy,
 bool shell_menu_handle_msg(unsigned msg, uintptr_t wp, intptr_t lp,
                            intptr_t* result);
 
+// The REAL Windows Properties dialog for `n` items of ONE folder (one
+// item, a whole selection with its combined size, a folder or a drive) -
+// the very sheet Explorer's Alt+Enter opens.  False = the shell refused.
+bool shell_properties(void* hwnd, char** paths, int n);
+
 // Drag the items out of the app (modal until dropped / cancelled).
 // Returns 0 when nothing was dropped, else 0x100 | DROPEFFECT_*.
 int shell_drag_files(void* hwnd, char** paths, int n);

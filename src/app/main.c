@@ -1510,15 +1510,23 @@ typedef struct {
 
 enum {                                  // entry ids (index into g_ents)
     CMD_SET_OPEN = 0, CMD_QUIT, CMD_REFRESH, CMD_HIDDEN, CMD_ESCAPE,
-    CMD_THEME, CMD_VIEW, CMD_VIEW_KEYS, CMD_ZOOM,
+    CMD_THEME, CMD_VIEW,
+    CMD_VIEW_1, CMD_VIEW_2, CMD_VIEW_3, CMD_VIEW_4, CMD_VIEW_5,
+    CMD_ZOOM, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_SCALE_UP, CMD_SCALE_DOWN,
+    CMD_WIN_MAX,
     CMD_NEW_TAB, CMD_CYCLE_TAB, CMD_SHIFT_TAB_L, CMD_SHIFT_TAB_R,
-    CMD_FOCUS_SEARCH, CMD_FOCUS_ADDR,
-    CMD_OPEN, CMD_UP, CMD_HOME, CMD_SEL, CMD_DEEP,
-    CMD_RENAME, CMD_NEW_FOLDER, CMD_DELETE, CMD_COPY, CMD_CUT, CMD_PASTE, CMD_SELECT_ALL,
+    CMD_FOCUS_SEARCH, CMD_SEARCH2, CMD_FOCUS_ADDR, CMD_ADDR_SEL, CMD_ADDR_SEL2,
+    CMD_OPEN, CMD_OPEN2, CMD_UP, CMD_UP2, CMD_UP3, CMD_BACK, CMD_FORWARD,
+    CMD_HOME,
+    CMD_SEL_UP, CMD_SEL_DOWN, CMD_PAGE_UP, CMD_PAGE_DOWN, CMD_SEL_FIRST,
+    CMD_SEL_LAST, CMD_DEEP,
+    CMD_RENAME, CMD_NEW_FOLDER, CMD_DELETE, CMD_DELETE_PERM, CMD_UNDO,
+    CMD_COPY, CMD_CUT, CMD_PASTE, CMD_SELECT_ALL, CMD_PROPS,
+    CMD_CTX_MENU, CMD_CTX_MENU2,
     CMD_THUMBS, CMD_CTDOC,
     CMD_ALTGEST, CMD_GESTDOC,
     CMD_SPLIT, CMD_CLOSE_PANE, CMD_PANE_MAX, CMD_PANE_HOVER,
-    CMD_BOOKMARK, CMD_WHEEL, CMD_STARDOC,
+    CMD_BOOKMARK, CMD_WHEEL, CMD_WHEEL2, CMD_STARDOC,
     CMD_BURST,
     CMD_STORE,
     CMD_SEARCH_CASE, CMD_SEARCH_BROAD, CMD_SEARCH_WORD, CMD_SEARCH_HL,
@@ -1611,14 +1619,66 @@ static SetEnt g_ents[CMD_COUNT] = {
         .cat=SCAT_APPEARANCE, .kind=EK_ACTION,
         .key=VK_F3, .dkey=VK_F3,
         .rebindable=true, .has_sw=true, .on=true, .don=true },
-    [CMD_VIEW_KEYS] = { .id="view_keys", .name="Pick a view mode",
-        .desc="Alt+1 Details, Alt+2 List, Alt+3 Tree, Alt+4 Icons, Alt+5 XL icons.",
-        .how="Fixed keys, in the order of the view menu in the status bar.",
-        .cat=SCAT_APPEARANCE, .kind=EK_DOC },
+    [CMD_VIEW_1] = { .id="view_details", .name="View: Details",
+        .desc="Switch the list straight to the Details view.",
+        .how="Or pick it in the view menu in the status bar.",
+        .cat=SCAT_APPEARANCE, .kind=EK_ACTION,
+        .key='1', .mods=M_ALT, .dkey='1', .dmods=M_ALT,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_VIEW_2] = { .id="view_list", .name="View: List",
+        .desc="Switch the list straight to the List view.",
+        .how="Or pick it in the view menu in the status bar.",
+        .cat=SCAT_APPEARANCE, .kind=EK_ACTION,
+        .key='2', .mods=M_ALT, .dkey='2', .dmods=M_ALT,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_VIEW_3] = { .id="view_tree", .name="View: Tree",
+        .desc="Switch the list straight to the Tree view.",
+        .how="Or pick it in the view menu in the status bar.",
+        .cat=SCAT_APPEARANCE, .kind=EK_ACTION,
+        .key='3', .mods=M_ALT, .dkey='3', .dmods=M_ALT,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_VIEW_4] = { .id="view_icons", .name="View: Icons",
+        .desc="Switch the list straight to the Icons view.",
+        .how="Or pick it in the view menu in the status bar.",
+        .cat=SCAT_APPEARANCE, .kind=EK_ACTION,
+        .key='4', .mods=M_ALT, .dkey='4', .dmods=M_ALT,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_VIEW_5] = { .id="view_xl", .name="View: XL icons",
+        .desc="Switch the list straight to the XL icons view.",
+        .how="Or pick it in the view menu in the status bar.",
+        .cat=SCAT_APPEARANCE, .kind=EK_ACTION,
+        .key='5', .mods=M_ALT, .dkey='5', .dmods=M_ALT,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
     [CMD_ZOOM] = { .id="zoom", .name="Zoom the icon size",
         .desc="Change how large rows, cells and thumbnails are drawn.",
         .how="Ctrl + mouse wheel over the list, or the % control in the status bar.",
         .cat=SCAT_APPEARANCE, .kind=EK_DOC },
+    [CMD_ZOOM_IN] = { .id="zoom_in", .name="Bigger icons",
+        .desc="Make rows, cells and thumbnails one step bigger.",
+        .how="Unbound by default - Ctrl + mouse wheel does the same.",
+        .cat=SCAT_APPEARANCE, .kind=EK_ACTION,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_ZOOM_OUT] = { .id="zoom_out", .name="Smaller icons",
+        .desc="Make rows, cells and thumbnails one step smaller.",
+        .how="Unbound by default - Ctrl + mouse wheel does the same.",
+        .cat=SCAT_APPEARANCE, .kind=EK_ACTION,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_SCALE_UP] = { .id="scale_up", .name="Bigger interface",
+        .desc="Scale the whole interface up by 10%.",
+        .how="Unbound by default - Alt + wheel or hold V and press + also work.",
+        .cat=SCAT_APPEARANCE, .kind=EK_ACTION,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_SCALE_DOWN] = { .id="scale_down", .name="Smaller interface",
+        .desc="Scale the whole interface down by 10%.",
+        .how="Unbound by default - Alt + wheel or hold V and press - also work.",
+        .cat=SCAT_APPEARANCE, .kind=EK_ACTION,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_WIN_MAX] = { .id="window_max", .name="Maximize / restore window",
+        .desc="Fill the screen with the NovaFile window, or bring it back.",
+        .how="Or double-click the title bar.",
+        .cat=SCAT_APPEARANCE, .kind=EK_ACTION,
+        .key=VK_F11, .mods=0, .dkey=VK_F11, .dmods=0,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
 
     // ---- Navigation and Tabs ----
     [CMD_NEW_TAB] = { .id="new_tab", .name="New tab",
@@ -1652,35 +1712,114 @@ static SetEnt g_ents[CMD_COUNT] = {
         .how="Type to filter; Enter scans subfolders; Escape clears. Ctrl+L also works.",
         .cat=SCAT_NAV, .kind=EK_ACTION,
         .key='F', .mods=M_CTRL, .dkey='F', .dmods=M_CTRL,
-        .akey='L', .amods=M_CTRL,
         .rebindable=true, .has_sw=false, .on=true, .don=true },
+    [CMD_SEARCH2] = { .id="focus_search2", .name="Focus the search box (2nd key)",
+        .desc="A second key for the search box.",
+        .how="Ctrl+L by default.",
+        .cat=SCAT_NAV, .kind=EK_ACTION,
+        .key='L', .mods=M_CTRL, .dkey='L', .dmods=M_CTRL,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
     [CMD_FOCUS_ADDR] = { .id="focus_addr", .name="Focus the address bar",
         .desc="Edit the current path directly instead of clicking crumbs.",
         .how="Type a path and press Enter; Tab jumps back to search.",
         .cat=SCAT_NAV, .kind=EK_ACTION,
         .key=VK_TAB, .dkey=VK_TAB,
         .rebindable=true, .has_sw=false, .on=true, .don=true },
+    [CMD_ADDR_SEL] = { .id="addr_select", .name="Address bar, path selected",
+        .desc="Open the address bar with the whole path selected - copy it or type over it.",
+        .how="Works even while a text field has focus.",
+        .cat=SCAT_NAV, .kind=EK_ACTION,
+        .key='D', .mods=M_ALT, .dkey='D', .dmods=M_ALT,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_ADDR_SEL2] = { .id="addr_select2", .name="Address bar, path selected (2nd key)",
+        .desc="A second key for the selected address bar.",
+        .how="Alt+E by default.",
+        .cat=SCAT_NAV, .kind=EK_ACTION,
+        .key='E', .mods=M_ALT, .dkey='E', .dmods=M_ALT,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
     [CMD_OPEN] = { .id="open", .name="Open the selection",
         .desc="Folders open in place, files open with their associated app.",
-        .how="Enter, or the Right arrow key.",
+        .how="Or double-click it. The 2nd key below is the Right arrow by default.",
         .cat=SCAT_NAV, .kind=EK_ACTION,
-        .key=VK_RETURN, .dkey=VK_RETURN, .akey=VK_RIGHT, .amods=0,
+        .key=VK_RETURN, .dkey=VK_RETURN,
         .rebindable=true, .has_sw=false, .on=true, .don=true },
+    [CMD_OPEN2] = { .id="open2", .name="Open the selection (2nd key)",
+        .desc="A second key that opens the selected item.",
+        .how="Right arrow by default.",
+        .cat=SCAT_NAV, .kind=EK_ACTION,
+        .key=VK_RIGHT, .mods=0, .dkey=VK_RIGHT, .dmods=0,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
     [CMD_UP] = { .id="up", .name="Go to the parent folder",
         .desc="Walk one level up the folder tree.",
-        .how="Backspace, or the Left arrow key.",
+        .how="Or the up arrow button. More keys below: Left arrow, Alt+Up.",
         .cat=SCAT_NAV, .kind=EK_ACTION,
-        .key=VK_BACK, .dkey=VK_BACK, .akey=VK_LEFT, .amods=0,
+        .key=VK_BACK, .dkey=VK_BACK,
         .rebindable=true, .has_sw=false, .on=true, .don=true },
+    [CMD_UP2] = { .id="up2", .name="Go to the parent folder (2nd key)",
+        .desc="A second key for one folder up.",
+        .how="Left arrow by default.",
+        .cat=SCAT_NAV, .kind=EK_ACTION,
+        .key=VK_LEFT, .mods=0, .dkey=VK_LEFT, .dmods=0,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_UP3] = { .id="up3", .name="Go to the parent folder (3rd key)",
+        .desc="A third key for one folder up.",
+        .how="Alt+Up by default.",
+        .cat=SCAT_NAV, .kind=EK_ACTION,
+        .key=VK_UP, .mods=M_ALT, .dkey=VK_UP, .dmods=M_ALT,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_BACK] = { .id="back", .name="Back",
+        .desc="Go to the previous folder of this pane.",
+        .how="Or the back arrow, or the mouse side button.",
+        .cat=SCAT_NAV, .kind=EK_ACTION,
+        .key=VK_LEFT, .mods=M_ALT, .dkey=VK_LEFT, .dmods=M_ALT,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_FORWARD] = { .id="forward", .name="Forward",
+        .desc="Go forward again after Back.",
+        .how="Or the forward arrow, or the mouse side button.",
+        .cat=SCAT_NAV, .kind=EK_ACTION,
+        .key=VK_RIGHT, .mods=M_ALT, .dkey=VK_RIGHT, .dmods=M_ALT,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
     [CMD_HOME] = { .id="home", .name="Go Home",
         .desc="Jump to your user profile folder.",
         .how="Or the hamburger menu -> Home. Unbound by default - assign a key here if you want one.",
         .cat=SCAT_NAV, .kind=EK_ACTION,
         .rebindable=true, .has_sw=false, .on=true, .don=true },
-    [CMD_SEL] = { .id="select", .name="Move the selection",
-        .desc="Walk the highlight through the list without the mouse.",
-        .how="Up / Down arrows, Page Up / Page Down, Home / End jump to the ends.",
-        .cat=SCAT_NAV, .kind=EK_DOC, .key=VK_UP, .dkey=VK_UP },
+    [CMD_SEL_UP] = { .id="sel_up", .name="Selection up",
+        .desc="Move the highlight one row up.",
+        .how="Inside a text field the key keeps its text meaning.",
+        .cat=SCAT_NAV, .kind=EK_ACTION,
+        .key=VK_UP, .mods=0, .dkey=VK_UP, .dmods=0,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_SEL_DOWN] = { .id="sel_down", .name="Selection down",
+        .desc="Move the highlight one row down.",
+        .how="Inside a text field the key keeps its text meaning.",
+        .cat=SCAT_NAV, .kind=EK_ACTION,
+        .key=VK_DOWN, .mods=0, .dkey=VK_DOWN, .dmods=0,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_PAGE_UP] = { .id="page_up", .name="Page up",
+        .desc="Jump the highlight one page up.",
+        .how="Inside a text field the key keeps its text meaning.",
+        .cat=SCAT_NAV, .kind=EK_ACTION,
+        .key=VK_PRIOR, .mods=0, .dkey=VK_PRIOR, .dmods=0,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_PAGE_DOWN] = { .id="page_down", .name="Page down",
+        .desc="Jump the highlight one page down.",
+        .how="Inside a text field the key keeps its text meaning.",
+        .cat=SCAT_NAV, .kind=EK_ACTION,
+        .key=VK_NEXT, .mods=0, .dkey=VK_NEXT, .dmods=0,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_SEL_FIRST] = { .id="sel_first", .name="First item",
+        .desc="Jump to the first item of the list.",
+        .how="Inside a text field the key keeps its text meaning.",
+        .cat=SCAT_NAV, .kind=EK_ACTION,
+        .key=VK_HOME, .mods=0, .dkey=VK_HOME, .dmods=0,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_SEL_LAST] = { .id="sel_last", .name="Last item",
+        .desc="Jump to the last item of the list.",
+        .how="Inside a text field the key keeps its text meaning.",
+        .cat=SCAT_NAV, .kind=EK_ACTION,
+        .key=VK_END, .mods=0, .dkey=VK_END, .dmods=0,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
     [CMD_DEEP] = { .id="deep_search", .name="Deep folder search",
         .desc="Search a whole folder tree, not just the visible rows.",
         .how="Type in the search box and press Enter; progress shows in the status bar; Escape cancels.",
@@ -1689,7 +1828,7 @@ static SetEnt g_ents[CMD_COUNT] = {
         .name="Restore Previous Session",
         .desc="Reopen your previous tabs, folders, and workspace layout when NovaFile starts.",
         .how="While ON, tabs and split layouts are saved (debounced) to session.txt beside settings.txt and restored at the next start. Turning it OFF starts fresh next launch and drops the old snapshot - settings and other user data are never touched.",
-        .cat=SCAT_NAV, .kind=EK_OPTION,
+        .cat=SCAT_NAV, .kind=EK_OPTION, .rebindable=true,
         .has_sw=true, .var=&g_opt_restore, .dval=true,
         .apply=session_apply },
 
@@ -1711,6 +1850,18 @@ static SetEnt g_ents[CMD_COUNT] = {
         .how="Turning the shortcut off only removes the key; right-click -> Delete still works.",
         .cat=SCAT_FILEOPS, .kind=EK_ACTION,
         .key=VK_DELETE, .dkey=VK_DELETE,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_DELETE_PERM] = { .id="delete_perm", .name="Delete permanently",
+        .desc="Remove the selection without the Recycle Bin (asks first).",
+        .how="This one cannot be undone.",
+        .cat=SCAT_FILEOPS, .kind=EK_ACTION,
+        .key=VK_DELETE, .mods=M_SHIFT, .dkey=VK_DELETE, .dmods=M_SHIFT,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_UNDO] = { .id="undo", .name="Undo",
+        .desc="Undo the last rename, delete, new item or paste (press again for more).",
+        .how="Up to 64 steps.",
+        .cat=SCAT_FILEOPS, .kind=EK_ACTION,
+        .key='Z', .mods=M_CTRL, .dkey='Z', .dmods=M_CTRL,
         .rebindable=true, .has_sw=true, .on=true, .don=true },
     [CMD_COPY] = { .id="copy", .name="Copy",
         .desc="Put the selection on the app clipboard for pasting.",
@@ -1736,12 +1887,30 @@ static SetEnt g_ents[CMD_COUNT] = {
         .cat=SCAT_FILEOPS, .kind=EK_ACTION,
         .key='A', .mods=M_CTRL, .dkey='A', .dmods=M_CTRL,
         .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_PROPS] = { .id="properties", .name="Properties",
+        .desc="Open the Windows Properties dialog of the selection.",
+        .how="Or right-click -> Properties.",
+        .cat=SCAT_FILEOPS, .kind=EK_ACTION,
+        .key=VK_RETURN, .mods=M_ALT, .dkey=VK_RETURN, .dmods=M_ALT,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_CTX_MENU] = { .id="context_menu", .name="Context menu",
+        .desc="Open the right-click menu of the selection (or of the folder).",
+        .how="The Menu key by default.",
+        .cat=SCAT_FILEOPS, .kind=EK_ACTION,
+        .key=VK_APPS, .mods=0, .dkey=VK_APPS, .dmods=0,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_CTX_MENU2] = { .id="context_menu2", .name="Context menu (2nd key)",
+        .desc="A second key for the right-click menu.",
+        .how="Shift+F10 by default.",
+        .cat=SCAT_FILEOPS, .kind=EK_ACTION,
+        .key=VK_F10, .mods=M_SHIFT, .dkey=VK_F10, .dmods=M_SHIFT,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
 
     // ---- Thumbnails and Previews ----
     [CMD_THUMBS] = { .id="thumbnails", .name="Image thumbnails",
         .desc="ON = pictures are drawn as real thumbnails; OFF = type icons only.",
         .how="Custom folder previews (below) always draw, whatever this is set to.",
-        .cat=SCAT_THUMBS, .kind=EK_OPTION,
+        .cat=SCAT_THUMBS, .kind=EK_OPTION, .rebindable=true,
         .has_sw=true, .var=&g_opt_thumbs, .dval=true },
     [CMD_CTDOC] = { .id="custom_thumbs", .name="Custom folder thumbnails",
         .desc="Give any folder its own picture, drawn inside the folder icon.",
@@ -1752,7 +1921,7 @@ static SetEnt g_ents[CMD_COUNT] = {
     [CMD_ALTGEST] = { .id="alt_gesture", .name="Alt + mouse: Back / Forward / Up",
         .desc="Hold Alt and move the mouse: left = Back, right = Forward, up = one folder up.",
         .how="Up works from any folder, visited or not. Small moves (Alt+Tab) do nothing; releasing Alt cancels.",
-        .cat=SCAT_GESTURES, .kind=EK_OPTION,
+        .cat=SCAT_GESTURES, .kind=EK_OPTION, .rebindable=true,
         .has_sw=true, .var=&g_opt_alt_gest, .dval=true },
     [CMD_GESTDOC] = { .id="gestures_doc", .name="Gesture safety",
         .desc="The Alt gesture never starts during a selection, a drag or a resize.",
@@ -1781,7 +1950,7 @@ static SetEnt g_ents[CMD_COUNT] = {
     [CMD_PANE_HOVER] = { .id="pane_hover", .name="Pane follows the mouse",
         .desc="ON = moving the mouse into a pane makes it the active one - no click needed.",
         .how="It waits while you type in a field, drag, or have a menu open. OFF = click a pane to activate it.",
-        .cat=SCAT_PANES, .kind=EK_OPTION,
+        .cat=SCAT_PANES, .kind=EK_OPTION, .rebindable=true,
         .has_sw=true, .var=&g_opt_pane_hover, .dval=true },
 
     // ---- Starred Items and Quick Access ----
@@ -1792,12 +1961,18 @@ static SetEnt g_ents[CMD_COUNT] = {
         .key='B', .mods=M_CTRL, .dkey='B', .dmods=M_CTRL,
         .rebindable=true, .has_sw=true, .on=true, .don=true },
     [CMD_WHEEL] = { .id="wheel", .name="Quick Access wheel",
-        .desc="Hold C (or press Alt+S) to open the radial wheel of starred folders at the pointer.",
+        .desc="Hold C to open the radial wheel of starred folders at the pointer.",
         .how="Star a row with the star to add it; while open, arrows pick a slot and Enter jumps.",
         .cat=SCAT_STARRED, .kind=EK_OPTION,
-        .key='C', .dkey='C', .akey='S', .amods=M_ALT,
+        .key='C', .dkey='C',
         .rebindable=true, .has_sw=true, .key_gated=true,
         .var=&g_opt_wheel, .dval=true },
+    [CMD_WHEEL2] = { .id="wheel2", .name="Quick Access wheel (press key)",
+        .desc="Opens the wheel on a single press (no hold).",
+        .how="Alt+S by default. Works while the wheel switch above is ON.",
+        .cat=SCAT_STARRED, .kind=EK_ACTION,
+        .key='S', .mods=M_ALT, .dkey='S', .dmods=M_ALT,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
     [CMD_STARDOC] = { .id="starred_doc", .name="Starred items",
         .desc="Every starred folder or file is remembered across restarts.",
         .how="Click the star on a row, or right-click a folder in the sidebar.",
@@ -1807,29 +1982,29 @@ static SetEnt g_ents[CMD_COUNT] = {
     [CMD_BURST] = { .id="icon_preload", .name="Fast icon preloading",
         .desc="After a navigation, shell icon lookups get a longer per-frame budget so a folder's icons appear within 2-3 frames.",
         .how="OFF = a steady small budget every frame (slower first paint, gentler on slow folders).",
-        .cat=SCAT_PERF, .kind=EK_OPTION,
+        .cat=SCAT_PERF, .kind=EK_OPTION, .rebindable=true,
         .has_sw=true, .var=&g_opt_burst, .dval=true },
 
     // ---- Search ----
     [CMD_SEARCH_CASE] = { .id="search_case", .name="Case-sensitive search",
         .desc="Match upper/lower case exactly. OFF = ignore case (photo matches Photo and PHOTO).",
         .how="Applies as you type, to the current folder and to Enter deep-search.",
-        .cat=SCAT_SEARCH, .kind=EK_OPTION,
+        .cat=SCAT_SEARCH, .kind=EK_OPTION, .rebindable=true,
         .has_sw=true, .var=&g_search_case, .dval=false },
     [CMD_SEARCH_BROAD] = { .id="search_broad", .name="Broad (substring) match",
         .desc="Also find names containing the query anywhere (dark-theme.png for 'theme'). OFF = only names that start with it.",
         .how="Names that start with your query are always listed first.",
-        .cat=SCAT_SEARCH, .kind=EK_OPTION,
+        .cat=SCAT_SEARCH, .kind=EK_OPTION, .rebindable=true,
         .has_sw=true, .var=&g_search_broad, .dval=true },
     [CMD_SEARCH_WORD] = { .id="search_word", .name="Word-start match",
         .desc="With Broad OFF: also match a query that starts a word (theme matches dark-theme.png).",
         .how="Turned off automatically while Broad is ON.",
-        .cat=SCAT_SEARCH, .kind=EK_OPTION,
+        .cat=SCAT_SEARCH, .kind=EK_OPTION, .rebindable=true,
         .has_sw=true, .var=&g_search_word, .dval=false },
     [CMD_SEARCH_HL] = { .id="search_highlight", .name="Highlight matches",
         .desc="Highlight every matching part of a name in the results.",
         .how="Turn off for plain text. Does not change which items match.",
-        .cat=SCAT_SEARCH, .kind=EK_OPTION,
+        .cat=SCAT_SEARCH, .kind=EK_OPTION, .rebindable=true,
         .has_sw=true, .var=&g_search_hl, .dval=true },
 
     // ---- Advanced ----
@@ -1944,10 +2119,19 @@ static void set_keyname(int key, char* buf, size_t n) {
         case VK_OEM_5:       s = "\\"; break;
         case VK_OEM_6:       s = "]"; break;
         case VK_OEM_7:       s = "'"; break;
+        case VK_OEM_2:       s = "/"; break;
+        case VK_OEM_3:       s = "`"; break;
+        case VK_APPS:        s = "Menu"; break;
+        case VK_ADD:         s = "Num +"; break;
+        case VK_SUBTRACT:    s = "Num -"; break;
+        case VK_MULTIPLY:    s = "Num *"; break;
+        case VK_DIVIDE:      s = "Num /"; break;
+        case VK_DECIMAL:     s = "Num ."; break;
         default: break;
     }
     if (s) { snprintf(buf, n, "%s", s); return; }
     if (key >= VK_F1 && key <= VK_F24) { snprintf(buf, n, "F%d", key - VK_F1 + 1); return; }
+    if (key >= VK_NUMPAD0 && key <= VK_NUMPAD9) { snprintf(buf, n, "Num %d", key - VK_NUMPAD0); return; }
     if (key > 0 && key < 256) { snprintf(buf, n, "K%d", key); return; }
     buf[0] = '\0';
 }
@@ -2119,14 +2303,12 @@ static bool set_rebind(int id, int key, unsigned mods,
         if (err && errn) snprintf(err, errn, "That shortcut is fixed.");
         return false;
     }
-    // Fixed keys the hardcoded fallbacks own (list movement, Escape) -
-    // binding one of them would produce a shortcut that looks armed but
-    // never runs, so they are refused with the reason.
-    if (key == VK_ESCAPE || key == VK_UP || key == VK_DOWN ||
-        key == VK_PRIOR || key == VK_NEXT || key == VK_HOME ||
-        key == VK_END) {
+    // Escape is the one key every menu, panel and field closes with -
+    // binding it to a command would leave no way out, so it is refused.
+    // Every other key (arrows, Page Up/Down, Home/End included) is free.
+    if (key == VK_ESCAPE) {
         if (err && errn)
-            snprintf(err, errn, "Reserved: list navigation and closing.");
+            snprintf(err, errn, "Reserved: Escape closes menus and panels.");
         return false;
     }
     // Windows-reserved Win+key: the OS keeps the combination for itself
@@ -2189,6 +2371,12 @@ static void settings_load(void) {
     if (!g_set_file[0]) return;
     FILE* f = fopen(g_set_file, "rb");
     if (!f) return;
+    // Rows whose binding came from the file.  A key the user chose wins
+    // over a NEWER default: when an update turns a formerly fixed key
+    // (Alt+Left, F11, Ctrl+Z...) into a row and the user had already
+    // given that key to another command, the new row steps aside.
+    bool from_file[CMD_COUNT];
+    memset(from_file, 0, sizeof from_file);
     char line[320];
     while (fgets(line, sizeof(line), f)) {
         size_t n = strlen(line);
@@ -2268,6 +2456,7 @@ static void settings_load(void) {
         }
         e->key = (int)key;
         e->mods = (int)mods;
+        from_file[id] = true;
         if (e->kind == EK_OPTION) { if (e->var) *e->var = val != 0; }
         else e->on = val != 0;
     }
@@ -2289,7 +2478,20 @@ static void settings_load(void) {
                        (b->akey && set_clash(a->key, (unsigned)a->mods,
                                              (unsigned)b->akey,
                                              (unsigned)b->amods));
-            if (hit) { set_entry_default(i); break; }
+            if (!hit) continue;
+            // the user's own key keeps it: a row still on its default
+            // (not in the file) is unbound instead; otherwise, as before,
+            // the later row falls back to its default
+            if (from_file[j] && !from_file[i]) {
+                g_ents[i].key = 0;
+                g_ents[i].mods = 0;
+            } else if (from_file[i] && !from_file[j]) {
+                g_ents[j].key = 0;
+                g_ents[j].mods = 0;
+            } else {
+                set_entry_default(i);
+            }
+            break;
         }
     }
     ui_scale_refresh();   // an early caller may have staged the scale
@@ -2650,8 +2852,7 @@ static void settings_keys(InputState* in) {
         // captured: Ctrl / Shift / Alt / Win appear the instant they
         // are held, but they never touch an already-captured combo.
         if (rk == 0 || rk == VK_CONTROL || rk == VK_SHIFT || rk == VK_MENU ||
-            rk == VK_LWIN || rk == VK_RWIN || rk == VK_APPS ||
-            rk == VK_SNAPSHOT) {
+            rk == VK_LWIN || rk == VK_RWIN || rk == VK_SNAPSHOT) {
             if (!g_rec_key) g_rec_mods = held;
             return;
         }
@@ -17930,6 +18131,14 @@ static bool rad_handle_key(InputState* in, const Layout* L) {
         }
     }
 
+    // The press alias (default Alt+S): opens / closes on one press, only
+    // while the wheel feature itself is switched on.
+    if (cmd_hit(in, CMD_WHEEL2) && cmd_enabled(CMD_WHEEL)) {
+        tts_reset();
+        if (g_rad_open) rad_close("toggle");
+        else rad_open(in->x, in->y);
+        return true;
+    }
     if (cmd_hit(in, CMD_WHEEL)) {          // registry binding (default C)
         // The key is a TOGGLE when the wheel is up: open -> closed. When
         // it is down a LETTER key is the tap/hold gesture above (tap =
@@ -18234,6 +18443,33 @@ static const char* tts_row_query(int vi) {
 // ------------------------------------------------------------
 // Input
 // ------------------------------------------------------------
+// cmd_hit for the commands checked BEFORE a focused text field takes its
+// keys: a binding without Ctrl / Alt / Win is a typing key while a field
+// has focus, so it may only fire when no field is focused.
+static bool cmd_hit_global(const InputState* in, int id) {
+    if (!cmd_hit(in, id)) return false;
+    if (g_ents[id].mods & (M_CTRL | M_ALT | M_WIN)) return true;
+    return !g_app.addr_focused && !g_app.search_focused;
+}
+
+// The selection's (or the folder's) context menu from the keyboard, at the
+// selected row - Explorer's Menu key / Shift+F10.
+static void ctx_menu_key(const Layout* L) {
+    int vi = g_app.selected;
+    if (vi >= 0 && (size_t)vi < g_app.view_count) {
+        int ei = g_app.view[vi];
+        int row = mode_is_grid() ? vi / (L->cols > 0 ? L->cols : 1) : vi;
+        int y = L->list.y + L->list_head_h +
+                (row - g_app.scroll) * (mode_is_grid() ? L->cell_h : L->row_h) +
+                SC(12);
+        if (!sel_contains(vi)) { sel_clear(); sel_add(vi); }
+        xm_open_items(vi, g_app.entries[ei].is_directory,
+                      L->list.x + SC(60), y);
+    } else {
+        xm_open_bg(L->list.x + L->list.w / 3, L->list.y + L->list.h / 3);
+    }
+}
+
 static void handle_keys(InputState* in, const Layout* L) {
     // Quick Access: every frame the wheel is up it ticks.  This runs
     // before the key_code == 0 test, because a frame can carry nothing at
@@ -18262,27 +18498,23 @@ static void handle_keys(InputState* in, const Layout* L) {
     // instead of vanishing into an open menu.
     if (g_ctx_open && ctx_handle_key(in)) return;
 
-    // Alt+E / Alt+D: the address bar with the WHOLE path selected, ready
-    // to copy (Ctrl+C) or to overwrite by typing.  Checked before any text
-    // field takes the key, so pressing it again while the bar is already
-    // open selects everything again.
-    if (in->alt_pressed && !in->ctrl_pressed && !in->win_pressed &&
-        (in->key_code == 'E' || in->key_code == 'D') &&
-        g_confirm_kind == CONFIRM_NONE && g_rename_vi < 0) {
-        focus_address();
-        g_app.addr_anchor = 0;
-        g_app.addr_caret = (int)strlen(g_app.addr_buf);
-        return;
-    }
-    // Ctrl+Space (rebindable): maximize / restore the active pane.  Alt+1..5:
-    // pick a view mode in the view menu's order.  Both work from a text
-    // field too, but never under a confirm panel or an inline rename.
+    // Commands that also work while a text field has focus (address bar
+    // with the path selected - default Alt+D / Alt+E -, pane maximize -
+    // Ctrl+Space -, the five view modes - Alt+1..5).  Never under a confirm
+    // panel or an inline rename.  Every key is the user's choice
+    // (Settings); a binding WITHOUT Ctrl/Alt/Win is a typing key while a
+    // field has focus, so it only acts here when no field is focused.
     if (g_confirm_kind == CONFIRM_NONE && g_rename_vi < 0) {
-        if (cmd_hit(in, CMD_PANE_MAX)) { pane_max_toggle(); return; }
-        if (in->alt_pressed && !in->ctrl_pressed && !in->win_pressed &&
-            !in->shift_pressed &&
-            in->key_code >= '1' && in->key_code < '1' + VIEW_MENU_MAX) {
-            int m = in->key_code - '1';
+        if (cmd_hit_global(in, CMD_ADDR_SEL) ||
+            cmd_hit_global(in, CMD_ADDR_SEL2)) {
+            focus_address();               // the WHOLE path selected, ready
+            g_app.addr_anchor = 0;         // to copy or to type over
+            g_app.addr_caret = (int)strlen(g_app.addr_buf);
+            return;
+        }
+        if (cmd_hit_global(in, CMD_PANE_MAX)) { pane_max_toggle(); return; }
+        for (int m = 0; m < VIEW_MENU_MAX; m++) {
+            if (!cmd_hit_global(in, CMD_VIEW_1 + m)) continue;
             if (g_app.view_mode == m) set_status("%s view", MODE_NAMES[m]);
             else set_view_mode(m, true);
             return;
@@ -18580,44 +18812,43 @@ static void handle_keys(InputState* in, const Layout* L) {
     //      binding - rebind or switch a command off there and this chain
     //      follows automatically. Exact Ctrl/Alt match, Shift only when a
     //      binding asks for it, so Ctrl+Tab / Ctrl+Shift+Tab both work.
-    // ---- Explorer's fixed navigation keys: Alt+Left / Alt+Right = Back /
-    //      Forward, Alt+Up = parent folder, Alt+Enter = Properties, Alt+D =
-    //      address bar, F11 = maximize / restore.  Checked before the
-    //      registry chain; plain arrows (no Alt) keep their meaning.
-    if (in->alt_pressed && !in->ctrl_pressed && !in->win_pressed) {
-        if (k == VK_LEFT)   { go_back(); return; }
-        if (k == VK_RIGHT)  { go_forward(); return; }
-        if (k == VK_UP)     { go_up(); return; }
-        if (k == VK_RETURN) { props_real(); return; }
-        if (k == 'D')       { focus_address(); return; }
-    }
-    // Menu key / Shift+F10: the context menu of the selection (or of the
-    // folder when nothing is selected), at the selected row - Explorer.
-    if ((k == VK_APPS || (k == VK_F10 && in->shift_pressed)) && !g_st_running) {
-        int vi = g_app.selected;
-        if (vi >= 0 && (size_t)vi < g_app.view_count) {
-            int ei = g_app.view[vi];
-            int row = mode_is_grid() ? vi / (L->cols > 0 ? L->cols : 1) : vi;
-            int y = L->list.y + L->list_head_h +
-                    (row - g_app.scroll) * (mode_is_grid() ? L->cell_h : L->row_h) +
-                    SC(12);
-            if (!sel_contains(vi)) { sel_clear(); sel_add(vi); }
-            xm_open_items(vi, g_app.entries[ei].is_directory,
-                          L->list.x + SC(60), y);
-        } else {
-            xm_open_bg(L->list.x + L->list.w / 3, L->list.y + L->list.h / 3);
-        }
+    // ---- Explorer's navigation keys (defaults Alt+Left / Alt+Right =
+    //      Back / Forward, Alt+Up = parent, Alt+Enter = Properties), all
+    //      registry rows now - the user can move any of them.  Checked
+    //      before the rest of the chain, as before.
+    if (cmd_hit(in, CMD_BACK))    { go_back(); return; }
+    if (cmd_hit(in, CMD_FORWARD)) { go_forward(); return; }
+    if (cmd_hit(in, CMD_UP3))     { go_up(); return; }
+    if (cmd_hit(in, CMD_PROPS))   { props_real(); return; }
+    // Menu key / Shift+F10 by default: the context menu of the selection
+    // (or of the folder when nothing is selected), at the selected row.
+    if ((cmd_hit(in, CMD_CTX_MENU) || cmd_hit(in, CMD_CTX_MENU2)) &&
+        !g_st_running) {
+        ctx_menu_key(L);
         return;
     }
     if (cmd_hit(in, CMD_HELP)) { help_open(); return; }
     if (cmd_hit(in, CMD_SIDEBAR)) { sidebar_toggle(); return; }
-    if (k == 'Z' && in->ctrl_pressed && !in->alt_pressed &&
-        !in->shift_pressed) {
-        undo_run();                           // Explorer's Ctrl+Z
+    if (cmd_hit(in, CMD_UNDO)) { undo_run(); return; }    // default Ctrl+Z
+    if (cmd_hit(in, CMD_WIN_MAX)) {                       // default F11
+        platform_window_maximize_toggle();
         return;
     }
-    if (k == VK_F11 && !in->ctrl_pressed && !in->alt_pressed) {
-        platform_window_maximize_toggle();
+    if (cmd_hit(in, CMD_ZOOM_IN))    { adjust_zoom(+0.30f); return; }
+    if (cmd_hit(in, CMD_ZOOM_OUT))   { adjust_zoom(-0.30f); return; }
+    if (cmd_hit(in, CMD_SCALE_UP))   { ui_scale_step(+10); return; }
+    if (cmd_hit(in, CMD_SCALE_DOWN)) { ui_scale_step(-10); return; }
+    // An ON/OFF option the user gave a key in Settings (thumbnails, Alt
+    // gesture, pane follows mouse, search options, ...): the key flips it.
+    // The sidebar, hidden files and the wheel have their own handlers.
+    for (int i = 0; i < CMD_COUNT; i++) {
+        const SetEnt* oe = &g_ents[i];
+        if (oe->kind != EK_OPTION || !oe->var || oe->key_gated ||
+            i == CMD_SIDEBAR || i == CMD_HIDDEN || i == CMD_WHEEL)
+            continue;
+        if (!cmd_hit(in, i)) continue;
+        opt_set(i, !*oe->var);
+        set_status("%s: %s", oe->name, *oe->var ? "ON" : "OFF");
         return;
     }
     if (cmd_hit(in, CMD_NEW_FOLDER)) {
@@ -18654,7 +18885,7 @@ static void handle_keys(InputState* in, const Layout* L) {
     }
     if (cmd_hit(in, CMD_QUIT)) {
         g_app.running = false;
-    } else if (cmd_hit(in, CMD_FOCUS_SEARCH)) {
+    } else if (cmd_hit(in, CMD_FOCUS_SEARCH) || cmd_hit(in, CMD_SEARCH2)) {
         focus_search();                  // Explorer's search-box shortcut
         g_search_popup_open = true;      // ... which pops the big overlay,
         g_search_popup_pane = g_active_pane;   // exactly like clicking it
@@ -18674,8 +18905,11 @@ static void handle_keys(InputState* in, const Layout* L) {
                 rename_begin(&g_app.entries[ei]);
         }
         return;
+    } else if (cmd_hit(in, CMD_DELETE_PERM)) {
+        delete_confirm_mode(true);           // default Shift+Delete
+        return;
     } else if (cmd_hit(in, CMD_DELETE)) {
-        delete_confirm();
+        delete_confirm_mode(false);
         return;
     } else if (cmd_hit(in, CMD_COPY)) {
         ctx_run(CTX_CMD_COPY);
@@ -18697,28 +18931,29 @@ static void handle_keys(InputState* in, const Layout* L) {
         settings_open();
     } else if (cmd_hit(in, CMD_FOCUS_ADDR)) {
         focus_address();
-    } else if (cmd_hit(in, CMD_OPEN)) {
+    } else if (cmd_hit(in, CMD_OPEN) || cmd_hit(in, CMD_OPEN2)) {
         open_selected();
-    } else if (cmd_hit(in, CMD_UP)) {
+    } else if (cmd_hit(in, CMD_UP) || cmd_hit(in, CMD_UP2)) {
         go_up();
     } else if (cmd_hit(in, CMD_REFRESH)) {
         folder_refresh_keep();           // F5 keeps scroll + selection
     } else if (cmd_hit(in, CMD_HOME)) {
         navigate(platform_get_home_directory(), true);
-    } else if (k == VK_UP) {
-        // fixed keys (documented in Settings, deliberately not rebindable)
+    } else if (cmd_hit(in, CMD_SEL_UP)) {
+        // list movement: registry rows too (defaults: the arrow keys,
+        // Page Up / Page Down, Home / End)
         move_selection(-1, L);
-    } else if (k == VK_DOWN) {
+    } else if (cmd_hit(in, CMD_SEL_DOWN)) {
         move_selection(1, L);
-    } else if (k == VK_PRIOR) {
+    } else if (cmd_hit(in, CMD_PAGE_UP)) {
         page_selection(-1, L);
-    } else if (k == VK_NEXT) {
+    } else if (cmd_hit(in, CMD_PAGE_DOWN)) {
         page_selection(1, L);
-    } else if (k == VK_HOME) {
+    } else if (cmd_hit(in, CMD_SEL_FIRST)) {
         g_app.selected = 0;
         g_app.scroll = 0;
         clamp_scroll(L);
-    } else if (k == VK_END) {
+    } else if (cmd_hit(in, CMD_SEL_LAST)) {
         g_app.selected = (int)g_app.view_count - 1;
         g_app.scroll = L->max_scroll;
         clamp_scroll(L);
@@ -19907,27 +20142,16 @@ static void help_build(void) {
             help_add(SCAT_NAMES[c], k, e->name);
         }
     }
-    // 2) the fixed keys (not rebindable - they work everywhere)
+    // 2) what is not a keyboard shortcut row: Escape, typing, the mouse
+    //    and the held-key gestures (every real shortcut is listed above
+    //    with the key the user chose)
     const char* G1 = "Moving around";
-    help_add(G1, "Up / Down", "Move the selection");
-    help_add(G1, "PgUp / PgDn", "Jump a page");
-    help_add(G1, "Home / End", "First / last item");
-    help_add(G1, "Enter", "Open the folder or file");
-    help_add(G1, "Backspace", "Parent folder");
-    help_add(G1, "Alt+Left  /  Alt+Right", "Back / Forward");
-    help_add(G1, "Alt+Up", "One level up");
-    help_add(G1, "Alt+E  /  Alt+D", "Address bar, whole path selected (copy / type)");
+    help_add(G1, "Esc", "Close the menu, panel or field on top");
     help_add(G1, "Type a name", "Jump to the item that starts with it");
-    const char* G2 = "Files";
-    help_add(G2, "Shift+Delete", "Delete permanently (skips the Recycle Bin)");
-    help_add(G2, "Ctrl+Z", "Undo rename / delete / new item / paste (press again for more)");
-    help_add(G2, "Alt+Enter", "Properties");
-    help_add(G2, "Menu key  /  Shift+F10", "Context menu of the selection");
-    help_add(G2, "Type in a menu", "Search every command in it");
+    help_add(G1, "Type in a menu", "Search every command in it");
     const char* G3 = "View and window";
     help_add(G3, "Ctrl+Wheel", "Make icons bigger / smaller");
     help_add(G3, "Alt+Wheel  /  Hold V + / -", "Scale the whole interface");
-    help_add(G3, "F11", "Maximize / restore the window");
     const char* G4 = "Mouse";
     help_add(G4, "Middle-click a folder", "Open it in a new tab");
     help_add(G4, "Side buttons", "Back / Forward");
@@ -20360,7 +20584,7 @@ static void sidebar_animate(void) {
 
 // ---- "next time press ..." (once per command per session) ---------------
 static void menu_key_tip(int cmd) {
-    static bool told[64];
+    static bool told[CMD_COUNT];
     int id = -1;
     switch (cmd) {
     case CTX_CMD_CUT: id = CMD_CUT; break;
@@ -20371,7 +20595,7 @@ static void menu_key_tip(int cmd) {
     case CTX_CMD_REFRESH: id = CMD_REFRESH; break;
     default: return;
     }
-    if (id < 0 || id >= 64 || told[id] || !g_ents[id].key || !g_ents[id].on) return;
+    if (id < 0 || id >= CMD_COUNT || told[id] || !g_ents[id].key || !g_ents[id].on) return;
     told[id] = true;
     char prev[200];
     snprintf(prev, sizeof prev, "%s", g_app.status_msg);
@@ -27878,9 +28102,24 @@ static void run_selftest(void) {
         {
             compute_layout(&M, w, h); g_content = M.list;
             int pc0 = pane_count(g_pane_root);
+            Pane* old_leaves[16];
+            int nold = pane_leaves(g_pane_root, old_leaves, 0, 16);
             pane_split_right();
             compute_pane_tree_layout(g_pane_root, M.list);
             bool split_ok = pane_count(g_pane_root) == pc0 + 1;
+            // the pane this test created - the ONLY one it may close
+            // (later checks still hold pointers to the older panes)
+            Pane* mine = NULL;
+            {
+                Pane* now[16];
+                int nn = pane_leaves(g_pane_root, now, 0, 16);
+                for (int i = 0; i < nn && !mine; i++) {
+                    bool seen = false;
+                    for (int j = 0; j < nold; j++)
+                        if (now[i] == old_leaves[j]) seen = true;
+                    if (!seen) mine = now[i];
+                }
+            }
             Pane* a = g_active_pane;
             RectI before = a ? a->rect : (RectI){0, 0, 0, 0};
             Pane* other = pane_leaf_other(g_pane_root, a);
@@ -27912,11 +28151,17 @@ static void run_selftest(void) {
                 if (g_app.view_mode != m) keys_ok = false;
             }
             // closing the maximized pane must leave a normal layout
-            handle_keys((memset(&kf, 0, sizeof kf), kf.key_code = VK_SPACE,
-                         kf.ctrl_pressed = true, &kf), &M);
-            pane_close_active();
-            bool close_ok = !g_pane_max && pane_count(g_pane_root) == pc0;
-            while (pane_count(g_pane_root) > pc0) pane_close_active();
+            bool close_ok = false;
+            if (mine) {
+                activate_pane(mine);
+                memset(&kf, 0, sizeof kf);
+                kf.key_code = VK_SPACE; kf.ctrl_pressed = true;
+                handle_keys(&kf, &M);
+                bool was_max = pane_max_live() == mine;
+                pane_close_active();               // closes `mine` only
+                close_ok = was_max && !g_pane_max &&
+                           pane_count(g_pane_root) == pc0;
+            }
             compute_pane_tree_layout(g_pane_root, M.list);
             printf("[selftest]   Ctrl+Space maximize/restore, Alt+1..5: %s\n",
                    (max_ok && rest_ok && keys_ok && close_ok) ? "ok" : "FAILED");
@@ -30566,9 +30811,10 @@ static void run_selftest(void) {
             st_expect(g_tts_prefix[0] == 's',
                       "bare S still types 's' for type-to-select", &fails);
             tts_reset();
-            st_expect(g_ents[CMD_WHEEL].akey == 'S' &&
-                      g_ents[CMD_WHEEL].amods == (int)M_ALT,
-                      "the wheel's fixed alias is Alt+S", &fails);
+            st_expect(g_ents[CMD_WHEEL2].key == 'S' &&
+                      g_ents[CMD_WHEEL2].mods == (int)M_ALT &&
+                      g_ents[CMD_WHEEL2].rebindable,
+                      "the wheel's press key is Alt+S and can be changed", &fails);
         }
 
         // ---- 1) the cap and the LRU rule (spec 9 / 10) -----------------
@@ -31595,10 +31841,21 @@ static void run_selftest(void) {
                     !a->desc || !a->desc[0])
                     meta_ok = false;
                 if (a->kind == EK_OPTION && !a->var) meta_ok = false;
+                // every action ships bound except the ones that are
+                // unbound ON PURPOSE (the user may give them a key): Home,
+                // and the icon / interface size steps (mouse gestures
+                // already cover those)
+                static const char* const UNBOUND_OK[] = {
+                    "home", "zoom_in", "zoom_out", "scale_up", "scale_down"
+                };
+                bool unbound_ok = false;
+                for (size_t u = 0; a->id &&
+                     u < sizeof UNBOUND_OK / sizeof UNBOUND_OK[0]; u++)
+                    if (strcmp(a->id, UNBOUND_OK[u]) == 0) unbound_ok = true;
                 if (a->kind == EK_ACTION && a->dkey == 0 &&
                     a->rebindable &&          // fixed unbound rows are buttons
-                    (!a->id || strcmp(a->id, "home") != 0))
-                    meta_ok = false;   // every action but Home ships bound
+                    !unbound_ok)
+                    meta_ok = false;
                 if (a->cat < 0 || a->cat >= SCAT_COUNT) cats_ok = false;
                 for (int j = 0; j < i; j++) {
                     const SetEnt* b = &g_ents[j];
@@ -32082,6 +32339,75 @@ static void run_selftest(void) {
                   "settings: Escape leaves the recorder, not the panel");
             settings_keys(&esc);                       // Esc #2: the panel
             S_EXP(!g_set_open, "settings: the panel is closed again");
+
+            // Every shortcut is the user's choice: no visible command row
+            // is fixed any more (Escape stays the one universal "close").
+            {
+                bool all_rb = true;
+                for (int i = 0; i < CMD_COUNT; i++) {
+                    const SetEnt* e = &g_ents[i];
+                    if (e->hidden || e->kind == EK_DOC) continue;
+                    bool button = e->kind == EK_ACTION && !e->rebindable &&
+                                  e->dkey == 0;
+                    if (!button && !e->rebindable) {
+                        all_rb = false;
+                        printf("[selftest]   not rebindable: %s\n", e->id);
+                    }
+                }
+                S_EXP(all_rb, "settings: every visible command can be rebound");
+            }
+            S_EXP(set_rebind(CMD_SEL_UP, 'K', 0, err, sizeof err),
+                  "settings: list movement (Up) can move to another key");
+            {
+                InputState kk;
+                memset(&kk, 0, sizeof kk);
+                kk.key_code = 'K';
+                bool on_k = cmd_hit(&kk, CMD_SEL_UP);
+                kk.key_code = VK_UP;
+                S_EXP(on_k && !cmd_hit(&kk, CMD_SEL_UP),
+                      "settings: the moved key fires, the old one no longer");
+            }
+            S_EXP(set_rebind(CMD_BACK, VK_UP, 0, err, sizeof err),
+                  "settings: a freed arrow key can be given to another command");
+            S_EXP(!set_rebind(CMD_UNDO, VK_ESCAPE, 0, err, sizeof err),
+                  "settings: Escape stays reserved for closing");
+            {
+                // an ON/OFF option with a user-chosen key flips on that key
+                S_EXP(set_rebind(CMD_THUMBS, 'T', M_CTRL | M_ALT, err,
+                                 sizeof err),
+                      "settings: an option can get a key");
+                bool before = g_opt_thumbs;
+                int ww = 0, hh = 0;
+                platform_window_size(&ww, &hh);
+                Layout KL;
+                compute_layout(&KL, ww, hh);
+                g_app.addr_focused = g_app.search_focused = false;
+                InputState kk;
+                memset(&kk, 0, sizeof kk);
+                kk.key_code = 'T'; kk.ctrl_pressed = kk.alt_pressed = true;
+                handle_keys(&kk, &KL);
+                bool flipped = g_opt_thumbs != before;
+                if (g_opt_thumbs != before) opt_set(CMD_THUMBS, before);
+                S_EXP(flipped, "settings: the option's key toggles it");
+            }
+            {
+                // An older settings file where the user had given Alt+Left
+                // (now the new Back row's default) to Home: the user's
+                // choice is kept, the new row steps aside (unbound).
+                g_set_file[0] = '\0';
+                settings_defaults();
+                FILE* of = fopen(tmp, "wb");
+                if (of) {
+                    fprintf(of, "# NovaFile settings v2\nhome\t%d\t%d\t1\n",
+                            VK_LEFT, (int)M_ALT);
+                    fclose(of);
+                }
+                settings_set_path(tmp);          // load it
+                S_EXP(g_ents[CMD_HOME].key == VK_LEFT &&
+                      g_ents[CMD_HOME].mods == (int)M_ALT &&
+                      g_ents[CMD_BACK].key == 0,
+                      "settings: an older user binding beats a new default");
+            }
 
             settings_defaults();               // documented defaults back
             settings_init();                   // run store reloaded + applied

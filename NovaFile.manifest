@@ -9,7 +9,7 @@
      Common-Controls 6: the system dialogs the app opens (folder / image
      pickers, message boxes) get the modern visual style. -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="NovaFile.Explorer" version="1.5.2.0" processorArchitecture="*"/>
+  <assemblyIdentity type="win32" name="NovaFile.Explorer" version="1.5.3.0" processorArchitecture="*"/>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
       <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>

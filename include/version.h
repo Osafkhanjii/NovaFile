@@ -9,8 +9,8 @@
 
 #define NOVA_VERSION_MAJOR 1
 #define NOVA_VERSION_MINOR 5
-#define NOVA_VERSION_PATCH 2
-#define NOVA_VERSION       "1.5.2"
+#define NOVA_VERSION_PATCH 3
+#define NOVA_VERSION       "1.5.3"
 
 #define NOVA_PRODUCT    "NovaFile Explorer"
 // Publisher shown in the installer and the VERSIONINFO resource - set this

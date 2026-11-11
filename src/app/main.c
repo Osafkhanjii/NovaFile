@@ -715,6 +715,11 @@ static App g_app;
 // ---- Pane tiling ----
 static Pane* g_pane_root = NULL;      // root of the layout tree
 static Pane* g_active_pane = NULL;    // pane the user works in
+// Maximized pane (Ctrl+Space): this leaf fills the whole pane area and its
+// siblings are laid out as empty rects, so they are neither drawn nor hit.
+// Only a pointer - the tree itself never changes, so restoring gives back
+// the exact split ratios.  NULL = normal tiling.  pane_free() clears it.
+static Pane* g_pane_max = NULL;
 
 // ---- Search popup (single GLOBAL overlay) ----
 // Clicking Search opens ONE large, focused input overlay centered over the
@@ -1505,14 +1510,14 @@ typedef struct {
 
 enum {                                  // entry ids (index into g_ents)
     CMD_SET_OPEN = 0, CMD_QUIT, CMD_REFRESH, CMD_HIDDEN, CMD_ESCAPE,
-    CMD_THEME, CMD_VIEW, CMD_ZOOM,
+    CMD_THEME, CMD_VIEW, CMD_VIEW_KEYS, CMD_ZOOM,
     CMD_NEW_TAB, CMD_CYCLE_TAB, CMD_SHIFT_TAB_L, CMD_SHIFT_TAB_R,
     CMD_FOCUS_SEARCH, CMD_FOCUS_ADDR,
     CMD_OPEN, CMD_UP, CMD_HOME, CMD_SEL, CMD_DEEP,
     CMD_RENAME, CMD_NEW_FOLDER, CMD_DELETE, CMD_COPY, CMD_CUT, CMD_PASTE, CMD_SELECT_ALL,
     CMD_THUMBS, CMD_CTDOC,
     CMD_ALTGEST, CMD_GESTDOC,
-    CMD_SPLIT, CMD_CLOSE_PANE, CMD_PANE_HOVER,
+    CMD_SPLIT, CMD_CLOSE_PANE, CMD_PANE_MAX, CMD_PANE_HOVER,
     CMD_BOOKMARK, CMD_WHEEL, CMD_STARDOC,
     CMD_BURST,
     CMD_STORE,
@@ -1606,6 +1611,10 @@ static SetEnt g_ents[CMD_COUNT] = {
         .cat=SCAT_APPEARANCE, .kind=EK_ACTION,
         .key=VK_F3, .dkey=VK_F3,
         .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_VIEW_KEYS] = { .id="view_keys", .name="Pick a view mode",
+        .desc="Alt+1 Details, Alt+2 List, Alt+3 Tree, Alt+4 Icons, Alt+5 XL icons.",
+        .how="Fixed keys, in the order of the view menu in the status bar.",
+        .cat=SCAT_APPEARANCE, .kind=EK_DOC },
     [CMD_ZOOM] = { .id="zoom", .name="Zoom the icon size",
         .desc="Change how large rows, cells and thumbnails are drawn.",
         .how="Ctrl + mouse wheel over the list, or the % control in the status bar.",
@@ -1762,6 +1771,12 @@ static SetEnt g_ents[CMD_COUNT] = {
         .how="Or the pane context menu -> Close.",
         .cat=SCAT_PANES, .kind=EK_ACTION,
         .key='W', .mods=M_CTRL, .dkey='W', .dmods=M_CTRL,
+        .rebindable=true, .has_sw=true, .on=true, .don=true },
+    [CMD_PANE_MAX] = { .id="pane_max", .name="Maximize / restore pane",
+        .desc="Show only the active pane, filling the whole pane area. Press again to bring the other panes back.",
+        .how="While maximized, the pane header shows a badge with a map of the hidden panes; click it to restore.",
+        .cat=SCAT_PANES, .kind=EK_ACTION,
+        .key=VK_SPACE, .mods=M_CTRL, .dkey=VK_SPACE, .dmods=M_CTRL,
         .rebindable=true, .has_sw=true, .on=true, .don=true },
     [CMD_PANE_HOVER] = { .id="pane_hover", .name="Pane follows the mouse",
         .desc="ON = moving the mouse into a pane makes it the active one - no click needed.",
@@ -11897,6 +11912,10 @@ static void draw_view_menu(const Layout* L, const InputState* in) {
         if (cur) fill(r->x, r->y + SC(4), SC(3), r->h - SC(8), P->accent);
         text_px(MODE_NAMES[i], r->x + SC(12),
                 r->y + (r->h - L->text_med) / 2, L->text_med, P->text);
+        char hk[8];
+        snprintf(hk, sizeof hk, "Alt+%d", i + 1);
+        text_right_px(hk, r->x + r->w, r->y + (r->h - L->text_small) / 2,
+                      L->text_small, P->dim);
     }
 }
 
@@ -13610,6 +13629,9 @@ static void pane_split_right(void);
 // the definition next to pane_split_right).
 static void pane_open_in_new_pane(const char* path);
 static void pane_close_active(void);
+static Pane* pane_max_live(void);                 // Ctrl+Space maximize
+static void pane_max_toggle(void);
+static RectI pane_max_pill_rect(RectI title);
 static RectI pane_close_rect(RectI r);
 static Pane* pane_title_close_at(Pane* p, int x, int y);
 static Pane* pane_title_strip_at(Pane* p, int x, int y);
@@ -18252,6 +18274,20 @@ static void handle_keys(InputState* in, const Layout* L) {
         g_app.addr_caret = (int)strlen(g_app.addr_buf);
         return;
     }
+    // Ctrl+Space (rebindable): maximize / restore the active pane.  Alt+1..5:
+    // pick a view mode in the view menu's order.  Both work from a text
+    // field too, but never under a confirm panel or an inline rename.
+    if (g_confirm_kind == CONFIRM_NONE && g_rename_vi < 0) {
+        if (cmd_hit(in, CMD_PANE_MAX)) { pane_max_toggle(); return; }
+        if (in->alt_pressed && !in->ctrl_pressed && !in->win_pressed &&
+            !in->shift_pressed &&
+            in->key_code >= '1' && in->key_code < '1' + VIEW_MENU_MAX) {
+            int m = in->key_code - '1';
+            if (g_app.view_mode == m) set_status("%s view", MODE_NAMES[m]);
+            else set_view_mode(m, true);
+            return;
+        }
+    }
     bool editing = g_app.addr_focused || g_app.search_focused;
     bool is_addr = g_app.addr_focused;
     bool is_search = g_app.search_focused;
@@ -20344,7 +20380,7 @@ static void menu_key_tip(int cmd) {
 }
 
 // ---- "Update available" card -------------------------------------------
-// The updater checks in the background (start + every 6 hours) and
+// The updater checks in the background (start + every 30 minutes) and
 // downloads + verifies a newer release by itself.  As soon as one is
 // ready this card appears bottom-right: Update now installs it (the app
 // closes, the installer runs silently and reopens NovaFile), Later hides
@@ -21794,6 +21830,10 @@ static void handle_mouse(const Layout* L, InputState* in) {
         // ---- pane title [x]: close THAT pane. Tested before the grab
         //      zone so pressing the cross can never arm a pane drag; the
         //      last pane refuses (existing rule) and the layout retiles.
+        if (pane_max_live()) {            // header badge: restore panes
+            RectI br = pane_max_pill_rect(pane_body_rect(g_pane_max));
+            if (inside(&br, in->x, in->y)) { pane_max_toggle(); return; }
+        }
         if (g_pane_root) {
             Pane* xc = pane_title_close_at(g_pane_root, in->x, in->y);
             if (xc) {
@@ -21813,7 +21853,8 @@ static void handle_mouse(const Layout* L, InputState* in) {
         //      [x] already follows - so in a 3+-pane tree every pane can be
         //      moved without first closing another one to reach it.
         {
-            Pane* grab = pane_title_strip_at(g_pane_root, in->x, in->y);
+            Pane* grab = pane_max_live() ? NULL   // nothing to tile against
+                       : pane_title_strip_at(g_pane_root, in->x, in->y);
             if (grab) {
                 if (grab != g_active_pane) activate_pane(grab);
                 g_drag_split_armed = true;
@@ -27831,6 +27872,60 @@ static void run_selftest(void) {
             if (!ok5) printf("[selftest] FAIL: four-way zones\n");
         }
 
+        // (5b) Ctrl+Space maximize: the active pane fills the pane area,
+        //      the other one is laid out empty and is never hit; a second
+        //      press restores the exact split; Alt+1..5 picks view modes.
+        {
+            compute_layout(&M, w, h); g_content = M.list;
+            int pc0 = pane_count(g_pane_root);
+            pane_split_right();
+            compute_pane_tree_layout(g_pane_root, M.list);
+            bool split_ok = pane_count(g_pane_root) == pc0 + 1;
+            Pane* a = g_active_pane;
+            RectI before = a ? a->rect : (RectI){0, 0, 0, 0};
+            Pane* other = pane_leaf_other(g_pane_root, a);
+            InputState kf;
+            memset(&kf, 0, sizeof kf);
+            kf.key_code = VK_SPACE; kf.ctrl_pressed = true;
+            handle_keys(&kf, &M);
+            compute_pane_tree_layout(g_pane_root, M.list);
+            bool max_ok = split_ok && a && pane_max_live() == a &&
+                a->rect.w == M.list.w && a->rect.h == M.list.h &&
+                other && other->rect.w == 0 && other->rect.h == 0 &&
+                pane_at_point(g_pane_root, M.list.x + 2, M.list.y + 40) == a &&
+                pane_at_point(g_pane_root, M.list.x + M.list.w - 2,
+                              M.list.y + 40) == a &&
+                pane_tree_splitter_at(g_pane_root,
+                    before.x + before.w, before.y + before.h / 2) == NULL;
+            handle_keys(&kf, &M);
+            compute_pane_tree_layout(g_pane_root, M.list);
+            bool rest_ok = a && !pane_max_live() &&
+                a->rect.x == before.x && a->rect.w == before.w &&
+                other && other->rect.w > 0;
+            // Alt+1..5 -> the view menu's modes, in order
+            bool keys_ok = true;
+            memset(&kf, 0, sizeof kf);
+            kf.alt_pressed = true;
+            for (int m = VIEW_MENU_MAX - 1; m >= 0; m--) {
+                kf.key_code = '1' + m;
+                handle_keys(&kf, &M);
+                if (g_app.view_mode != m) keys_ok = false;
+            }
+            // closing the maximized pane must leave a normal layout
+            handle_keys((memset(&kf, 0, sizeof kf), kf.key_code = VK_SPACE,
+                         kf.ctrl_pressed = true, &kf), &M);
+            pane_close_active();
+            bool close_ok = !g_pane_max && pane_count(g_pane_root) == pc0;
+            while (pane_count(g_pane_root) > pc0) pane_close_active();
+            compute_pane_tree_layout(g_pane_root, M.list);
+            printf("[selftest]   Ctrl+Space maximize/restore, Alt+1..5: %s\n",
+                   (max_ok && rest_ok && keys_ok && close_ok) ? "ok" : "FAILED");
+            if (!(max_ok && rest_ok && keys_ok && close_ok))
+                printf("[selftest] FAIL: pane maximize split=%d max=%d "
+                       "restore=%d keys=%d close=%d\n", split_ok, max_ok,
+                       rest_ok, keys_ok, close_ok);
+        }
+
         // (6) release OUTSIDE every pane -> no zone: clean cancel
         compute_layout(&M, w, h); g_content = M.list;
         compute_pane_tree_layout(g_pane_root, M.list);
@@ -33194,6 +33289,7 @@ static void run_bench_nav(void) {
 
 static void pane_free(Pane* p) {
     if (!p) return;
+    if (p == g_pane_max) g_pane_max = NULL;   // never leave it dangling
     pane_free(p->left);
     pane_free(p->right);
     // Each leaf OWNS its folder arrays now (g_app only borrows the ACTIVE
@@ -33306,6 +33402,23 @@ static int pane_count(Pane* p) {
     if (!p) return 0;
     if (p->kind == PN_LEAF) return 1;
     return pane_count(p->left) + pane_count(p->right);
+}
+
+// Is leaf x somewhere under node t?
+static bool pane_in_tree(const Pane* t, const Pane* x) {
+    if (!t || !x) return false;
+    if (t == x) return true;
+    if (t->kind == PN_LEAF) return false;
+    return pane_in_tree(t->left, x) || pane_in_tree(t->right, x);
+}
+
+// The maximized pane of the CURRENT workspace, or NULL.  The pointer may
+// belong to another tab's tree (each tab keeps its own maximize); it only
+// counts while it is a leaf of this tab's split tree.
+static Pane* pane_max_live(void) {
+    if (!g_pane_max || !g_pane_root || g_pane_root->kind == PN_LEAF)
+        return NULL;
+    return pane_in_tree(g_pane_root, g_pane_max) ? g_pane_max : NULL;
 }
 
 // axis 0 = vertical split (width matters), 1 = horizontal (height).
@@ -33495,6 +33608,7 @@ static bool pane_apply_drop(Pane* D, Pane* T, int zone) {
     if (!zone_valid(&T->rect, zone)) return false;   // too small
     Pane* built = build_zone_subtree(zone, D, T);
     if (!built) { set_status("Out of memory"); return false; }
+    g_pane_max = NULL;      // a new layout: every pane visible again
 
     // D is either a pane of THIS tree (a pane-header drag) or an EXTERNAL
     // subtree just carried in by a top-tab absorb - in the latter case it
@@ -33536,6 +33650,10 @@ static bool pane_apply_drop(Pane* D, Pane* T, int zone) {
 static void pane_split_right(void) {
     if (!g_pane_root || !g_active_pane || g_active_pane->kind != PN_LEAF)
         return;
+    if (pane_max_live()) {              // a new pane must be visible
+        g_pane_max = NULL;
+        compute_pane_tree_layout(g_pane_root, g_content);
+    }
     if (!zone_valid(&g_active_pane->rect, DZ_RIGHT)) {
         set_status("Pane too narrow to split");
         return;
@@ -33627,6 +33745,7 @@ static RectI pane_body_rect(const Pane* p) {
 static Pane* pane_title_close_at(Pane* p, int x, int y) {
     if (!p) return NULL;
     if (p->kind == PN_LEAF) {
+        if (p->rect.w <= 0 || p->rect.h <= 0) return NULL;   // hidden
         RectI r = pane_close_rect(pane_body_rect(p));
         return inside(&r, x, y) ? p : NULL;
     }
@@ -33665,6 +33784,9 @@ static void activate_pane(Pane* p) {
     search_restore();
     blur_fields();                       // typing focus does not travel
     pane_sync_active();                  // save the pane we are leaving
+    // A maximized tab shows the pane being activated (search popup,
+    // restore...) instead of driving a pane the user cannot see.
+    if (pane_max_live() && pane_in_tree(g_pane_root, p)) g_pane_max = p;
     g_active_pane = p;
     app_push_folder(&p->folder);         // load the pane we are entering
     // A pane whose listing was never loaded (session restore stores PATHS
@@ -33686,6 +33808,97 @@ static void activate_pane(Pane* p) {
 
 // Menu / Ctrl+W: close the active pane; its sibling subtree expands into
 // the freed space, so the layout still tiles. The last pane never closes.
+// Ctrl+Space (Blender's "toggle maximize area"): the active pane fills the
+// whole pane area, the others are hidden but kept exactly as they were.
+// Pressing it again - or clicking the header badge - brings them back.
+static void pane_max_toggle(void) {
+    if (pane_max_live()) {
+        g_pane_max = NULL;
+        set_status("Panes restored (%d)", pane_count(g_pane_root));
+    } else if (!g_pane_root || g_pane_root->kind == PN_LEAF ||
+               !g_active_pane || g_active_pane->kind != PN_LEAF) {
+        set_status("Only one pane - split first (Ctrl+E) to maximize one");
+        return;
+    } else {
+        g_pane_max = g_active_pane;
+        int n = pane_count(g_pane_root) - 1;
+        set_status("Maximized - %d pane%s hidden", n, n == 1 ? "" : "s");
+    }
+    compute_pane_tree_layout(g_pane_root, g_content);
+}
+
+// The maximize badge in the maximized pane's header, just left of its [x]:
+// [layout map] Maximized  N hidden  Ctrl+Space.  Drawing and the click
+// test both read this one rect.
+static void pane_max_badge_text(char* hid, size_t hn, char* key, size_t kn) {
+    snprintf(hid, hn, "%d hidden", pane_count(g_pane_root) - 1);
+    set_binding_of(&g_ents[CMD_PANE_MAX], key, kn);
+}
+static RectI pane_max_pill_rect(RectI tt) {
+    char hid[32], key[48];
+    pane_max_badge_text(hid, sizeof hid, key, sizeof key);
+    int px = SC(11);
+    int w = SC(8) + SC(20) + SC(7) + (int)measure_px("Maximized", px) +
+            SC(8) + (int)measure_px(hid, px) +
+            (key[0] ? (int)measure_px(key, px) + SC(14) : 0) + SC(10);
+    RectI xr = pane_close_rect(tt);
+    RectI r = {xr.x - SC(6) - w, tt.y + SC(3), w, PANE_TITLE_H - SC(6)};
+    if (r.x < tt.x + SC(30)) { r.x = tt.x + SC(30); r.w = xr.x - SC(6) - r.x; }
+    return r;
+}
+
+// Miniature of the split tree (stored ratios, ignoring the maximize) with
+// the shown pane filled in the accent colour: the user can see at a glance
+// how many panes are hidden and where they sit.
+static void pane_minimap(const Pane* p, RectI r, const Pane* mx) {
+    if (!p || r.w < 2 || r.h < 2) return;
+    if (p->kind == PN_LEAF) {
+        Color none = (Color){0, 0, 0, 0};
+        rrect(r.x, r.y, r.w, r.h, SC(1), p == mx ? P->accent : none,
+              p == mx ? P->accent : P->dim, 1.0f);
+        return;
+    }
+    RectI a = r, b = r;
+    if (p->kind == PN_SPLIT_V) {
+        a.w = (int)(r.w * p->ratio) - 1;
+        b.x = r.x + a.w + 2; b.w = r.w - a.w - 2;
+    } else {
+        a.h = (int)(r.h * p->ratio) - 1;
+        b.y = r.y + a.h + 2; b.h = r.h - a.h - 2;
+    }
+    pane_minimap(p->left, a, mx);
+    pane_minimap(p->right, b, mx);
+}
+
+static void draw_pane_max_badge(RectI tt, const InputState* in) {
+    RectI r = pane_max_pill_rect(tt);
+    if (r.w < SC(40)) return;
+    bool hov = inside(&r, in->x, in->y);
+    rrect(r.x, r.y, r.w, r.h, r.h / 2, hov ? P->btn_hover : P->selected,
+          P->accent, 1.0f);
+    Rect clip = {(float)r.x, (float)r.y, (float)r.w, (float)r.h};
+    renderer_set_scissor(g_app.renderer, clip);
+    char hid[32], key[48];
+    pane_max_badge_text(hid, sizeof hid, key, sizeof key);
+    int px = SC(11);
+    int x = r.x + SC(8);
+    int mh = r.h - SC(8);
+    pane_minimap(g_pane_root, (RectI){x, r.y + (r.h - mh) / 2, SC(20), mh},
+                 g_pane_max);
+    x += SC(20) + SC(7);
+    int ty = r.y + (r.h - px) / 2;
+    text_px("Maximized", x, ty, px, P->accent);
+    x += (int)measure_px("Maximized", px) + SC(8);
+    text_px(hid, x, ty, px, P->text);
+    x += (int)measure_px(hid, px) + SC(8);
+    if (key[0]) {                                  // the key as a keycap
+        int kw = (int)measure_px(key, px) + SC(12);
+        rrect(x, r.y + SC(3), kw, r.h - SC(6), SC(3), P->panel, P->border, 1.0f);
+        text_px(key, x + SC(6), ty, px, P->dim);
+    }
+    renderer_reset_scissor(g_app.renderer);
+}
+
 static void pane_close_active(void) {
     Pane* victim = g_active_pane;
     if (!victim || victim->kind != PN_LEAF) return;
@@ -33693,6 +33906,7 @@ static void pane_close_active(void) {
         set_status("Already a single pane");
         return;
     }
+    g_pane_max = NULL;                    // closing restores the tiling
     Pane** dl = find_link(&g_pane_root, victim);
     Pane* par = dl ? parent_of_link(g_pane_root, dl) : NULL;
     if (!par) return;
@@ -33800,6 +34014,18 @@ static void pane_input_build(Layout* out, const Layout* win) {
         pane_list_metrics(out, pane_body_rect(g_active_pane));
 }
 
+// A subtree hidden by a maximized pane: every node gets an EMPTY rect at
+// the edge it collapsed towards.  w = h = 0 keeps it out of drawing and
+// of every hit test (pane_at_point compares against the left child's far
+// edge, which then sits on the content edge).  Ratios are not touched.
+static void pane_collapse(Pane* p, int x, int y) {
+    if (!p) return;
+    p->region = p->rect = (RectI){x, y, 0, 0};
+    if (p->kind == PN_LEAF) return;
+    pane_collapse(p->left, x, y);
+    pane_collapse(p->right, x, y);
+}
+
 static void compute_pane_tree_layout(Pane* p, RectI content) {
     if (!p) return;
     p->region = content;
@@ -33807,6 +34033,21 @@ static void compute_pane_tree_layout(Pane* p, RectI content) {
                          // pane_at_point / splitter_at_point / draw_splitter
                          // all read child rects, nested trees included
     if (p->kind == PN_LEAF) return;
+    // Maximized (Ctrl+Space): the child holding that pane takes the whole
+    // region, the other child collapses to the far edge.
+    if (g_pane_max && pane_in_tree(p, g_pane_max)) {
+        bool in_left = pane_in_tree(p->left, g_pane_max);
+        Pane* show = in_left ? p->left : p->right;
+        Pane* hide = in_left ? p->right : p->left;
+        int hx = content.x, hy = content.y;
+        if (in_left) {
+            if (p->kind == PN_SPLIT_V) hx += content.w;
+            else                       hy += content.h;
+        }
+        compute_pane_tree_layout(show, content);
+        pane_collapse(hide, hx, hy);
+        return;
+    }
     int mid;
     if (p->kind == PN_SPLIT_V) {
         p->ratio = clamp_ratio(content, 0, p->ratio);
@@ -33915,7 +34156,9 @@ static void render_pane_view(Pane* p, const Layout* win) {
         // The pane header keeps its folder path (unchanged single-pane
         // design); it simply ends before the [x] now that the split-only
         // search pill is gone.  The address breadcrumb lives in row 2.
-        int path_w = pane_close_rect(tt).x - SC(6) - (tt.x + SC(25));
+        bool maxed = (p == pane_max_live());
+        int path_w = (maxed ? pane_max_pill_rect(tt).x
+                            : pane_close_rect(tt).x) - SC(6) - (tt.x + SC(25));
         if (path_w < SC(20)) path_w = SC(20);
         char nm[512];
         fit_text(g_app.current_path, nm, sizeof(nm), path_w, L.text_small);
@@ -33934,6 +34177,10 @@ static void render_pane_view(Pane* p, const Layout* win) {
         }
         line(cx, cy, cx + SC(9), cy + SC(9), xc, 1.8f);
         line(cx + SC(9), cy, cx, cy + SC(9), xc, 1.8f);
+        if (maxed) {          // Ctrl+Space: accent edge + "N hidden" badge
+            fill(tt.x, tt.y, tt.w, SC(2), P->accent);
+            draw_pane_max_badge(tt, in);
+        }
     }
     vline(L.list.x, L.list.y, L.list.y + L.list.h, P->border);
     // While the window is split, the active pane's header is tinted so it
@@ -34236,6 +34483,7 @@ static void render_pane_tree(Pane* p, RectI content, const Layout* win) {
     if (!p) return;
     compute_pane_tree_layout(p, content);
     if (p->kind == PN_LEAF) {
+        if (p->rect.w <= 0 || p->rect.h <= 0) return;   // hidden (maximize)
         render_pane_view(p, win);
     } else {
         render_pane_tree(p->left,  p->left->rect, win);
@@ -34246,6 +34494,7 @@ static void render_pane_tree(Pane* p, RectI content, const Layout* win) {
 // Draw all splitter bars in the tree.
 static void draw_splitters(Pane* p) {
     if (!p) return;
+    if (pane_max_live()) return;        // one pane shown: no dividers
     if (p->kind == PN_SPLIT_V) {
         draw_splitter(p);
         draw_splitters(p->left);
@@ -34284,6 +34533,7 @@ static Pane* splitter_at_point(Pane* p, int x, int y) {
 }
 
 static Pane* pane_tree_splitter_at(Pane* root, int x, int y) {
+    if (pane_max_live()) return NULL;   // dividers are hidden
     Pane* p = splitter_at_point(root, x, y);
     if (p) return p;
     if (!root || root->kind == PN_LEAF) return NULL;
@@ -34439,13 +34689,15 @@ static void app_run(bool selftest) {
         // and it can never re-walk a folder that did not change.
         sug_pump();
         if (!selftest) session_tick();  // debounced workspace snapshot
-        // Look for a new release again every 6 hours while NovaFile stays
-        // open (the start-up check covers a fresh launch).
+        // Look for a new release again every 30 minutes while NovaFile
+        // stays open (the start-up check covers a fresh launch), so a
+        // running app shows the "Update available" card soon after a
+        // release - no restart needed.  One small manifest GET per check.
         {
             static DWORD last_upd = 0;
             if (!last_upd) last_upd = GetTickCount();
             if (!selftest && !g_bench && g_update_auto && !update_ready() &&
-                GetTickCount() - last_upd > 6u * 3600u * 1000u) {
+                GetTickCount() - last_upd > 30u * 60u * 1000u) {
                 last_upd = GetTickCount();
                 update_kick_check(false);
             }

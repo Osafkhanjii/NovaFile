@@ -21,6 +21,7 @@ SOURCES = \
     $(SRC_DIR)/renderer/renderer_gl.c \
     $(SRC_DIR)/ui/ui_framework.c \
     $(SRC_DIR)/app/update.c \
+    $(SRC_DIR)/app/translate.c \
     $(SRC_DIR)/app/main.c
 
 OBJECTS = $(SOURCES:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
@@ -35,7 +36,7 @@ export PATH := C:\Program Files (x86)\Dev-Cpp\MinGW64\bin;$(PATH)
 RES_OBJECT = $(BUILD_DIR)/resource_res.o
 
 INCLUDES = -I$(INC_DIR) -Ilib
-CFLAGS = -std=gnu11 -Wall -O2 $(INCLUDES)
+CFLAGS = -std=gnu11 -Wall -Os $(INCLUDES)
 
 # ole32/oleaut32: thumbnail decoding (IPicture)
 # shell32: ShellExecuteA, shell folders, shell thumbnails
@@ -62,6 +63,10 @@ all: $(BUILD_DIR) $(EXECUTABLE)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
+
+# Size: UI code builds with -Os (see CFLAGS); the hot image decoders keep
+# -O2 (the later -O flag wins), same split as compile.bat.
+$(BUILD_DIR)/core/exr.o $(BUILD_DIR)/core/mov.o: CFLAGS += -O2
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	@mkdir -p $(dir $@)

@@ -90,6 +90,7 @@ extern int  WINAPI SHGetPathFromIDListA(const void* pidl, char* path);
 #include "exr.h"        // OpenEXR thumbnails (Windows has no .exr codec)
 #include "mov.h"        // ProRes .mov thumbnails (Windows has no ProRes codec)
 #include "video_thumb.h" // Media Foundation frame when the shell has none
+#include "translate.h"   // file names shown in English (or another language)
 #include "../platform/shell_ole.h"   // native menu + drag-out
 
 #include <stdarg.h>
@@ -170,7 +171,7 @@ static void legacy_line_fix(char* s, size_t cap) {
 #define NAV_BTN_COUNT     3    // back / forward / up (icons) - refresh is
                                // F5 / the right-click menu / hamburger
 #define TAB_MAX           20    // hard cap on open tabs, workspace-wide
-#define MENU_MAX          8
+#define MENU_MAX          9
 // Right-click menu: one flat row array big enough for the full Explorer
 // style menu (root rows + every submenu's children live in the same array).
 #define CTX_MAX          96
@@ -229,6 +230,10 @@ typedef struct {
     // (animating) value; this field is the stored value for every pane and
     // is what an inactive pane renders from (swapped into g_app.zoom).
     float zoom;
+    // Per-pane bottom bar counts (folders / files / hidden of THIS pane's
+    // folder).  The g_folder_count trio is the active pane's live copy;
+    // these travel with the view so every pane's bar shows its own folder.
+    unsigned folder_count, file_count, hidden_total;
     // NOTE: no tab/workspace state and no theme field here on purpose -
     // tabs are workspaces (owned by the global g_ws[] list) and the
     // theme is a single global setting (g_pal_idx).
@@ -619,6 +624,9 @@ typedef struct {
     RectI view_btn;            // view menu button in the bottom bar
     RectI count_lbl, hidden_btn;      // "N folders - N files" + Hidden toggle
     RectI zoom_lbl;                   // "150%" left of nothing / right side
+    int   view_name_w;                // left half of view_btn (shrinks in narrow panes)
+    RectI lang_btn;                   // name-language chip ("EN") in the bottom bar
+    RectI lang_menu, lang_items[16];  // its popup (TR_LANGS)
     RectI view_menu, view_items[VIEW_MENU_MAX];      // Details popup menu
     RectI zoom_pop, zoom_pop_up, zoom_pop_dn, zoom_pop_track;  // zoom slider
     // row 2: address field (left) and search box (right, Windows 11 style)
@@ -1444,6 +1452,23 @@ static bool g_opt_alt_gest = true;    // Alt + corner Back/Forward gesture
 static bool g_opt_pane_hover = true;  // the pane under the mouse is active
 static bool g_opt_wheel = true;       // Quick Access wheel on C
 static bool g_opt_restore = true;     // Restore Previous Session (startup)
+// Language file and folder NAMES are shown in (TR_LANGS index, translate.h).
+// Default English: a Chinese / Urdu / Russian... name is displayed in
+// English; TR_LANG_ORIGINAL shows every name exactly as it is on disk.
+// Display only - the real name is never changed and every operation
+// (open, rename, copy, search on disk) keeps using it.
+static int g_name_lang = TR_LANG_ENGLISH;
+// The bottom-bar popup (g_app.view_menu_open) shows either the view modes
+// or, when opened from the language chip, the name languages.
+static bool g_view_menu_lang = false;
+
+static void name_lang_set(int k) {
+    if (k < 0 || k >= TR_LANG_COUNT) return;
+    g_name_lang = k;
+    settings_save();
+    set_status(k == TR_LANG_ORIGINAL ? "Names: original"
+                                     : "Names shown in %s", TR_LANGS[k].name);
+}
 
 // "Restore Previous Session" engine (defined just before app_init);
 // declared here so the command registry's apply callback and the
@@ -2056,10 +2081,12 @@ static SetEnt g_ents[CMD_COUNT] = {
         .rebindable=false, .hidden=true } // button row
 };
 
-// Hamburger menu -> registry entry (labels are GENERATED from the
-// registry, so the menu can never advertise a stale shortcut).
+// Main menu (the gear button) -> registry entry (labels are GENERATED from
+// the registry, so the menu can never advertise a stale shortcut).  Menu
+// and Settings are ONE button: Settings is the menu's first item.
 enum { MENU_MAX_ITEMS = MENU_MAX };
 static const int MENU_CMD[MENU_MAX] = {
+    CMD_SET_OPEN,
     CMD_NEW_TAB, CMD_BOOKMARK, CMD_REFRESH, CMD_HIDDEN,
     CMD_HOME, CMD_SPLIT, CMD_CLOSE_PANE, CMD_QUIT,
 };
@@ -2357,6 +2384,10 @@ static void settings_save(void) {
     // way - the command table only stores booleans.  Older builds skip
     // the unknown id; a missing line keeps the Midnight default.
     fprintf(f, "palette\t%d\t0\t1\n", g_pal_idx);
+    // Name language (bottom bar language chip): own line, like palette.
+    fprintf(f, "name_lang\t%s\t0\t1\n",
+            g_name_lang == TR_LANG_ORIGINAL ? "orig"
+                                            : TR_LANGS[g_name_lang].code);
     // Sidebar bookmarks, one line each - same "own prefix" trick as
     // ui_scale: the generic id/key/mods/val loop above never sees them,
     // and older builds just skip the unknown "bm" line.
@@ -2397,6 +2428,18 @@ static void settings_load(void) {
             if (end2 && (*end2 == '\0' || *end2 == '\t') &&
                 pi >= 0 && pi < PAL_COUNT_N)
                 g_pal_idx = (int)pi;
+            continue;
+        }
+        // Name language: "name_lang<TAB>code".  An unknown code keeps the
+        // default (English); "orig" = original names.
+        if (strncmp(line, "name_lang\t", 10) == 0) {
+            char code[16];
+            snprintf(code, sizeof code, "%s", line + 10);
+            char* t = strchr(code, '\t');
+            if (t) *t = '\0';
+            if (strcmp(code, "orig") == 0) g_name_lang = TR_LANG_ORIGINAL;
+            for (int k = 1; k < TR_LANG_COUNT; k++)
+                if (strcmp(TR_LANGS[k].code, code) == 0) g_name_lang = k;
             continue;
         }
         // Interface Scaling: its own line, parsed here so the entry
@@ -2596,7 +2639,8 @@ static bool     g_rec_ok = false;   // g_rec_status holds a success (not an erro
 static char     g_rec_status[168];  // validation / save result message
 static RectI    s_rec_btn[4];       // Record / Save / Clear / Cancel (rects from draw)
 static char g_set_msg[128];         // conflict / status line
-static int  g_set_rows[CMD_COUNT];  // rows for the active view/filter
+static int  g_set_rows[CMD_COUNT + 8];  // rows for the active filter
+                                    // (>= 0: g_ents id, < 0: SROW_* row)
 static int  g_set_row_n = 0;
 static int  s_set_vis = 7;          // rows the panel can show (set by draw)
 // ---- "Interface Scaling" card state (drawn inside the panel) ----
@@ -2626,13 +2670,51 @@ static bool  g_set_sb_drag = false; // dragging the scrollbar thumb
 static int   g_set_sb_grab = 0;     // grab offset inside the thumb (px)
 static int   g_set_cat_scroll = 0;  // sidebar overflow offset (px)
 static unsigned g_set_reset_arm = 0;  // frame deadline while reset-all is armed
+// The language row's dropdown (the list of TR_LANGS) and its keyboard pick.
+static bool  g_set_dd_open = false;
+static int   g_set_dd_sel = 0;
+static RectI s_set_dd_panel, s_set_dd_item[16];
+
+// ---- rows that are not registry entries --------------------------------
+// The panel is ONE flat list (search on top, one row per setting, its
+// control on the right).  Three settings carry a value instead of an
+// on/off switch or a shortcut, so they get their own row kinds.
+enum { SROW_THEME = -1, SROW_SCALE = -2, SROW_LANG = -3 };
+static const struct {
+    int id;
+    const char* name;
+    const char* desc;
+    const char* keys;          // extra search words
+} SROWS[] = {
+    {SROW_THEME, "Color Scheme",
+     "Applies a color palette to the whole interface.",
+     "theme midnight dark light palette appearance"},
+    {SROW_SCALE, "Interface Size",
+     "Scales text, icons and buttons. Shortcut: Alt + mouse wheel, or hold V and press + / -.",
+     "ui scale scaling zoom font size appearance"},
+    {SROW_LANG, "File Name Language",
+     "Shows file and folder names in this language (translated online, then cached). "
+     "Original Names keeps them exactly as on disk.",
+     "translate translation english urdu chinese names"},
+};
+#define SROW_N ((int)(sizeof(SROWS) / sizeof(SROWS[0])))
+static int srow_index(int id) {
+    for (int k = 0; k < SROW_N; k++) if (SROWS[k].id == id) return k;
+    return 0;
+}
 
 // Which entries the panel lists: a category, the collected shortcut
 // view, or - once a filter is typed - every match across ALL categories.
 static void set_build_rows(void) {
     g_set_row_n = 0;
     const char* q = g_set_filter;
-    for (int i = 0; i < CMD_COUNT && g_set_row_n < CMD_COUNT; i++) {
+    for (int k = 0; k < SROW_N; k++) {
+        if (q[0] && !set_has_ci(SROWS[k].name, q) &&
+            !set_has_ci(SROWS[k].desc, q) && !set_has_ci(SROWS[k].keys, q))
+            continue;
+        g_set_rows[g_set_row_n++] = SROWS[k].id;
+    }
+    for (int i = 0; i < CMD_COUNT && g_set_row_n < CMD_COUNT + 8; i++) {
         const SetEnt* e = &g_ents[i];
         if (e->hidden) continue;     // kept for persistence, never listed
         if (q[0]) {
@@ -2644,11 +2726,7 @@ static void set_build_rows(void) {
                 g_set_rows[g_set_row_n++] = i;
             continue;
         }
-        if (g_set_cat == SCAT_SHORTCUTS) {
-            if (e->kind == EK_ACTION) g_set_rows[g_set_row_n++] = i;
-            continue;
-        }
-        if (e->cat == g_set_cat) g_set_rows[g_set_row_n++] = i;
+        g_set_rows[g_set_row_n++] = i;          // one flat list
     }
     if (g_set_focus >= g_set_row_n)
         g_set_focus = g_set_row_n ? g_set_row_n - 1 : 0;
@@ -2699,6 +2777,10 @@ static void rec_reset(void) {
 static void set_start_capture(void) {
     if (g_set_row_n <= 0) return;
     int id = g_set_rows[g_set_focus];
+    if (id < 0) {
+        snprintf(g_set_msg, sizeof(g_set_msg), "This setting has no shortcut.");
+        return;
+    }
     if (!g_ents[id].rebindable) {
         snprintf(g_set_msg, sizeof(g_set_msg), "That shortcut is fixed.");
         return;
@@ -2804,9 +2886,25 @@ static bool cmd_run(int id) {
     return false;
 }
 
+// Enter / click on one of the value rows.
+static void srow_activate(int id) {
+    if (id == SROW_THEME) {
+        theme_select((g_pal_idx + 1) % PAL_COUNT_N);
+    } else if (id == SROW_SCALE) {           // 75 -> 100 -> 125 -> 150 -> 75
+        int next = g_ui_scale >= UI_SCALE_MAX ? UI_SCALE_MIN
+                                              : (g_ui_scale / 25 + 1) * 25;
+        ui_scale_set(next);
+        settings_save();
+    } else if (id == SROW_LANG) {
+        g_set_dd_open = !g_set_dd_open;
+        g_set_dd_sel = g_name_lang;
+    }
+}
+
 static void set_activate(void) {
     if (g_set_row_n <= 0) return;
     int id = g_set_rows[g_set_focus];
+    if (id < 0) { srow_activate(id); return; }
     if (g_ents[id].has_sw) set_toggle(id);
     else if (g_ents[id].kind == EK_ACTION && !g_ents[id].rebindable &&
              g_ents[id].key == 0)
@@ -2895,6 +2993,20 @@ static void settings_keys(InputState* in) {
         }
         return;                                   // all other repeats
     }
+    if (g_set_dd_open) {                     // the language dropdown
+        if (k == VK_ESCAPE) { g_set_dd_open = false; return; }
+        if (k == VK_UP && g_set_dd_sel > 0) { g_set_dd_sel--; return; }
+        if (k == VK_DOWN && g_set_dd_sel < TR_LANG_COUNT - 1) {
+            g_set_dd_sel++;
+            return;
+        }
+        if (k == VK_RETURN) {
+            name_lang_set(g_set_dd_sel);
+            g_set_dd_open = false;
+            return;
+        }
+        if (k) return;                       // nothing leaks while it is open
+    }
     if (k == VK_ESCAPE) { g_set_open = false; return; }
     if (k == VK_UP)    { set_focus_move(-1); return; }
     if (k == VK_DOWN)  { set_focus_move(1); return; }
@@ -2906,10 +3018,15 @@ static void settings_keys(InputState* in) {
     //      routes every typed character here, so it owns the editing
     //      keys). Del with a live selection deletes the selection; a
     //      bare Del still rebinds the focused shortcut, as before.
-    if (k == VK_TAB) {                       // next category, fresh filter
-        g_set_cat = (g_set_cat + 1) % SCAT_COUNT;
-        set_filter_clear();
-        set_build_rows();
+    if (k == VK_TAB && g_set_row_n > 0) {    // jump to the next group
+        int cur = g_set_rows[g_set_focus];
+        int cat = cur < 0 ? -1 : g_ents[cur].cat;
+        int i = g_set_focus + 1;
+        while (i < g_set_row_n && g_set_rows[i] >= 0 &&
+               g_ents[g_set_rows[i]].cat == cat)
+            i++;
+        while (i < g_set_row_n && g_set_rows[i] < 0) i++;
+        set_focus_move((i < g_set_row_n ? i : 0) - g_set_focus);
         return;
     }
     if (in->ctrl_pressed && !in->alt_pressed) {
@@ -3005,18 +3122,8 @@ static void settings_open(void) {
     g_set_cat_scroll = 0;              // fresh panel: sidebar at the top too
     g_set_sb_drag = false;
     g_set_reset_arm = 0;
+    g_set_dd_open = false;
     set_build_rows();
-}
-
-// Menu label, GENERATED from the registry (name padded to the old
-// column + the live binding, so rebinding updates the menu too).
-static void menu_label(int i, char* buf, size_t n) {
-    if (i < 0 || i >= MENU_MAX) { buf[0] = '\0'; return; }
-    const SetEnt* e = &g_ents[MENU_CMD[i]];
-    char b[40];
-    set_binding_of(e, b, sizeof b);
-    if (b[0]) snprintf(buf, n, "%-19s%s", e->name, b);
-    else snprintf(buf, n, "%s", e->name);
 }
 
 // CtxShellLink, declared by hand: shlobj.h's VIEW_GRID macro collides with
@@ -8272,6 +8379,115 @@ static void compute_pane_tree_layout(Pane* p, RectI content);  // below (panes)
 static FolderView folder_view_from_app(void);     // below (pane swap model)
 static void app_push_folder(const FolderView* fv);
 static int pane_count(Pane* p);
+static RectI pane_body_rect(const Pane* p);       // below (panes)
+
+// ---- per-pane bottom bar ------------------------------------------------
+// Every pane owns a bar along the bottom of its body: counts, the Hidden
+// toggle and the [view > | zoom%] control, all for THAT pane.  The bar is
+// laid out right to left and is responsive: as the pane narrows, the count
+// text shrinks then disappears, the Hidden toggle goes next, and the view
+// name gives up width before the zoom % does - nothing ever overlaps or
+// spills past the pane's edge.
+static RectI pane_status_rect(const Pane* p) {
+    RectI b = pane_body_rect(p);
+    int sh = SC(STATUS_H);
+    if (sh > b.h) sh = b.h;
+    return (RectI){b.x, b.y + b.h - sh, b.w, sh};
+}
+
+static void status_metrics(Layout* L, RectI bar) {
+    L->status = bar;
+    L->status_h = bar.h;
+    int pad = SC(8), gap = SC(6), bh = SC(24);
+    if (bh > bar.h - SC(4)) bh = bar.h - SC(4);
+    if (bh < 0) bh = 0;
+    int by = bar.y + (bar.h - bh) / 2;
+    int left = bar.x + pad;
+    int x = bar.x + bar.w - pad;
+    int avail = x - left;
+
+    // [view name > | zoom%] hugs the right corner; the name half shrinks
+    // first in a narrow pane (the % half always stays readable).
+    int zw = SC(50);
+    int nw = SC(96);
+    if (avail < nw + zw) nw = avail - zw;
+    if (nw < SC(30)) nw = 0;                     // zoom % only
+    if (zw > avail) zw = avail > 0 ? avail : 0;
+    x -= nw + zw;
+    L->view_btn = (RectI){x, by, nw + zw, bh};
+    L->zoom_lbl = (RectI){x + nw, by, zw, bh};
+    L->view_name_w = nw;
+
+    // Hidden toggle: only while there is comfortable room for it.
+    if (x - gap - SC(56) >= left) {
+        x -= gap + SC(56);
+        L->hidden_btn = (RectI){x, by, SC(56), bh};
+    } else {
+        L->hidden_btn = (RectI){x, by, 0, 0};
+    }
+
+    // Name-language chip ("EN" / "Orig"): left of Hidden, when it fits.
+    if (L->hidden_btn.w > 0 && x - gap - SC(44) >= left) {
+        x -= gap + SC(44);
+        L->lang_btn = (RectI){x, by, SC(44), bh};
+    } else {
+        L->lang_btn = (RectI){x, by, 0, 0};
+    }
+
+    // Counts: whatever is left (up to 260px), gone below 48px.
+    int cw = x - gap - left;
+    if (cw > SC(260)) cw = SC(260);
+    if (cw < SC(40)) cw = 0;
+    L->count_lbl = (RectI){x - gap - cw, by, cw, bh};
+}
+
+// The view menu and the zoom slider float just above the ACTIVE pane's bar
+// (L->status / L->view_btn / L->zoom_lbl from status_metrics).
+static void bar_popups_metrics(Layout* L) {
+    int ih = SC(26), vw = SC(150), vpad = SC(6);
+    int vh = VIEW_MENU_MAX * ih + vpad * 2;
+    L->view_menu = (RectI){L->view_btn.x, L->status.y - vh - SC(4), vw, vh};
+    if (L->view_menu.x + L->view_menu.w > L->status.x + L->status.w - SC(6))
+        L->view_menu.x = L->status.x + L->status.w - SC(6) - L->view_menu.w;
+    if (L->view_menu.x < SC(4)) L->view_menu.x = SC(4);
+    for (int i = 0; i < VIEW_MENU_MAX; i++)
+        L->view_items[i] = (RectI){L->view_menu.x + SC(3),
+                                   L->view_menu.y + vpad + i * ih,
+                                   L->view_menu.w - SC(6), ih};
+
+    // name-language popup: one row per TR_LANGS entry, above the chip
+    {
+        int n = TR_LANG_COUNT < 16 ? TR_LANG_COUNT : 16;
+        int lw = SC(170), lh = n * ih + vpad * 2;
+        int lx = L->lang_btn.x;
+        int ly = L->status.y - lh - SC(4);
+        if (lx + lw > L->status.x + L->status.w - SC(6))
+            lx = L->status.x + L->status.w - SC(6) - lw;
+        if (lx < SC(4)) lx = SC(4);
+        if (ly < SC(4)) ly = SC(4);
+        L->lang_menu = (RectI){lx, ly, lw, lh};
+        for (int i = 0; i < 16; i++)
+            L->lang_items[i] = (i < n) ? (RectI){lx + SC(3),
+                                                 ly + vpad + i * ih,
+                                                 lw - SC(6), ih}
+                                       : (RectI){0, 0, 0, 0};
+    }
+
+    // vertical zoom slider popup: + / track / - above the zoom label
+    int zcap = SC(20), ztrk = SC(96), pw2 = SC(34);
+    int ph = zcap * 2 + ztrk + SC(16);
+    int px = L->zoom_lbl.x + L->zoom_lbl.w / 2 - pw2 / 2;
+    if (px < SC(4)) px = SC(4);
+    L->zoom_pop = (RectI){px, L->status.y - ph - SC(4), pw2, ph};
+    L->zoom_pop_up = (RectI){px + SC(4), L->zoom_pop.y + SC(5),
+                             pw2 - SC(8), zcap};
+    L->zoom_pop_track = (RectI){px + SC(4),
+                                L->zoom_pop_up.y + zcap + SC(3),
+                                pw2 - SC(8), ztrk};
+    L->zoom_pop_dn = (RectI){px + SC(4),
+                             L->zoom_pop_track.y + ztrk + SC(3),
+                             pw2 - SC(8), zcap};
+}
 
 // Last computed layout, for the custom-title-bar hit callback
 // (platform_set_drag_hit): WM_NCHITTEST runs outside the frame loop, so
@@ -8473,13 +8689,13 @@ static void compute_layout(Layout* L, int w, int h) {
     L->icon_s = SC(16);
 
     L->toolbar = (RectI){0, 0, w, L->toolbar_h};
-    // The sidebar runs the FULL height down to the window's bottom edge;
-    // the status bar sits only under the file area, right of the sidebar.
-    L->status = (RectI){L->sidebar_w, h - L->status_h, w - L->sidebar_w,
-                        L->status_h};
+    // The sidebar runs the FULL height down to the window's bottom edge.
+    // The file area does too: each pane reserves its own bottom bar inside
+    // its rect (pane_status_rect), so there is no window-wide status strip.
     L->sidebar = (RectI){0, L->toolbar_h, L->sidebar_w, h - L->toolbar_h};
     L->list = (RectI){L->sidebar_w, L->toolbar_h, w - L->sidebar_w,
-                      h - L->toolbar_h - L->status_h};
+                      h - L->toolbar_h};
+    L->status = (RectI){L->list.x, h - L->status_h, L->list.w, L->status_h};
 
     // ---- row 1: hamburger | tabs | '+' | ... | min max close ----
     // Windows 11 Explorer style: the window controls live IN the tab row,
@@ -8488,7 +8704,9 @@ static void compute_layout(Layout* L, int w, int h) {
     int bh = SC(26);
     int y1 = SC(4);
     L->menu_btn = (RectI){SC(8), y1, bh, bh};
-    L->set_btn  = (RectI){L->menu_btn.x + bh + SC(6), y1, bh, bh};
+    // Menu and Settings are one button now (Settings = its first item);
+    // set_btn stays in the layout as an EMPTY rect so nothing can hit it.
+    L->set_btn  = (RectI){L->menu_btn.x, y1, 0, 0};
     // The caption buttons own the very top edge (y = 0), including the
     // top-right CORNER: a click thrown into the corner must close the
     // window, never start a resize/drag (selftest: corner hits). Uniform
@@ -8498,7 +8716,7 @@ static void compute_layout(Layout* L, int w, int h) {
     L->cap_max   = (RectI){L->cap_close.x - SC(44), 0, SC(44), cap_h};
     L->cap_min   = (RectI){L->cap_max.x - SC(44), 0, SC(44), cap_h};
 
-    L->side_btn = (RectI){L->set_btn.x + bh + SC(6), y1, bh, bh};
+    L->side_btn = (RectI){L->menu_btn.x + bh + SC(6), y1, bh, bh};
     int tabs_x = L->side_btn.x + bh + SC(6);  // menu | gear | sidebar | tabs
     int tabs_end = L->cap_min.x - SC(8);
     int area = tabs_end - tabs_x - (bh + SC(6));      // room for the '+'
@@ -8624,55 +8842,17 @@ static void compute_layout(Layout* L, int w, int h) {
         }
     }
 
-    // ---- bottom bar: (empty left) | (empty middle) |
-    //      [counts] [Hidden] [view name + zoom% as ONE control] ----
-    {
-        int pad = SC(10), gap = SC(6), bh = SC(24);
-        int by = L->status.y + (L->status_h - bh) / 2;
-        int x = L->status.x + L->status.w - pad;
-
-        // Round 12: the view menu and the zoom % are ONE control hugging
-        // the right corner, right of the Hidden toggle: [Icons > | 55%]
-        x -= SC(96) + SC(50);
-        L->view_btn = (RectI){x, by, SC(96) + SC(50), bh};
-        L->zoom_lbl = (RectI){x + SC(96), by, SC(50), bh};  // right half
-
-        x -= gap + SC(56);
-        L->hidden_btn = (RectI){x, by, SC(56), bh};
-
-        x -= gap + SC(210);
-        L->count_lbl = (RectI){x, by, SC(210), bh};
-
-        // (the filter box moved to the toolbar: row 2, right of the
-        //  address field - see the "row 2" block above)
-
-        // ---- Details popup menu: floats above the status bar ----
-        int ih = SC(26), vw = SC(150), vpad = SC(6);
-        int vh = VIEW_MENU_MAX * ih + vpad * 2;
-        L->view_menu = (RectI){L->view_btn.x, L->status.y - vh - SC(4), vw, vh};
-        if (L->view_menu.x + L->view_menu.w > L->status.x + L->status.w - SC(6))
-            L->view_menu.x = L->status.x + L->status.w - SC(6) - L->view_menu.w;
-        if (L->view_menu.x < SC(4)) L->view_menu.x = SC(4);
-        for (int i = 0; i < VIEW_MENU_MAX; i++)
-            L->view_items[i] = (RectI){L->view_menu.x + SC(3),
-                                       L->view_menu.y + vpad + i * ih,
-                                       L->view_menu.w - SC(6), ih};
-
-        // ---- vertical zoom slider popup: + / track / - above the zoom label
-        int zcap = SC(20), ztrk = SC(96), pw2 = SC(34);
-        int ph = zcap * 2 + ztrk + SC(16);
-        int px = L->zoom_lbl.x + L->zoom_lbl.w / 2 - pw2 / 2;
-        if (px < SC(4)) px = SC(4);
-        L->zoom_pop = (RectI){px, L->status.y - ph - SC(4), pw2, ph};
-        L->zoom_pop_up = (RectI){px + SC(4), L->zoom_pop.y + SC(5),
-                                 pw2 - SC(8), zcap};
-        L->zoom_pop_track = (RectI){px + SC(4),
-                                    L->zoom_pop_up.y + zcap + SC(3),
-                                    pw2 - SC(8), ztrk};
-        L->zoom_pop_dn = (RectI){px + SC(4),
-                                 L->zoom_pop_track.y + ztrk + SC(3),
-                                 pw2 - SC(8), zcap};
-    }
+    // ---- bottom bar: every pane carries its OWN bar along its bottom
+    //      edge (see status_metrics / pane_status_rect).  The window
+    //      layout describes the ACTIVE pane's bar, so every existing
+    //      click, hover and popup path keeps working unchanged. ----
+    compute_pane_tree_layout(g_pane_root, L->list);
+    status_metrics(L, (g_active_pane && g_active_pane->kind == PN_LEAF &&
+                       g_active_pane->rect.w > 0)
+                          ? pane_status_rect(g_active_pane)
+                          : (RectI){L->list.x, L->list.y + L->list.h -
+                                    L->status_h, L->list.w, L->status_h});
+    bar_popups_metrics(L);
 
     // ---- sidebar rows: the panel sits below the toolbar and scrolls ----
     // Rows are laid out in full content coordinates (no clipping here):
@@ -10894,30 +11074,34 @@ static Pane* nav_pane_at(Pane* p, int x) {
 
 static void draw_toolbar(const Layout* L, const InputState* in) {
     // ---------------- row 1: menu | tabs | window controls ----------------
+    // ONE button for the menu and Settings, with a real cog: eight square
+    // teeth around a solid body and a round hole in the middle (the
+    // familiar Settings symbol), drawn with the app's own primitives.
     bool hov = inside(&L->menu_btn, in->x, in->y);
+    bool on = g_app.menu_open || g_set_open;
+    Color bgc = (hov || on) ? P->btn_hover : P->btn;
     rrect(L->menu_btn.x, L->menu_btn.y, L->menu_btn.w, L->menu_btn.h,
-          L->radius, (hov || g_app.menu_open) ? P->btn_hover : P->btn,
-          P->border, 1.0f);
-    for (int k = 0; k < 3; k++)                    // hamburger glyph
-        hline(L->menu_btn.x + SC(7), L->menu_btn.x + L->menu_btn.w - SC(7),
-              L->menu_btn.y + SC(7) + k * SC(5), P->text);
-
-    // Settings gear (opens the panel): ring + four teeth, drawn with the
-    // same primitives as every other glyph - no font or image asset.
+          L->radius, bgc, on ? P->accent : P->border, 1.0f);
     {
-        bool shov = inside(&L->set_btn, in->x, in->y);
-        rrect(L->set_btn.x, L->set_btn.y, L->set_btn.w, L->set_btn.h,
-              L->radius, (shov || g_set_open) ? P->btn_hover : P->btn,
-              g_set_open ? P->accent : P->border, 1.0f);
-        Color none = (Color){0, 0, 0, 0};
-        int cx = L->set_btn.x + L->set_btn.w / 2;
-        int cy = L->set_btn.y + L->set_btn.h / 2;
-        int r = SC(6);
-        rrect(cx - r, cy - r, r * 2, r * 2, r, none, P->text, 1.4f);
-        fill(cx - 1, cy - r - SC(3), 2, SC(3), P->text);   // teeth N, S, E, W
-        fill(cx - 1, cy + r + 1, 2, SC(3), P->text);
-        fill(cx - r - SC(3), cy - 1, SC(3), 2, P->text);
-        fill(cx + r + 1, cy - 1, SC(3), 2, P->text);
+        float cx = L->menu_btn.x + L->menu_btn.w / 2.0f;
+        float cy = L->menu_btn.y + L->menu_btn.h / 2.0f;
+        float ro = SC(8) - 0.5f;               // tooth tips
+        float rb = SC(6);                      // body
+        float rh = SC(2) + 0.5f;               // hole
+        Color gc = on ? P->accent : P->text;
+        for (int k = 0; k < 8; k++) {          // teeth
+            double a = k * 3.14159265358979 / 4.0;
+            float dx = (float)cos(a), dy = (float)sin(a);
+            line((int)(cx + dx * (rb - 1) + 0.5f), (int)(cy + dy * (rb - 1) + 0.5f),
+                 (int)(cx + dx * ro + 0.5f), (int)(cy + dy * ro + 0.5f), gc,
+                 (float)SC(3));
+        }
+        int ib = (int)(rb + 0.5f);
+        rrect((int)(cx - ib + 0.5f), (int)(cy - ib + 0.5f), ib * 2, ib * 2, ib,
+              gc, gc, 1.0f);                   // body
+        int ih = (int)(rh + 0.5f);
+        rrect((int)(cx - ih + 0.5f), (int)(cy - ih + 0.5f), ih * 2, ih * 2, ih,
+              bgc, bgc, 1.0f);                 // hole
     }
     // Sidebar toggle: a window outline with its left column - filled while
     // the sidebar is shown, hollow while it is hidden.
@@ -11178,6 +11362,30 @@ static void draw_item_star(const Layout* L, int vi, DirEntry* e, bool hov) {
 // rename state); NULL = the name draws plain.
 static const char* tts_row_query(int vi);
 
+// The name a row SHOWS: the real name, or - when a name language is set
+// and the name is in another language - its translation.  A file keeps
+// its real extension (a Chinese "report.txt" -> "Report.txt"); only the part before it
+// is translated.  Until the translation has arrived the real name shows.
+static const char* entry_label(const DirEntry* e, char* buf, size_t cap) {
+    const char* nm = e->name;
+    if (g_name_lang == TR_LANG_ORIGINAL || !nm || !nm[0]) return nm;
+    const char* dot = e->is_directory ? NULL : strrchr(nm, '.');
+    if (dot == nm) dot = NULL;                 // ".gitignore": no stem
+    if (!dot) {
+        const char* t = tr_get(nm, g_name_lang);
+        return t ? t : nm;
+    }
+    size_t sl = (size_t)(dot - nm);
+    char stem[512];
+    if (sl >= sizeof stem) return nm;
+    memcpy(stem, nm, sl);
+    stem[sl] = '\0';
+    const char* t = tr_get(stem, g_name_lang);
+    if (!t) return nm;
+    snprintf(buf, cap, "%s%s", t, dot);
+    return buf;
+}
+
 static void draw_details(const Layout* L, const InputState* in) {
     // <= rows_visible: the LAST row may be only half visible at big zoom
     // sizes - draw it too, the body scissor cuts it at the edge.
@@ -11207,9 +11415,9 @@ static void draw_details(const Layout* L, const InputState* in) {
             fill(L->list.x + SC(8), ry + (L->row_h - isz) / 2, isz, isz,
                  (Color){0, 0, 0, 0.45f});
 
-        char name[512];
-        fit_text(e->name, name, sizeof(name), L->name_w - (isz + SC(18)),
-                 L->text_h);
+        char name[512], lbl[600];
+        fit_text(entry_label(e, lbl, sizeof lbl), name, sizeof(name),
+                 L->name_w - (isz + SC(18)), L->text_h);
         // Match boxes take priority in the order the user produces them:
         // the search query when the search box drives the list, else the
         // live type-to-select prefix - the growing "W", "Wo", "Wor"...
@@ -11320,8 +11528,8 @@ static void draw_tree(const Layout* L, const InputState* in) {
             fill(ix, ry + (L->row_h - isz) / 2, isz, isz,
                  (Color){0, 0, 0, 0.45f});
 
-        char name[512];
-        fit_text(e->name, name, sizeof(name),
+        char name[512], lbl[600];
+        fit_text(entry_label(e, lbl, sizeof lbl), name, sizeof(name),
                  L->list.w - (ind + isz + SC(40)), L->text_h);
         const char* hlq = search_hl_active() ? g_app.search_buf
                                              : tts_row_query((int)vi);
@@ -11367,8 +11575,9 @@ static void draw_grid(const Layout* L, const InputState* in) {
                 fill(tx, cy + SC(2), tw, L->thumb, (Color){0, 0, 0, 0.45f});
 
             // name + size under the preview (File Pilot style)
-            char nm[96], nms[96], sz[32];
-            fit_text(e->name, nm, sizeof(nm), L->cell_w - SC(10), L->text_med);
+            char nm[96], nms[96], sz[32], lbl[600];
+            fit_text(entry_label(e, lbl, sizeof lbl), nm, sizeof(nm),
+                     L->cell_w - SC(10), L->text_med);
             snprintf(nms, sizeof(nms), "%s", nm);
             if (e->is_directory) snprintf(sz, sizeof(sz), "");
             else format_size(e->size, sz, sizeof(sz));
@@ -11412,10 +11621,18 @@ static void draw_menu(const Layout* L, const InputState* in) {
         if (inside(r, in->x, in->y))
             rrect(r->x, r->y, r->w, r->h, L->radius, P->btn_hover, COLOR_BLACK,
                   0.0f);
-        char lab[64];
-        menu_label(i, lab, sizeof lab);       // registry-generated label
-        text_px(lab, r->x + SC(8), r->y + (r->h - L->text_med) / 2,
+        // name left, live binding right-aligned (registry-generated)
+        const SetEnt* me = &g_ents[MENU_CMD[i]];
+        char kb2[40];
+        set_binding_of(me, kb2, sizeof kb2);
+        int ty = r->y + (r->h - L->text_med) / 2;
+        text_px(i == 0 ? "Settings" : me->name, r->x + SC(8), ty,
                 L->text_med, P->text);
+        if (kb2[0])
+            text_right_px(kb2, r->x + r->w - SC(8), ty, L->text_med, P->dim);
+        if (i == 0)                           // Settings | everything else
+            hline(r->x + SC(4), r->x + r->w - SC(4), r->y + r->h,
+                  P->border);
     }
 }
 
@@ -12005,9 +12222,14 @@ static int y_for_zoom(const Layout* L, float z) {
 
 // Bottom bar: [filter ...]    (middle stays empty)    [counts][Hidden]
 //              [Details v | 150%]   <- ONE control, at the right corner
-static void draw_status(const Layout* L, const InputState* in) {
+static void draw_status(const Layout* L, const InputState* in, bool active) {
     fill(L->status.x, L->status.y, L->status.w, L->status_h, P->toolbar);
     hline(L->status.x, L->status.x + L->status.w, L->status.y, P->border);
+    // Only the active pane's bar reacts to hover (and shows the transient
+    // message); a dimmed pane's bar is a quiet summary of that pane.
+    InputState none = *in;
+    if (!active) none.x = none.y = -100000;
+    in = &none;
 
     int y = L->status.y + (L->status_h - L->text_h) / 2;
 
@@ -12016,7 +12238,9 @@ static void draw_status(const Layout* L, const InputState* in) {
     //      the toolbar); a transient message borrows the count slot
     //      for ~4 seconds and then the counts come back. ----
     char cnt[192];
-    if (g_app.status_msg[0] && tick_before(g_status_until)) {
+    if (L->count_lbl.w <= 0) {
+        // narrow pane: no room for the counts
+    } else if (active && g_app.status_msg[0] && tick_before(g_status_until)) {
         fit_text(g_app.status_msg, cnt, sizeof(cnt), L->count_lbl.w - SC(6),
                  L->text_small);
         text_right_px(cnt, L->count_lbl.x + L->count_lbl.w, y, L->text_small,
@@ -12025,9 +12249,21 @@ static void draw_status(const Layout* L, const InputState* in) {
         if (g_app.search_buf[0])
             snprintf(cnt, sizeof(cnt), "%u of %u files",
                      (unsigned)g_app.view_count, (unsigned)g_app.count);
-        else
-            snprintf(cnt, sizeof(cnt), "%u folders - %u files",
-                     g_folder_count, g_file_count);
+        else {
+            unsigned nfo = g_folder_count, nfi = g_file_count;
+            if (!active && nfo + nfi == 0 && g_app.entries && g_app.count) {
+                // a pane restored from the session that was never active
+                // has no stored totals yet: count its visible entries
+                for (size_t k = 0; k < g_app.count; k++) {
+                    if (g_app.entries[k].is_directory) nfo++;
+                    else nfi++;
+                }
+            }
+            snprintf(cnt, sizeof(cnt), "%u folders - %u files", nfo, nfi);
+            // narrow pane: the compact form instead of an ellipsis
+            if ((int)measure_px(cnt, L->text_small) > L->count_lbl.w - SC(6))
+                snprintf(cnt, sizeof(cnt), "%u items", nfo + nfi);
+        }
         if (g_hidden_total > 0) {
             size_t used = strlen(cnt);
             snprintf(cnt + used, sizeof(cnt) - used, " - %u hidden",
@@ -12067,14 +12303,29 @@ static void draw_status(const Layout* L, const InputState* in) {
                       P->dim);
     }
 
+    // ---- name-language chip: which language names are shown in ----
+    if (L->lang_btn.w > 0) {
+        bool lh = inside(&L->lang_btn, in->x, in->y);
+        bool on = g_name_lang != TR_LANG_ORIGINAL;
+        rrect(L->lang_btn.x, L->lang_btn.y, L->lang_btn.w, L->lang_btn.h,
+              L->radius,
+              (lh || (active && g_app.view_menu_open && g_view_menu_lang))
+                  ? P->btn_hover : P->btn,
+              on ? P->accent : P->border, 1.0f);
+        text_centered_px(TR_LANGS[g_name_lang].tag, &L->lang_btn,
+                         L->text_small, on ? P->accent : (lh ? P->text : P->dim));
+    }
+
     // ---- hidden toggle (sits just left of the corner control) ----
     bool hov = inside(&L->hidden_btn, in->x, in->y);
-    rrect(L->hidden_btn.x, L->hidden_btn.y, L->hidden_btn.w, L->hidden_btn.h,
-          L->radius,
-          g_show_hidden ? P->selected : (hov ? P->btn_hover : P->btn),
-          g_show_hidden ? P->selected : P->border, 1.0f);
-    text_centered_px("Hidden", &L->hidden_btn, L->text_small,
-                     g_show_hidden ? P->paper : (hov ? P->text : P->dim));
+    if (L->hidden_btn.w > 0) {
+        rrect(L->hidden_btn.x, L->hidden_btn.y, L->hidden_btn.w,
+              L->hidden_btn.h, L->radius,
+              g_show_hidden ? P->selected : (hov ? P->btn_hover : P->btn),
+              g_show_hidden ? P->selected : P->border, 1.0f);
+        text_centered_px("Hidden", &L->hidden_btn, L->text_small,
+                         g_show_hidden ? P->paper : (hov ? P->text : P->dim));
+    }
 
     // ---- Round 12: view menu + zoom % are ONE control in the corner:
     //      [view name > | 55%]. The plain button steps the view, the
@@ -12082,25 +12333,55 @@ static void draw_status(const Layout* L, const InputState* in) {
     //      (100% = the big "large icon" size; the slider starts at 15%). ----
     hov = inside(&L->view_btn, in->x, in->y);
     rrect(L->view_btn.x, L->view_btn.y, L->view_btn.w, L->view_btn.h,
-          L->radius, (hov || g_app.view_menu_open) ? P->btn_hover : P->btn,
+          L->radius,
+          (hov || (active && g_app.view_menu_open)) ? P->btn_hover : P->btn,
           P->border, 1.0f);
-    int dvx = L->view_btn.x + SC(96);          // divider between the halves
-    vline(dvx, L->view_btn.y + SC(4),
-          L->view_btn.y + L->view_btn.h - SC(4), P->border);
-    RectI vt = L->view_btn;
-    vt.x += SC(4);
-    vt.w = SC(96) - SC(14);
-    text_centered_px(view_mode_name(), &vt, L->text_med, P->text);
-    RectI vc = {dvx - SC(13), L->view_btn.y + (L->view_btn.h - SC(10)) / 2,
-                SC(10), SC(10)};
-    draw_chevron(&vc, g_app.view_menu_open, P->dim);
+    if (L->view_name_w > 0) {
+        int dvx = L->view_btn.x + L->view_name_w;  // divider between halves
+        vline(dvx, L->view_btn.y + SC(4),
+              L->view_btn.y + L->view_btn.h - SC(4), P->border);
+        RectI vt = L->view_btn;
+        vt.x += SC(4);
+        vt.w = L->view_name_w - SC(18);
+        char vn[64];
+        fit_text(view_mode_name(), vn, sizeof vn, vt.w, L->text_med);
+        text_centered_px(vn, &vt, L->text_med, P->text);
+        RectI vc = {dvx - SC(13),
+                    L->view_btn.y + (L->view_btn.h - SC(10)) / 2,
+                    SC(10), SC(10)};
+        draw_chevron(&vc, active && g_app.view_menu_open, P->dim);
+    }
     char zt[16];
-    snprintf(zt, sizeof(zt), "%d%%", zoom_percent(g_zoom));
+    // the active pane's zoom animates in g_zoom; any other pane shows the
+    // size it stores (swapped into g_app.zoom while it is drawn)
+    snprintf(zt, sizeof(zt), "%d%%",
+             zoom_percent(active ? g_zoom : g_app.zoom));
     text_centered_px(zt, &L->zoom_lbl, L->text_med, hov ? P->text : P->dim);
 }
 
 // ---- Details popup menu: Details | List | Tree | Icons | XL icons ----
+static void draw_lang_menu(const Layout* L, const InputState* in) {
+    rrect(L->lang_menu.x, L->lang_menu.y, L->lang_menu.w, L->lang_menu.h,
+          SC(8), P->panel, P->border, 1.0f);
+    for (int i = 0; i < TR_LANG_COUNT && i < 16; i++) {
+        const RectI* r = &L->lang_items[i];
+        bool cur = (i == g_name_lang);
+        if (cur) fill(r->x, r->y, r->w, r->h, P->row_hover);
+        else if (inside(r, in->x, in->y))
+            rrect(r->x, r->y, r->w, r->h, L->radius, P->btn_hover, COLOR_BLACK,
+                  0.0f);
+        if (cur) fill(r->x, r->y + SC(4), SC(3), r->h - SC(8), P->accent);
+        text_px(TR_LANGS[i].name, r->x + SC(12),
+                r->y + (r->h - L->text_med) / 2, L->text_med, P->text);
+        if (i != TR_LANG_ORIGINAL)
+            text_right_px(TR_LANGS[i].tag, r->x + r->w - SC(8),
+                          r->y + (r->h - L->text_small) / 2, L->text_small,
+                          P->dim);
+    }
+}
+
 static void draw_view_menu(const Layout* L, const InputState* in) {
+    if (g_view_menu_lang) { draw_lang_menu(L, in); return; }
     rrect(L->view_menu.x, L->view_menu.y, L->view_menu.w, L->view_menu.h,
           SC(8), P->panel, P->border, 1.0f);
     for (int i = 0; i < VIEW_MENU_MAX; i++) {
@@ -12138,89 +12419,6 @@ static void set_ring(int cx, int cy, int r, Color c) {
         line(px, py, nx, ny, c, 1.6f);
         px = nx;
         py = ny;
-    }
-}
-
-// One consistent icon style for the category rail: line-art glyphs in a
-// SC(16) box at the same 1.6px stroke weight as the toolbar arrows.
-// Monochrome (accent when the category is selected, dim otherwise) and
-// drawn only from the app's own primitives, so every theme works.
-static void set_cat_icon(int cat, int x, int y, int s, Color c) {
-    int hx = x + s / 2, hy = y + s / 2;
-    switch (cat) {
-    case SCAT_GENERAL:                       // gear: ring + spokes + hub
-        set_ring(hx, hy, s / 2 - 3, c);
-        fill(hx - 1, hy - 1, 2, 2, c);
-        line(hx, y + 1, hx, y + 3, c, 1.6f);
-        line(hx, y + s - 3, hx, y + s - 1, c, 1.6f);
-        line(x + 1, hy, x + 3, hy, c, 1.6f);
-        line(x + s - 3, hy, x + s - 1, hy, c, 1.6f);
-        break;
-    case SCAT_APPEARANCE:                    // sun: lit disc + rays
-        set_ring(hx, hy, s / 2 - 4, c);
-        fill(hx - 2, hy - 2, 4, 4, c);
-        line(hx, y, hx, y + 2, c, 1.6f);
-        line(hx, y + s - 2, hx, y + s, c, 1.6f);
-        line(x, hy, x + 2, hy, c, 1.6f);
-        line(x + s - 2, hy, x + s, hy, c, 1.6f);
-        break;
-    case SCAT_NAV:                            // two overlapping tabs
-        box(x + 1, y + 4, s - 8, s - 5, c);
-        box(x + 6, y + 2, s - 7, s - 5, c);
-        break;
-    case SCAT_FILEOPS:                        // document with text lines
-        box(x + 3, y + 1, s - 6, s - 2, c);
-        line(x + 5, y + 5, x + s - 7, y + 5, c, 1.6f);
-        line(x + 5, y + 8, x + s - 7, y + 8, c, 1.6f);
-        line(x + 5, y + 11, x + s - 9, y + 11, c, 1.6f);
-        break;
-    case SCAT_THUMBS:                         // picture: frame + peak + sun
-        box(x + 1, y + 3, s - 2, s - 6, c);
-        line(x + 3, y + s - 6, x + s / 2 - 1, y + s / 2, c, 1.6f);
-        line(x + s / 2 - 1, y + s / 2, x + s - 3, y + s - 6, c, 1.6f);
-        fill(x + s - 6, y + 5, 2, 2, c);
-        break;
-    case SCAT_SHORTCUTS:                      // keyboard: keys + space bar
-        box(x + 1, y + 4, s - 2, s - 8, c);
-        fill(x + 3, y + 6, 2, 2, c);
-        fill(x + 7, y + 6, 2, 2, c);
-        fill(x + s - 5, y + 6, 2, 2, c);
-        fill(x + 3, y + s - 8, s - 6, 2, c);
-        break;
-    case SCAT_GESTURES:                       // mouse: body + wheel line
-        box(x + 3, y + 1, s - 6, s - 2, c);
-        line(hx, y + 3, hx, y + s / 2, c, 1.6f);
-        break;
-    case SCAT_PANES:                          // 2x2 grid
-        box(x + 1, y + 1, s - 2, s - 2, c);
-        line(hx, y + 1, hx, y + s - 1, c, 1.6f);
-        line(x + 1, hy, x + s - 1, hy, c, 1.6f);
-        break;
-    case SCAT_STARRED:                        // star (existing primitive)
-        draw_star(hx, hy, s / 2 - 2, true, c);
-        break;
-    case SCAT_PERF:                           // gauge: dial + needle
-        set_ring(hx, hy + 1, s / 2 - 3, c);
-        line(hx, hy + 1, hx + s / 4, hy - s / 5, c, 1.6f);
-        break;
-    case SCAT_SEARCH:                         // magnifier: lens + handle
-        set_ring(hx - 1, hy - 1, s / 2 - 4, c);
-        line(hx + 2, hy + 2, hx + s / 2, hy + s / 2, c, 1.6f);
-        break;
-    case SCAT_UPDATE:                         // refresh (existing glyph)
-        icon_refresh(x, y, s, c);
-        break;
-    case SCAT_ADV:                            // sliders: rails + knobs
-        line(x + 1, y + 4, x + s - 1, y + 4, c, 1.6f);
-        line(x + 1, y + 8, x + s - 1, y + 8, c, 1.6f);
-        line(x + 1, y + 12, x + s - 1, y + 12, c, 1.6f);
-        fill(x + 4, y + 3, 2, 2, c);
-        fill(x + s - 7, y + 7, 2, 2, c);
-        fill(x + 5, y + 11, 2, 2, c);
-        break;
-    default:
-        box(x + 2, y + 2, s - 4, s - 4, c);
-        break;
     }
 }
 
@@ -12269,37 +12467,6 @@ static int set_wrap_lines(const char* src, int px, int max_px,
     }
     if (more) *more = m;
     return n + 1;
-}
-
-// Word-wrap src into at most max_lines lines of max_px width and draw
-// them at x, y (+ line_h per line).  Descriptions must wrap, never
-// truncate into the control column.  When text remains past the last
-// line, that line ends in "...".  *more_out (optional) reports whether
-// anything was cut, so a hover tooltip can show the full string.
-// Returns the number of lines drawn.
-static int text_wrap_px(const char* src, int x, int y, int px, int max_px,
-                        int line_h, int max_lines, Color c, bool* more_out) {
-    if (more_out) *more_out = false;
-    if (!src || !src[0] || max_lines < 1 || max_px < px) return 0;
-    char lines[6][192];                       // descriptions are short
-    bool more = false;
-    int n = set_wrap_lines(src, px, max_px, lines, max_lines, &more);
-    for (int i = 0; i < n && i < max_lines; i++) {
-        char shown[200];
-        if (i == n - 1 && more) {             // last line, text still remains
-            char cut[192];
-            // ONE "..." total: fit_text ellipsizes when it has to cut, and a
-            // line that already fits gets the indicator only if it still
-            // stays inside the same max_px (never a spill, never "......").
-            snprintf(cut, sizeof cut, "%s...", lines[i]);
-            if ((int)measure_px(cut, px) > max_px)
-                fit_text(lines[i], cut, sizeof cut, max_px, px);
-            snprintf(shown, sizeof shown, "%s", cut);
-        } else snprintf(shown, sizeof shown, "%s", lines[i]);
-        text_px(shown, x, y + i * line_h, px, c);
-    }
-    if (more_out) *more_out = more;
-    return n < max_lines ? n : max_lines;
 }
 
 // A small tooltip for a row line that had to be truncated: wraps the
@@ -12657,367 +12824,133 @@ static void draw_recorder(const Layout* L, const InputState* in) {
 // returns early while the panel is open, keys go through
 // settings_keys() before anything else can see them.
 // ============================================================
+// ---- Settings: ONE flat, searchable list --------------------------------
+// Layout (top to bottom): a search line ("Select an option..."), one row
+// per setting - its name, a one-line description and its control on the
+// right (switch, shortcut chip, button, slider or dropdown) - and a footer
+// with the keys that drive it.  Every hit rect is rebuilt each frame, so
+// drawing and clicking always agree.
+static void set_draw_dropdown(const Layout* L, const RectI* r,
+                              const char* label, bool open,
+                              const InputState* in) {
+    bool hov = inside(r, in->x, in->y);
+    rrect(r->x, r->y, r->w, r->h, SC(5),
+          (hov || open) ? P->btn_hover : P->btn,
+          open ? P->accent : P->border, 1.0f);
+    RectI t = {r->x + SC(6), r->y, r->w - SC(24), r->h};
+    char b[64];
+    fit_text(label, b, sizeof b, t.w, L->text_small);
+    text_centered_px(b, &t, L->text_small, P->text);
+    int cx = r->x + r->w - SC(13), cy = r->y + r->h / 2;   // ">" chevron
+    line(cx - SC(2), cy - SC(4), cx + SC(2), cy, P->dim, 1.5f);
+    line(cx + SC(2), cy, cx - SC(2), cy + SC(4), P->dim, 1.5f);
+}
+
+// A small square "back to default" button with the refresh glyph.
+static void set_draw_reset_icon(const RectI* r, const InputState* in) {
+    bool hov = inside(r, in->x, in->y);
+    if (hov)
+        rrect(r->x, r->y, r->w, r->h, SC(5), P->btn_hover, COLOR_BLACK, 0.0f);
+    int g = SC(14);
+    icon_refresh(r->x + (r->w - g) / 2, r->y + (r->h - g) / 2, g,
+                 hov ? P->text : P->dim);
+}
+
 static void draw_settings(const Layout* L, const InputState* in) {
     int ww = 0, hh = 0;
     platform_window_size(&ww, &hh);
     if (ww <= 0 || hh <= 0) return;
 
     // One frame of clicks is ignored while the opener's latch is live -
-    // consumed HERE so no interaction below can eat it first (the panel
-    // is drawn the same frame its gear button was clicked).
+    // consumed HERE so no interaction below can eat it first.
     bool click_ok = in->left_click;
     if (g_modal_click_latch) { g_modal_click_latch = false; click_ok = false; }
-    // Every hit rect is re-derived each frame; the empty-state "Clear
-    // search" button must be re-armed ONLY while that state is drawn, or
-    // its old band keeps swallowing row clicks after rows come back.
     s_set_empty_clear = (RectI){0};
+    for (int i = 0; i < SCAT_COUNT; i++) s_set_cat[i] = (RectI){0};
+    for (int i = 0; i < PAL_COUNT_N; i++) s_theme_card[i] = (RectI){0};
+    s_scale_track = (RectI){0};
+    s_scale_rst = (RectI){0};
+    RectI lang_chip = {0};
 
-    fill(0, 0, ww, hh, (Color){0, 0, 0, 0.5f});   // dim backdrop (translucent)
+    fill(0, 0, ww, hh, (Color){0, 0, 0, 0.5f});   // dim backdrop
 
-    // ---- panel size: comfortable default, responsive to the window ----
-    int w = SC(980);
-    if (w > ww - SC(48)) w = ww - SC(48);
-    int h = SC(660);
-    if (h > hh - SC(48)) h = hh - SC(48);
-    if (w < SC(520)) w = (ww > SC(520)) ? SC(520) : ww;
-    if (h < SC(400)) h = (hh > SC(400)) ? SC(400) : hh;
+    // ---- panel: a tall, centred list; responsive to the window ----
+    int w = SC(880);
+    if (w > ww - SC(32)) w = ww - SC(32);
+    if (w < SC(420)) w = (ww > SC(420)) ? SC(420) : ww;
+    int h = SC(900);
+    if (h > hh - SC(32)) h = hh - SC(32);
+    if (h < SC(300)) h = (hh > SC(300)) ? SC(300) : hh;
     int x = (ww - w) / 2, y = (hh - h) / 2;
     s_set_panel = (RectI){x, y, w, h};
-    rrect(x, y, w, h, SC(12), P->panel, P->border, 1.0f);
+    rrect(x, y, w, h, SC(8), P->panel, P->border, 1.0f);
 
-    // ---- header: title + close ----
-    int hdr = SC(56);
-    text_px("Settings", x + SC(20), y + SC(15), L->text_h + SC(8), P->text);
-    s_set_close = (RectI){x + w - SC(44), y + SC(13), SC(32), SC(30)};
+    // ---- search line: magnifier | field | count | close ----
+    int top_h = SC(42);
+    s_set_close = (RectI){x + w - SC(38), y + (top_h - SC(28)) / 2, SC(28),
+                          SC(28)};
     bool hov_close = inside(&s_set_close, in->x, in->y);
     if (hov_close)
         rrect(s_set_close.x, s_set_close.y, s_set_close.w, s_set_close.h,
-              SC(6), in->left_down ? P->field : P->btn_hover, COLOR_BLACK, 0.0f);
-    line(s_set_close.x + SC(10), s_set_close.y + SC(9),
-         s_set_close.x + s_set_close.w - SC(10),
-         s_set_close.y + s_set_close.h - SC(9), hov_close ? P->text : P->dim,
-         1.7f);
-    line(s_set_close.x + s_set_close.w - SC(10), s_set_close.y + SC(9),
-         s_set_close.x + SC(10), s_set_close.y + s_set_close.h - SC(9),
-         hov_close ? P->text : P->dim, 1.7f);
-    hline(x, x + w, y + hdr, P->border);
-
-    // ---- search row: magnifier glyph + field + clear button + count ----
-    int sry = y + hdr + SC(10);
-    int sfh = SC(34);
-    int scnt_w = (w >= SC(720)) ? SC(150) : 0;
-    s_set_filter = (RectI){x + SC(20), sry, w - SC(40) - scnt_w, sfh};
-    rrect(s_set_filter.x, s_set_filter.y, s_set_filter.w, s_set_filter.h,
-          SC(8), P->field, focus_border(), 1.5f);
+              SC(5), P->btn_hover, COLOR_BLACK, 0.0f);
     {
-        int mx = s_set_filter.x + SC(17), my = sry + sfh / 2;
-        set_ring(mx, my, SC(6), P->dim);
-        line(mx + SC(4), my + SC(4), mx + SC(8), my + SC(8), P->dim, 1.6f);
+        int qx = s_set_close.x + s_set_close.w / 2;
+        int qy = s_set_close.y + s_set_close.h / 2;
+        Color xc = hov_close ? P->text : P->dim;
+        line(qx - SC(5), qy - SC(5), qx + SC(5), qy + SC(5), xc, 1.6f);
+        line(qx + SC(5), qy - SC(5), qx - SC(5), qy + SC(5), xc, 1.6f);
     }
-    s_set_filter_tx = s_set_filter.x + SC(32);
-    int fty = sry + (sfh - L->text_h) / 2;
-    // Same input style as the main search box: selection box + blinking
-    // caret at the true insertion point (the caret rests while a shortcut
-    // rebind is capturing keys, so the field never fights the capture).
+    char cnt[64];
     if (g_set_filter[0])
-        field_selection(g_set_filter, g_set_caret, g_set_anchor,
-                        s_set_filter_tx, fty, L->text_h, L->text_h,
-                        s_set_filter.x + s_set_filter.w - SC(30));
-    char ph[96];
-    fit_text("Search settings by name, description or shortcut...",
-             ph, sizeof ph, s_set_filter.w - SC(46), L->text_h);
-    text_px(g_set_filter[0] ? g_set_filter : ph, s_set_filter_tx, fty,
-            L->text_h, g_set_filter[0] ? P->text : P->dim);
+        snprintf(cnt, sizeof cnt, "%d match%s", g_set_row_n,
+                 g_set_row_n == 1 ? "" : "es");
+    else
+        snprintf(cnt, sizeof cnt, "%d settings", g_set_row_n);
+    int cnt_w = (int)measure_px(cnt, L->text_small) + SC(16);
+    text_right_px(cnt, s_set_close.x - SC(10), y + (top_h - L->text_small) / 2,
+                  L->text_small, P->dim);
+    s_set_filter = (RectI){x + SC(6), y + SC(6),
+                           s_set_close.x - SC(10) - cnt_w - (x + SC(6)),
+                           top_h - SC(12)};
+    {
+        int mx = s_set_filter.x + SC(13), my = y + top_h / 2;
+        set_ring(mx - SC(1), my - SC(1), SC(5), P->dim);
+        line(mx + SC(3), my + SC(3), mx + SC(7), my + SC(7), P->dim, 1.6f);
+    }
+    s_set_filter_tx = s_set_filter.x + SC(28);
+    int fty = y + (top_h - L->text_h) / 2;
     s_set_clear = (RectI){0};
-    if (g_set_filter[0]) {            // 'x' clear button, inside the field
-        s_set_clear = (RectI){s_set_filter.x + s_set_filter.w - SC(26),
-                              sry + (sfh - SC(20)) / 2, SC(20), SC(20)};
+    if (g_set_filter[0]) {
+        s_set_clear = (RectI){s_set_filter.x + s_set_filter.w - SC(22),
+                              y + (top_h - SC(20)) / 2, SC(20), SC(20)};
         if (inside(&s_set_clear, in->x, in->y))
             rrect(s_set_clear.x, s_set_clear.y, s_set_clear.w, s_set_clear.h,
-                  SC(4), in->left_down ? P->field : P->btn_hover,
-                  COLOR_BLACK, 0.0f);
+                  SC(4), P->btn_hover, COLOR_BLACK, 0.0f);
         int qx = s_set_clear.x + SC(10), qy = s_set_clear.y + SC(10);
-        line(qx - 3, qy - 3, qx + 3, qy + 3, P->dim, 1.7f);
-        line(qx + 3, qy - 3, qx - 3, qy + 3, P->dim, 1.7f);
+        line(qx - 3, qy - 3, qx + 3, qy + 3, P->dim, 1.6f);
+        line(qx + 3, qy - 3, qx - 3, qy + 3, P->dim, 1.6f);
+        field_selection(g_set_filter, g_set_caret, g_set_anchor,
+                        s_set_filter_tx, fty, L->text_h, L->text_h,
+                        s_set_clear.x - SC(4));
     }
+    text_px(g_set_filter[0] ? g_set_filter : "Select an option...",
+            s_set_filter_tx, fty, L->text_h,
+            g_set_filter[0] ? P->text : P->dim);
     int caret_max = g_set_filter[0] ? s_set_clear.x - SC(4)
-                                    : s_set_filter.x + s_set_filter.w - SC(8);
-    field_caret(g_set_filter, g_set_caret, g_set_cap < 0, s_set_filter_tx, fty,
-                L->text_h, L->text_h, caret_max);
-    if (scnt_w > 0) {     // match / inventory count, right of the search field
-        char cnt[64];
-        if (g_set_filter[0])
-            snprintf(cnt, sizeof cnt, "%d match%s", g_set_row_n,
-                     g_set_row_n == 1 ? "" : "es");
-        else {
-            int tot = 0;
-            for (int ci = 0; ci < CMD_COUNT; ci++)
-                if (!g_ents[ci].hidden) tot++;
-            snprintf(cnt, sizeof cnt, "%d settings", tot);
-        }
-        text_right_px(cnt, x + w - SC(20), sry + (sfh - L->text_med) / 2,
-                      L->text_med, P->dim);
-    }
+                                    : s_set_filter.x + s_set_filter.w - SC(4);
+    field_caret(g_set_filter, g_set_caret, g_set_cap < 0 && !g_set_dd_open,
+                s_set_filter_tx, fty, L->text_h, L->text_h, caret_max);
+    hline(x + 1, x + w - 1, y + top_h, P->border);
 
-    // ---- body geometry: sidebar | content ----
-    int fy = sry + sfh + SC(14);
-    int foot_h = SC(48);
-    int body_h = (y + h - foot_h) - fy;
-    if (body_h < SC(60)) body_h = SC(60);
-    bool wide = (w >= SC(760));
-    int side_w = wide ? SC(240) : SC(52);
-    int sx = x + SC(12), sy = fy;
-    RectI side_rect = {sx, sy, side_w, body_h};
-    rrect(sx, sy, side_w, body_h, SC(8), mixc(P->panel, P->bg, 0.55f),
-          COLOR_BLACK, 0.0f);
-    vline(sx + side_w + SC(8), sy, sy + body_h, mixc(P->panel, P->border, 0.6f));
-
-    // ---- sidebar: icons + labels + counts; scrolls on short windows ----
-    int rh_cat = SC(32), gap_cat = SC(2);
-    int cat_total = SCAT_COUNT * (rh_cat + gap_cat) - gap_cat;
-    int cat_max = cat_total - (body_h - SC(12));
-    if (cat_max < 0) cat_max = 0;
-    // keep the selected category in view (Tab / clicks scroll it into view)
-    {
-        int itop = (sy + SC(6)) + g_set_cat * (rh_cat + gap_cat) - g_set_cat_scroll;
-        int ibot = itop + rh_cat;
-        int vtop = sy + SC(6), vbot = sy + body_h - SC(6);
-        if (itop < vtop) g_set_cat_scroll -= (vtop - itop);
-        else if (ibot > vbot) g_set_cat_scroll += (ibot - vbot);
-    }
-    if (g_set_cat_scroll > cat_max) g_set_cat_scroll = cat_max;
-    if (g_set_cat_scroll < 0) g_set_cat_scroll = 0;
-    renderer_set_scissor(g_app.renderer,
-                         (Rect){(float)sx, (float)sy, (float)side_w,
-                                (float)body_h});
-    for (int i = 0; i < SCAT_COUNT; i++) {
-        RectI r = {sx + SC(4),
-                   sy + SC(6) + i * (rh_cat + gap_cat) - g_set_cat_scroll,
-                   side_w - SC(8), rh_cat};
-        if (r.y + r.h <= sy + SC(2) || r.y >= sy + body_h - SC(2)) {
-            s_set_cat[i] = (RectI){0};   // scrolled out: no phantom hit
-            continue;
-        }
-        s_set_cat[i] = r;
-        bool sel = (i == g_set_cat) && !g_set_filter[0];
-        bool hov = inside(&r, in->x, in->y);
-        if (sel) {
-            rrect(r.x, r.y, r.w, r.h, SC(8),
-                  mixc(P->btn_hover, P->accent, 0.14f), COLOR_BLACK, 0.0f);
-            fill(r.x, r.y + SC(5), SC(3), r.h - SC(10), P->accent);
-        } else if (hov) {
-            rrect(r.x, r.y, r.w, r.h, SC(8),
-                  in->left_down ? mixc(P->btn, P->panel, 0.5f) : P->btn,
-                  COLOR_BLACK, 0.0f);
-        }
-        Color ic = sel ? P->accent : P->dim;
-        int isz = SC(16);
-        int ix = wide ? r.x + SC(10) : r.x + (r.w - isz) / 2;
-        set_cat_icon(i, ix, r.y + (r.h - isz) / 2, isz, ic);
-        if (wide) {
-            char lab[64];
-            fit_text(SCAT_NAMES[i], lab, sizeof lab, r.w - SC(60),
-                     L->text_med);
-            text_px(lab, r.x + SC(34), r.y + (r.h - L->text_med) / 2,
-                    L->text_med, sel ? P->text : P->dim);
-            int cnt = 0;
-            for (int ci = 0; ci < CMD_COUNT; ci++) {
-                const SetEnt* se = &g_ents[ci];
-                if (se->hidden) continue;
-                if (i == SCAT_SHORTCUTS ? se->kind == EK_ACTION
-                                        : se->cat == i)
-                    cnt++;
-            }
-            char cb[12];
-            snprintf(cb, sizeof cb, "%d", cnt);
-            text_right_px(cb, r.x + r.w - SC(10),
-                          r.y + (r.h - L->text_small) / 2, L->text_small,
-                          sel ? mixc(P->dim, P->text, 0.5f) : P->dim);
-        }
-    }
-    renderer_reset_scissor(g_app.renderer);
-
-    // ---- content column: header line + rows + scrollbar ----
-    int cx = sx + side_w + SC(16);
-    int cw = (x + w - SC(16)) - cx;
-    int hdr_y = fy + SC(2);
-    const char* htit = g_set_filter[0] ? "Search results" : SCAT_NAMES[g_set_cat];
-    int htit_w = (int)measure_px(htit, L->text_h + SC(2));
-    text_px(htit, cx, hdr_y, L->text_h + SC(2), P->text);
-    {
-        char sub[160];
-        if (g_set_filter[0])
-            snprintf(sub, sizeof sub, "%d match%s for \"%s\"", g_set_row_n,
-                     g_set_row_n == 1 ? "" : "es", g_set_filter);
-        else {
-            int cnt = 0;
-            for (int ci = 0; ci < CMD_COUNT; ci++) {
-                const SetEnt* se = &g_ents[ci];
-                if (se->hidden) continue;
-                if (g_set_cat == SCAT_SHORTCUTS ? se->kind == EK_ACTION
-                                                : se->cat == g_set_cat)
-                    cnt++;
-            }
-            snprintf(sub, sizeof sub, "%d setting%s", cnt,
-                     cnt == 1 ? "" : "s");
-        }
-        char fs[160];
-        fit_text(sub, fs, sizeof fs, cw - htit_w - SC(16), L->text_small);
-        text_right_px(fs, cx + cw, hdr_y + SC(2), L->text_small, P->dim);
-    }
-    int ry0 = hdr_y + L->text_h + SC(16);
-    hline(cx, cx + cw, ry0 - SC(6), P->border);
-
-    // ---- "Interface Scaling" card (featured block, Appearance only) ----
-    // A horizontal slider with a live percentage: every change runs
-    // through the SAME SC() pipeline the whole panel uses, so the entire
-    // interface previews the new size frame by frame - no restart. One
-    // line below the description documents the hold-V gesture that does
-    // the same job from the keyboard.
-    s_scale_track = (RectI){0};
-    s_scale_rst = (RectI){0};
-    if (g_set_cat == SCAT_APPEARANCE && !g_set_filter[0]) {
-        int ch = SC(96);
-        rrect(cx, ry0, cw, ch, SC(8), mixc(P->panel, P->bg, 0.35f),
-              COLOR_BLACK, 0.0f);
-        text_px("Interface Scaling", cx + SC(14), ry0 + SC(8),
-                L->text_med, P->text);
-        // Reset to Default: always visible, inert while at 100%
-        s_scale_rst = (RectI){cx + cw - SC(12) - SC(58), ry0 + SC(7),
-                              SC(58), SC(24)};
-        set_draw_button(L, &s_scale_rst, "Reset", false,
-                        g_ui_scale != 100, in);
-        char dsc[128];
-        fit_text("Adjust the size of text, icons, buttons, and interface "
-                 "elements.", dsc, sizeof dsc, cw - SC(28), L->text_small);
-        text_px(dsc, cx + SC(14), ry0 + SC(8) + L->text_med + SC(2),
-                L->text_small, P->dim);
-        // The keyboard gesture, stated where it is useful - accent colour
-        // so it reads as a hint, ellipsised (never overflowed) when narrow.
-        char hsc[128];
-        fit_text("Shortcut: Alt + mouse wheel, or hold V and press + / -.",
-                 hsc, sizeof hsc, cw - SC(28), L->text_small);
-        text_px(hsc, cx + SC(14), ry0 + SC(8) + L->text_med + SC(2) +
-                L->text_small + SC(2), L->text_small, P->accent);
-        // ---- slider track: continuous UI_SCALE_MIN..UI_SCALE_MAX ----
-        int sl_y = ry0 + ch - SC(26);
-        int sl_x = cx + SC(14);
-        int pct_w = SC(44), tag_w = SC(84);
-        int track_w = cw - SC(28) - pct_w - tag_w;
-        if (track_w < SC(80)) {              // narrow panel: drop the word
-            tag_w = 0;
-            track_w = cw - SC(28) - pct_w;
-            if (track_w < SC(80)) track_w = SC(80);
-        }
-        s_scale_track = (RectI){sl_x, sl_y, track_w, SC(6)};
-        // Live drag: same self-contained lifecycle as the list scrollbar
-        // above - the drag pass updates every frame, the release saves.
-        if (g_scale_drag) {
-            if (in->left_down) {
-                int t = in->x - (s_scale_track.x + SC(7));
-                int span = s_scale_track.w - SC(14);
-                int pct = (span > 0)
-                    ? UI_SCALE_MIN +
-                          (int)((long long)(UI_SCALE_MAX - UI_SCALE_MIN) *
-                                t / span)
-                    : 100;
-                ui_scale_set(pct);           // clamped + live preview
-            } else {
-                g_scale_drag = false;
-                settings_save();             // ONE write per drag, not per pixel
-            }
-        }
-        bool hov = inside(&s_scale_track, in->x, in->y) || g_scale_drag;
-        rrect(s_scale_track.x, s_scale_track.y, s_scale_track.w,
-              s_scale_track.h, SC(3), P->field, COLOR_BLACK, 0.0f);
-        int fill_w = (int)((long long)(g_ui_scale - UI_SCALE_MIN) *
-                           (s_scale_track.w - SC(14)) /
-                           (UI_SCALE_MAX - UI_SCALE_MIN)) + SC(7);
-        if (fill_w > 0)
-            rrect(s_scale_track.x, s_scale_track.y, fill_w,
-                  s_scale_track.h, SC(3), P->accent, COLOR_BLACK, 0.0f);
-        int thx = s_scale_track.x + fill_w - SC(7);
-        rrect(thx, s_scale_track.y - SC(4), SC(14), SC(14), SC(7),
-              hov ? P->paper : P->accent, COLOR_BLACK, 0.0f);
-        // numeric value + size word, so the setting reads at a glance
-        char pv[16];
-        snprintf(pv, sizeof pv, "%d%%", g_ui_scale);
-        text_right_px(pv, sl_x + track_w + pct_w, sl_y - SC(6),
-                      L->text_small, P->text);
-        if (tag_w > 0) {
-            const char* tag = g_ui_scale <= 75   ? "Extra Small"
-                            : g_ui_scale <= 85   ? "Small"
-                            : g_ui_scale <= 100  ? "Default"
-                            : g_ui_scale <= 115  ? "Large"
-                            : g_ui_scale <= 130  ? "Extra Large"
-                                                 : "Maximum";
-            text_px(tag, sl_x + track_w + pct_w + SC(2), sl_y - SC(6),
-                    L->text_small, P->dim);
-        }
-        ry0 += ch + SC(8);                   // the rows start below the card
-    }
-
-    // ---- "Theme" card (featured block, Appearance only) ----
-    // Three preview cards - one per REAL palette (Midnight / Dark /
-    // Light), each drawn with that theme's OWN colours: a miniature
-    // surface, a name, a row of swatches for its main background, panel,
-    // primary text and accent, and a selected state.  The theme changes
-    // only because the user clicks a card - there is no cycling shortcut.
-    for (int i = 0; i < PAL_COUNT_N; i++) s_theme_card[i] = (RectI){0};
-    if (g_set_cat == SCAT_APPEARANCE && !g_set_filter[0]) {
-        int ch = SC(96);
-        rrect(cx, ry0, cw, ch, SC(8), mixc(P->panel, P->bg, 0.35f),
-              COLOR_BLACK, 0.0f);
-        text_px("Theme", cx + SC(14), ry0 + SC(8), L->text_med, P->text);
-        char tdsc[128];
-        fit_text("Pick a theme - it applies to the whole interface at once.",
-                 tdsc, sizeof tdsc, cw - SC(28), L->text_small);
-        text_px(tdsc, cx + SC(14), ry0 + SC(8) + L->text_med + SC(2),
-                L->text_small, P->dim);
-        // Three cards laid out side by side; each is a REAL miniature of
-        // its palette (bg + panel + text + accent all come from that
-        // theme), so what is shown is exactly what a click gives.
-        int card_y = ry0 + SC(40);
-        int card_h = ch - SC(40) - SC(10);
-        int gap = SC(8);
-        int card_w = (cw - SC(28) - gap * (PAL_COUNT_N - 1)) / PAL_COUNT_N;
-        for (int i = 0; i < PAL_COUNT_N; i++) {
-            const Palette* Q = pal_at(i);
-            int x = cx + SC(14) + i * (card_w + gap);
-            s_theme_card[i] = (RectI){x, card_y, card_w, card_h};
-            bool sel = (i == g_pal_idx);
-            bool hov = inside(&s_theme_card[i], in->x, in->y);
-            // the card surface IS that theme's background
-            rrect(x, card_y, card_w, card_h, SC(6), Q->bg,
-                  sel ? P->accent : P->border, sel ? 2.0f : 1.0f);
-            // theme name, in that theme's own primary text colour
-            text_px(pal_name(i), x + SC(7), card_y + SC(6),
-                    L->text_small, Q->text);
-            // swatches: main background, panel, primary text, accent
-            int sw = SC(9), sgap = SC(5);
-            int sx = x + SC(7), sy2 = card_y + card_h - sw - SC(7);
-            const Color* cols[4] = { &Q->bg, &Q->panel, &Q->text, &Q->accent };
-            for (int k = 0; k < 4; k++)
-                rrect(sx + k * (sw + sgap), sy2, sw, sw, SC(2), *cols[k],
-                      Q->border, 0.5f);
-            // selected state: an accent dot; hover lifts the border
-            if (sel)
-                rrect(x + card_w - SC(13), card_y + SC(6), SC(7), SC(7),
-                      SC(4), P->accent, COLOR_BLACK, 0.0f);
-            else if (hov)
-                rrect(x, card_y, card_w, card_h, SC(6), mixc(Q->bg,
-                      P->accent, 0.10f), P->border, 1.0f);
-        }
-        ry0 += ch + SC(8);                   // the rows start below the card
-    }
-
-    // ---- rows: fixed height, two-column, stacked when the window is narrow ----
-    int ctl_w = SC(52) + SC(8) + SC(44) + SC(8) + SC(128); // reset+sw+chip
-    int list_h = (sy + body_h) - ry0;
+    // ---- list geometry ----
+    int foot_h = SC(36);
+    int fy2 = y + h - foot_h;
+    int cx = x + SC(6);
+    int cw = w - SC(12);
+    int ry0 = y + top_h + SC(4);
+    int list_h = fy2 - SC(4) - ry0;
     if (list_h < SC(40)) list_h = SC(40);
-    bool stacked = (cw - ctl_w - SC(24)) < SC(200);
-    int rh = stacked ? SC(116) : SC(84);
-    int tw = stacked ? (cw - SC(24)) : (cw - ctl_w - SC(24));
+    int rh = SC(42);
     s_set_vis = list_h / rh;
     if (s_set_vis < 1) s_set_vis = 1;
     if (s_set_vis > CMD_COUNT) s_set_vis = CMD_COUNT;
@@ -13030,30 +12963,19 @@ static void draw_settings(const Layout* L, const InputState* in) {
     s_set_sb_track = (RectI){0};
     s_set_sb_thumb = (RectI){0};
     if (g_set_row_n > s_set_vis) {
-        s_set_sb_track = (RectI){cx + cw - SC(8), ry0, SC(6), list_h};
+        s_set_sb_track = (RectI){x + w - SC(10), ry0, SC(5), list_h};
         int maxs = g_set_row_n - s_set_vis;
         int th = list_h * s_set_vis / g_set_row_n;
         if (th < SC(24)) th = SC(24);
         int ty = ry0 + (list_h - th) * g_set_scroll / (maxs ? maxs : 1);
-        s_set_sb_thumb = (RectI){s_set_sb_track.x, ty, SC(6), th};
-        fill(s_set_sb_track.x, s_set_sb_track.y, s_set_sb_track.w,
-             s_set_sb_track.h, mixc(P->panel, P->bg, 0.5f));
+        s_set_sb_thumb = (RectI){s_set_sb_track.x, ty, SC(5), th};
         rrect(s_set_sb_thumb.x, s_set_sb_thumb.y, s_set_sb_thumb.w,
               s_set_sb_thumb.h, SC(3),
               (inside(&s_set_sb_thumb, in->x, in->y) || g_set_sb_drag)
                   ? mixc(P->scroll, P->text, 0.25f) : P->scroll,
               COLOR_BLACK, 0.0f);
-        cw -= SC(14);                        // rows stay clear of the bar
-        tw = stacked ? (cw - SC(24)) : (cw - ctl_w - SC(24));
-        if (tw < SC(80)) tw = SC(80);
-        // Thumb drag + track paging (wheel and keyboard still work).
-        // Handled HERE so the press frame starts the drag, but control then
-        // keeps flowing: a return here used to skip the rows/footer/recorder
-        // draw for that frame (a one-frame blank flicker on every bar
-        // click) and to bypass the recorder dialog's modal click gate.  The
-        // click itself is swallowed by the scrollbar guard in the click
-        // section below; while the recorder is open it owns every click.
-        if (g_set_cap < 0) {
+        cw -= SC(10);                        // rows stay clear of the bar
+        if (g_set_cap < 0 && !g_set_dd_open) {
             if (click_ok && inside(&s_set_sb_thumb, in->x, in->y)) {
                 g_set_sb_drag = true;
                 g_set_sb_grab = in->y - s_set_sb_thumb.y;
@@ -13083,275 +13005,297 @@ static void draw_settings(const Layout* L, const InputState* in) {
         }
     }
 
-    // ---- empty state: icon + query + hint + a real way back ----
+    // ---- empty state ----
     if (g_set_row_n == 0) {
-        int ccy = ry0 + (list_h - SC(140)) / 2;
-        if (ccy < ry0) ccy = ry0;
-        int mcx = cx + (cw - SC(14)) / 2;
-        set_ring(mcx, ccy + SC(12), SC(11), P->scroll);
-        line(mcx + SC(7), ccy + SC(19), mcx + SC(15), ccy + SC(27),
-             P->scroll, 2.0f);
         char t1[160], t2[160];
-        if (g_set_filter[0])
-            snprintf(t1, sizeof t1, "No settings match \"%s\"", g_set_filter);
-        else
-            snprintf(t1, sizeof t1, "This category has no settings");
+        snprintf(t1, sizeof t1, "No settings match \"%s\"", g_set_filter);
         fit_text(t1, t2, sizeof t2, cw - SC(40), L->text_med);
-        text_centered_px(t2, &(RectI){cx, ccy + SC(44), cw - SC(14),
-                                      L->text_med},
-                         L->text_med, P->text);
-        const char* hint = g_set_filter[0]
-            ? "Try a different word, or clear the search to browse categories."
-            : "Pick another category on the left.";
-        text_centered_px(hint,
-                         &(RectI){cx, ccy + SC(44) + L->text_med + SC(6),
-                                  cw - SC(14), L->text_small},
-                         L->text_small, P->dim);
-        s_set_empty_clear = (RectI){0};
-        if (g_set_filter[0]) {
-            s_set_empty_clear = (RectI){mcx - SC(70), ccy + SC(92),
-                                        SC(140), SC(28)};
-            set_draw_button(L, &s_set_empty_clear, "Clear search", false,
-                            true, in);
-        }
+        int ccy = ry0 + list_h / 2 - SC(40);
+        text_centered_px(t2, &(RectI){cx, ccy, cw, L->text_med}, L->text_med,
+                         P->text);
+        s_set_empty_clear = (RectI){cx + cw / 2 - SC(70),
+                                    ccy + L->text_med + SC(14), SC(140),
+                                    SC(28)};
+        set_draw_button(L, &s_set_empty_clear, "Clear search", false, true,
+                        in);
     }
 
-    // ---- one row per setting: title + wrapped description + how-to,
-    //      controls right-aligned in a fixed column (stacked when narrow) ----
-    char tip_buf[300] = "";        // one hover tooltip: a truncated line's
-    int tip_px = L->text_med;      // full text, drawn after the rows
+    // ---- live drag of the Interface Size slider (one save on release) ----
+    if (g_scale_drag && !in->left_down) {
+        g_scale_drag = false;
+        settings_save();
+    }
+
+    // ---- rows ----
+    char tip_buf[400] = "";
     for (int v = 0; v < s_set_vis; v++) {
         int ri = g_set_scroll + v;
+        s_set_row[v] = s_set_chip[v] = s_set_sw[v] = s_set_rst[v] = (RectI){0};
         if (ri >= g_set_row_n) break;
         int id = g_set_rows[ri];
-        const SetEnt* e = &g_ents[id];
-        RectI r = {cx, ry0 + v * rh, cw, rh - SC(4)};
+        const SetEnt* e = (id >= 0) ? &g_ents[id] : NULL;
+        RectI r = {cx, ry0 + v * rh, cw, rh - SC(2)};
         s_set_row[v] = r;
-        s_set_chip[v] = (RectI){0};
-        s_set_sw[v] = (RectI){0};
-        s_set_rst[v] = (RectI){0};
-        bool row_hov = inside(&r, in->x, in->y);
+        bool row_hov = inside(&r, in->x, in->y) && !g_set_dd_open;
         bool foc = (ri == g_set_focus);
-        if (foc) {
-            rrect(r.x, r.y, r.w, r.h, SC(8),
-                  mixc(P->panel, P->btn_hover, 0.55f), P->accent, 1.0f);
-            fill(r.x, r.y + SC(6), SC(3), r.h - SC(12), P->accent);
-        } else if (row_hov) {
-            rrect(r.x, r.y, r.w, r.h, SC(8),
-                  in->left_down ? mixc(P->btn, P->panel, 0.4f) : P->btn,
-                  COLOR_BLACK, 0.0f);
-        } else if (v > 0) {
-            // subtle grouping boundary - not a heavy per-row card
-            hline(r.x + SC(6), r.x + r.w - SC(6), r.y,
-                  mixc(P->panel, P->border, 0.55f));
-        }
+        if (foc)
+            rrect(r.x, r.y, r.w, r.h, SC(5), mixc(P->panel, P->btn, 0.6f),
+                  P->accent, 1.0f);
+        else if (row_hov)
+            rrect(r.x, r.y, r.w, r.h, SC(5), P->btn, COLOR_BLACK, 0.0f);
 
-        int tx0 = r.x + SC(12);
-        // title line: the name, plus (while filtering) the category it
-        // matched in, so a result is never ambiguous
-        char tag[48] = "";
-        int name_w = tw;
-        if (g_set_filter[0]) {
-            fit_text(SCAT_NAMES[e->cat], tag, sizeof tag, SC(140),
-                     L->text_small);
-            name_w = tw - (int)measure_px(tag, L->text_small) - SC(12);
-            if (name_w < SC(80)) name_w = SC(80);
-        }
-        char nbuf[128];
-        fit_text(e->name, nbuf, sizeof nbuf, name_w, L->text_h);
-        text_px(nbuf, tx0, r.y + SC(9), L->text_h, P->text);
-        if (tag[0])
-            text_right_px(tag, tx0 + tw - SC(4), r.y + SC(12), L->text_small,
-                          mixc(P->dim, P->accent, 0.45f));
-        // description: real word wrap, up to two lines - never truncated
-        // into the control column, never overlapping it.  If the wrap
-        // had to cut text, the hover tooltip below shows the rest.
-        bool dmore = false;
-        text_wrap_px(e->desc, tx0, r.y + SC(9) + L->text_h + SC(3),
-                     L->text_med, tw, L->text_med + SC(3), 2, P->dim, &dmore);
-        // how-to / live-value line.  A few rows carry a REAL current
-        // value instead of usage text (version, status, the store path).
-        // Both kinds share ONE slot: a left-aligned line under the
-        // description inside the text column, so a long value (the
-        // settings file path) can never overlap the name, the
-        // description or the controls; a truncated line gets a hover
-        // tooltip with the full text.
-        bool val_row = (id == CMD_UPD_SOURCE || id == CMD_UPD_VER ||
-                        id == CMD_UPD_STATUS || id == CMD_STORE);
-        const char* how = e->how;
-        char howbuf[300];
-        if (!how) {
-            snprintf(howbuf, sizeof howbuf, "Saved in %s",
-                     g_set_file[0] ? g_set_file
-                                   : "memory only (not persisted)");
-            how = howbuf;
-        } else if (e->rebindable &&
-                   (e->key != e->dkey || e->mods != e->dmods)) {
-            // The chip shows the CURRENT key - once the user has moved it,
-            // name the default too so the original is never lost.
-            SetEnt d = *e;
-            d.key = e->dkey;
-            d.mods = e->dmods;
-            d.akey = 0;
-            d.amods = 0;
-            char db[40];
-            set_binding_of(&d, db, sizeof db);
-            snprintf(howbuf, sizeof howbuf, "%s  Default: %s.",
-                     e->how, db[0] ? db : "none");
-            how = howbuf;
-        }
-        int hpx = val_row ? L->text_med : L->text_small;
-        // Both layout modes share the slot right under the description:
-        // in stacked rows it sits ABOVE the control line, so the text
-        // can never run under a chip or switch.
-        int hy = r.y + SC(62);
-        char hbuf[240];
-        fit_text(how, hbuf, sizeof hbuf, tw, hpx);
-        text_px(hbuf, tx0, hy, hpx,
-                val_row ? mixc(P->dim, P->text, 0.55f)
-                        : mixc(P->dim, P->panel, 0.25f));
-        // hover tooltip: a cut-short bottom line (or description) shows
-        // its full text - the long settings path is never lost to "..."
-        if (row_hov && in->y >= hy - SC(4) && in->y < r.y + r.h &&
-            (int)measure_px(how, hpx) > tw) {
-            snprintf(tip_buf, sizeof tip_buf, "%s", how);
-            tip_px = hpx;
-        } else if (dmore && row_hov && in->y >= r.y + SC(24) &&
-                   in->y < hy - SC(4)) {
-            snprintf(tip_buf, sizeof tip_buf, "%s", e->desc);
-            tip_px = L->text_med;
-        }
-
-        // ---- right-hand controls, right to left: reset / switch / chip ----
-        bool is_btn = (e->kind == EK_ACTION && !e->rebindable && e->key == 0);
-        int ctl_y = stacked ? (r.y + r.h - SC(36)) : (r.y + (r.h - SC(26)) / 2);
-        int cxr = r.x + r.w - SC(12);
-        if (e->kind != EK_DOC && !is_btn) {
-            // reset is visually secondary and appears only once the
-            // setting actually differs from its default
-            bool mod = false;
-            if (e->kind == EK_OPTION && e->var) mod = (*e->var != e->dval);
-            if (e->kind == EK_ACTION && e->has_sw)
-                mod = mod || (e->on != e->don);
-            if (e->rebindable)
-                mod = mod || e->key != e->dkey || e->mods != e->dmods;
-            if (mod) {
-                RectI rb = {cxr - SC(58), ctl_y, SC(58), SC(26)};
+        // ---- controls, right to left ----
+        int ch = SC(24);
+        int cy = r.y + (r.h - ch) / 2;
+        int cxr = r.x + r.w - SC(10);
+        if (id == SROW_THEME) {
+            RectI dd = {cxr - SC(150), cy, SC(150), ch};
+            s_set_chip[v] = dd;
+            set_draw_dropdown(L, &dd, pal_name(g_pal_idx), false, in);
+            cxr = dd.x - SC(8);
+        } else if (id == SROW_LANG) {
+            RectI dd = {cxr - SC(150), cy, SC(150), ch};
+            s_set_chip[v] = dd;
+            lang_chip = dd;
+            set_draw_dropdown(L, &dd, TR_LANGS[g_name_lang].name,
+                              g_set_dd_open, in);
+            cxr = dd.x - SC(8);
+        } else if (id == SROW_SCALE) {
+            RectI tr = {cxr - SC(150), cy + ch / 2 - SC(3), SC(150), SC(6)};
+            s_scale_track = tr;
+            s_set_chip[v] = (RectI){tr.x - SC(4), cy, tr.w + SC(8), ch};
+            if (g_scale_drag && in->left_down) {
+                int t = in->x - (tr.x + SC(7));
+                int span = tr.w - SC(14);
+                int pct = span > 0
+                    ? UI_SCALE_MIN + (int)((long long)(UI_SCALE_MAX -
+                                                       UI_SCALE_MIN) * t / span)
+                    : 100;
+                ui_scale_set(pct);
+            }
+            rrect(tr.x, tr.y, tr.w, tr.h, SC(3), P->field, COLOR_BLACK, 0.0f);
+            int fw = (int)((long long)(g_ui_scale - UI_SCALE_MIN) *
+                           (tr.w - SC(14)) / (UI_SCALE_MAX - UI_SCALE_MIN)) +
+                     SC(7);
+            rrect(tr.x, tr.y, fw, tr.h, SC(3), P->accent, COLOR_BLACK, 0.0f);
+            bool th = inside(&s_set_chip[v], in->x, in->y) || g_scale_drag;
+            rrect(tr.x + fw - SC(7), tr.y - SC(4), SC(14), SC(14), SC(7),
+                  th ? P->paper : P->accent, COLOR_BLACK, 0.0f);
+            char pv[16];
+            snprintf(pv, sizeof pv, "%d%%", g_ui_scale);
+            text_right_px(pv, tr.x - SC(10), r.y + (r.h - L->text_small) / 2,
+                          L->text_small, P->text);
+            cxr = tr.x - SC(10) - SC(40);
+            if (g_ui_scale != 100) {
+                RectI rb = {cxr - SC(26), cy, SC(26), ch};
                 s_set_rst[v] = rb;
-                set_draw_button(L, &rb, "Reset", false, true, in);
-                cxr = rb.x - SC(8);
+                s_scale_rst = rb;
+                set_draw_reset_icon(&rb, in);
+                cxr = rb.x - SC(6);
             }
-        }
-        if (e->has_sw) {
-            RectI sw = {cxr - SC(44), ctl_y + SC(1), SC(44), SC(24)};
-            s_set_sw[v] = sw;
-            set_draw_switch(&sw,
-                            (e->kind == EK_OPTION && e->var) ? *e->var : e->on,
-                            true, in);
-            cxr = sw.x - SC(8);
-        }
-        char b[40];
-        set_binding_of(e, b, sizeof b);
-        if (is_btn) {
-            // Update actions are real buttons with real labels - never a
-            // fake "None" chip.  The single visible button does both
-            // jobs: check for an update, or - once a VERIFIED package
-            // is actually downloaded - install it (genuine states only).
-            const char* lbl = "Run";
-            bool primary = false, ready = true;
-            if (id == CMD_UPD_CHECK) {
-                bool up_ready = update_ready();
-                // Once a verified package is waiting, the button becomes
-                // the explicit action the user asked for: "Update Now".
-                lbl     = up_ready ? "Update Now" : "Check for updates";
-                primary = up_ready;
-            } else if (id == CMD_UPD_RESTART) {
-                lbl = "Restart to update";
-                ready = update_ready();
-                primary = ready;
-            } else if (id == CMD_UPD_NOTES) lbl = "Open notes";
-            RectI bb = {cxr - SC(150), ctl_y, SC(150), SC(26)};
-            s_set_chip[v] = bb;      // the row's ONE interactive rect
-            set_draw_button(L, &bb, lbl, primary, ready, in);
-        } else if (b[0] || e->rebindable) {
-            // a binding chip: the current key, the LIVE pending combo
-            // while the recorder is open for this row (feedback right on
-            // the row, matching the dialog's keycaps), "Not set" when
-            // unbound; dimmed for fixed rows.
-            char recb[40];
-            const char* chip;
-            if (g_set_cap == id) {
-                rec_pending_text(recb, sizeof recb);
-                chip = recb[0] ? recb : "Press keys...";
-            } else {
-                chip = (b[0])          ? b
-                     : (e->rebindable) ? "Not set"
-                                       : "-";
-            }
-            RectI ch = {cxr - SC(128), ctl_y, SC(128), SC(26)};
-            s_set_chip[v] = ch;
-            set_draw_chip(L, &ch, chip, g_set_cap == id, !e->rebindable, in);
-        }
-    }
-
-    // ---- hover tooltip for a truncated line (over the rows, clamped
-    //      inside the list so it never covers the footer or leaves) ----
-    if (tip_buf[0]) {
-        RectI body = {cx, ry0, cw, list_h};
-        set_tooltip(tip_buf, tip_px, in->x, in->y, &body);
-    }
-
-    // ---- footer: hint / status line + reset-all (two-step, destructive) ----
-    int fy2 = y + h - foot_h;
-    hline(x + SC(16), x + w - SC(16), fy2, P->border);
-    bool armed = tick_before(g_set_reset_arm);
-    s_set_resetall = (RectI){x + w - SC(20) - SC(180), fy2 + SC(10),
-                             SC(180), SC(28)};
-    set_draw_button(L, &s_set_resetall,
-                    armed ? "Click again to reset" : "Reset all to defaults",
-                    armed, true, in);
-    if (!armed && g_set_reset_arm != 0) g_set_reset_arm = 0;   // arming expired
-    const char* msg = g_set_msg[0] ? g_set_msg
-                     : (g_set_cap >= 0)
-                         ? "Shortcut editor: press your keys, then Save - Esc cancels, nothing is saved yet."
-                         : "Enter toggles a setting - Del edits a shortcut - changes save automatically";
-    char hb[220];
-    fit_text(msg, hb, sizeof hb, (s_set_resetall.x - SC(16)) - (x + SC(20)),
-             L->text_med);
-    text_px(hb, x + SC(20), fy2 + (foot_h - L->text_med) / 2, L->text_med,
-            g_set_msg[0] ? P->accent : P->dim);
-
-    // ---- wheel: over the sidebar scrolls the categories, elsewhere rows ----
-    // Swallowed while the recorder dialog is open - it is modal.
-    if (in->wheel != 0 && g_set_cap < 0) {
-        if (inside(&side_rect, in->x, in->y) && cat_max > 0) {
-            g_set_cat_scroll -= in->wheel * SC(36);
-            if (g_set_cat_scroll > cat_max) g_set_cat_scroll = cat_max;
-            if (g_set_cat_scroll < 0) g_set_cat_scroll = 0;
         } else {
-            g_set_scroll -= in->wheel * 3;
-            int maxs = g_set_row_n - s_set_vis;
-            if (maxs < 0) maxs = 0;
-            if (g_set_scroll > maxs) g_set_scroll = maxs;
-            if (g_set_scroll < 0) g_set_scroll = 0;
-            if (g_set_focus < g_set_scroll) g_set_focus = g_set_scroll;
-            if (g_set_focus >= g_set_scroll + s_set_vis)
-                g_set_focus = g_set_scroll + s_set_vis - 1;
-            if (g_set_focus < 0) g_set_focus = 0;
+            bool is_btn = (e->kind == EK_ACTION && !e->rebindable &&
+                           e->key == 0);
+            bool val_row = (id == CMD_UPD_SOURCE || id == CMD_UPD_VER ||
+                            id == CMD_UPD_STATUS || id == CMD_STORE);
+            if (e->has_sw) {
+                RectI sw = {cxr - SC(42), cy, SC(42), ch};
+                s_set_sw[v] = sw;
+                set_draw_switch(&sw,
+                                (e->kind == EK_OPTION && e->var) ? *e->var
+                                                                 : e->on,
+                                true, in);
+                cxr = sw.x - SC(8);
+            }
+            char b[40];
+            set_binding_of(e, b, sizeof b);
+            if (is_btn) {
+                const char* lbl = "Run";
+                bool primary = false, ready = true;
+                if (id == CMD_UPD_CHECK) {
+                    bool up_ready = update_ready();
+                    lbl = up_ready ? "Update Now" : "Check for updates";
+                    primary = up_ready;
+                } else if (id == CMD_UPD_RESTART) {
+                    lbl = "Restart to update";
+                    ready = update_ready();
+                    primary = ready;
+                } else if (id == CMD_UPD_NOTES) lbl = "Open notes";
+                RectI bb = {cxr - SC(150), cy, SC(150), ch};
+                s_set_chip[v] = bb;
+                set_draw_button(L, &bb, lbl, primary, ready, in);
+                cxr = bb.x - SC(8);
+            } else if (val_row) {
+                char vb[300];
+                if (!e->how)
+                    snprintf(vb, sizeof vb, "%s",
+                             g_set_file[0] ? g_set_file : "memory only");
+                else
+                    snprintf(vb, sizeof vb, "%s", e->how);
+                char vf[300];
+                int vw = cw / 2;
+                fit_text(vb, vf, sizeof vf, vw, L->text_small);
+                text_right_px(vf, cxr, r.y + (r.h - L->text_small) / 2,
+                              L->text_small, mixc(P->dim, P->text, 0.5f));
+                cxr -= (int)measure_px(vf, L->text_small) + SC(8);
+                if (row_hov && (int)measure_px(vb, L->text_small) > vw)
+                    snprintf(tip_buf, sizeof tip_buf, "%s", vb);
+            } else if (b[0] || e->rebindable) {
+                char recb[40];
+                const char* chip;
+                if (g_set_cap == id) {
+                    rec_pending_text(recb, sizeof recb);
+                    chip = recb[0] ? recb : "Press keys...";
+                } else {
+                    chip = b[0] ? b : (e->rebindable ? "Not set" : "-");
+                }
+                RectI cr = {cxr - SC(120), cy, SC(120), ch};
+                s_set_chip[v] = cr;
+                set_draw_chip(L, &cr, chip, g_set_cap == id, !e->rebindable,
+                              in);
+                cxr = cr.x - SC(8);
+            }
+            if (e->kind != EK_DOC && !is_btn) {   // back-to-default icon
+                bool mod = false;
+                if (e->kind == EK_OPTION && e->var) mod = (*e->var != e->dval);
+                if (e->kind == EK_ACTION && e->has_sw)
+                    mod = mod || (e->on != e->don);
+                if (e->rebindable)
+                    mod = mod || e->key != e->dkey || e->mods != e->dmods;
+                if (mod) {
+                    RectI rb = {cxr - SC(26), cy, SC(26), ch};
+                    s_set_rst[v] = rb;
+                    set_draw_reset_icon(&rb, in);
+                    cxr = rb.x - SC(6);
+                }
+            }
         }
+
+        // ---- name + one-line description ----
+        const char* nm = e ? e->name : SROWS[srow_index(id)].name;
+        const char* ds = e ? e->desc : SROWS[srow_index(id)].desc;
+        int tx0 = r.x + SC(10);
+        int tw = cxr - SC(8) - tx0;
+        if (tw < SC(60)) tw = SC(60);
+        int ny = r.y + (r.h - (L->text_med + SC(2) + L->text_small)) / 2;
+        char nb[128], db[300];
+        fit_text(nm, nb, sizeof nb, tw, L->text_med);
+        text_px(nb, tx0, ny, L->text_med, P->text);
+        fit_text(ds ? ds : "", db, sizeof db, tw, L->text_small);
+        text_px(db, tx0, ny + L->text_med + SC(2), L->text_small, P->dim);
+        // the full text on hover when the line had to be cut (or there is
+        // a usage note to add)
+        if (row_hov && in->x < tx0 + tw && !tip_buf[0] && ds) {
+            bool cut = (int)measure_px(ds, L->text_small) > tw;
+            const char* how = (e && e->how && !(id == CMD_UPD_SOURCE ||
+                               id == CMD_UPD_VER || id == CMD_UPD_STATUS))
+                                  ? e->how : NULL;
+            if (cut || how)
+                snprintf(tip_buf, sizeof tip_buf, "%s%s%s", ds,
+                         how ? "  " : "", how ? how : "");
+        }
+    }
+    if (tip_buf[0] && !g_set_dd_open) {
+        RectI body = {cx, ry0, cw, list_h};
+        set_tooltip(tip_buf, L->text_small, in->x, in->y, &body);
+    }
+
+    // ---- language dropdown (over the rows) ----
+    s_set_dd_panel = (RectI){0};
+    for (int i = 0; i < 16; i++) s_set_dd_item[i] = (RectI){0};
+    if (g_set_dd_open && lang_chip.w > 0) {
+        int n = TR_LANG_COUNT < 16 ? TR_LANG_COUNT : 16;
+        int ih = SC(26), pw = SC(200), ph = n * ih + SC(8);
+        int px = lang_chip.x + lang_chip.w - pw;
+        int py = lang_chip.y + lang_chip.h + SC(4);
+        if (py + ph > y + h - SC(6)) py = lang_chip.y - SC(4) - ph;
+        if (py < y + SC(6)) py = y + SC(6);
+        s_set_dd_panel = (RectI){px, py, pw, ph};
+        rrect(px, py, pw, ph, SC(6), P->panel, P->border, 1.0f);
+        for (int i = 0; i < n; i++) {
+            RectI it = {px + SC(4), py + SC(4) + i * ih, pw - SC(8), ih};
+            s_set_dd_item[i] = it;
+            bool cur = (i == g_name_lang);
+            bool hv = inside(&it, in->x, in->y);
+            if (hv || i == g_set_dd_sel)
+                rrect(it.x, it.y, it.w, it.h, SC(4), P->btn_hover,
+                      COLOR_BLACK, 0.0f);
+            if (cur) fill(it.x, it.y + SC(5), SC(3), it.h - SC(10), P->accent);
+            text_px(TR_LANGS[i].name, it.x + SC(12),
+                    it.y + (it.h - L->text_med) / 2, L->text_med, P->text);
+            if (i != TR_LANG_ORIGINAL)
+                text_right_px(TR_LANGS[i].tag, it.x + it.w - SC(8),
+                              it.y + (it.h - L->text_small) / 2,
+                              L->text_small, P->dim);
+        }
+    }
+
+    // ---- footer: key hints (or the status line) + reset all ----
+    hline(x + 1, x + w - 1, fy2, P->border);
+    bool armed = tick_before(g_set_reset_arm);
+    if (!armed && g_set_reset_arm != 0) g_set_reset_arm = 0;
+    const char* rlbl = armed ? "Click again to reset" : "Reset all";
+    int rbw = (int)measure_px(rlbl, L->text_small) + SC(24);
+    s_set_resetall = (RectI){x + w - SC(10) - rbw, fy2 + (foot_h - SC(24)) / 2,
+                             rbw, SC(24)};
+    set_draw_button(L, &s_set_resetall, rlbl, armed, true, in);
+    int fty2 = fy2 + (foot_h - L->text_small) / 2;
+    if (g_set_msg[0] || g_set_cap >= 0) {
+        const char* msg = g_set_msg[0] ? g_set_msg
+            : "Shortcut editor: press your keys, then Save - Esc cancels.";
+        char hb[220];
+        fit_text(msg, hb, sizeof hb, s_set_resetall.x - SC(16) - (x + SC(14)),
+                 L->text_small);
+        text_px(hb, x + SC(14), fty2, L->text_small,
+                g_set_msg[0] ? P->accent : P->dim);
+    } else {
+        // [Up] [Down] to navigate   [Enter] to use   [Escape] to dismiss
+        static const char* K[] = {"Up", "Down", "Enter", "Escape"};
+        static const char* T[] = {"", "to navigate", "to use", "to dismiss"};
+        int kh = SC(20);
+        int tot = 0;
+        for (int i = 0; i < 4; i++) {
+            int kw = (int)measure_px(K[i], L->text_small) + SC(14);
+            tot += kw + SC(4);
+            if (T[i][0]) tot += (int)measure_px(T[i], L->text_small) + SC(14);
+        }
+        int hx = x + (w - tot) / 2;
+        if (hx + tot > s_set_resetall.x - SC(8))
+            hx = s_set_resetall.x - SC(8) - tot;
+        if (hx < x + SC(10)) hx = x + SC(10);
+        int ky = fy2 + (foot_h - kh) / 2;
+        for (int i = 0; i < 4; i++) {
+            int kw = (int)measure_px(K[i], L->text_small) + SC(14);
+            rrect(hx, ky, kw, kh, SC(4), P->btn, P->border, 1.0f);
+            text_centered_px(K[i], &(RectI){hx, ky, kw, kh}, L->text_small,
+                             P->text);
+            hx += kw + SC(4);
+            if (T[i][0]) {
+                text_px(T[i], hx + SC(2), fty2, L->text_small, P->dim);
+                hx += (int)measure_px(T[i], L->text_small) + SC(14);
+            }
+        }
+    }
+
+    // ---- wheel scrolls the rows (not while a modal part is open) ----
+    if (in->wheel != 0 && g_set_cap < 0 && !g_set_dd_open) {
+        g_set_scroll -= in->wheel * 3;
+        int maxs = g_set_row_n - s_set_vis;
+        if (maxs < 0) maxs = 0;
+        if (g_set_scroll > maxs) g_set_scroll = maxs;
+        if (g_set_scroll < 0) g_set_scroll = 0;
+        if (g_set_focus < g_set_scroll) g_set_focus = g_set_scroll;
+        if (g_set_focus >= g_set_scroll + s_set_vis)
+            g_set_focus = g_set_scroll + s_set_vis - 1;
+        if (g_set_focus < 0) g_set_focus = 0;
     }
 
     // ---- shortcut recorder dialog (topmost inside the panel) ----
     draw_recorder(L, in);
 
-    // ---- clicks (modal: a click outside the panel closes it) ----
-    // The opener's click is consumed as the latch at the top of the
-    // function, so anything reaching here is a genuine new click.
+    // ---- clicks ----
     if (!click_ok) return;
-    // The recorder is MODAL inside the panel: only its own four buttons
-    // act, every other click (rows, sidebar, close X, outside) is
-    // swallowed so recording can only end through Save or Cancel - and a
-    // stray click can no longer close the panel with the dialog open.
+    // The recorder is MODAL inside the panel: only its own four buttons act.
     if (g_set_cap >= 0) {
         if (inside(&s_rec_btn[REC_BTN_CANCEL], in->x, in->y)) {
             rec_cancel();
@@ -13359,29 +13303,39 @@ static void draw_settings(const Layout* L, const InputState* in) {
         }
         if (inside(&s_rec_btn[REC_BTN_CLEAR], in->x, in->y) ||
             inside(&s_rec_btn[REC_BTN_RECORD], in->x, in->y)) {
-            rec_clear();               // drop the pending combo, keep live
+            rec_clear();
             return;
         }
         if (inside(&s_rec_btn[REC_BTN_SAVE], in->x, in->y)) {
-            rec_save();                // commits, or shows the reason not to
+            rec_save();
             return;
         }
-        return;                        // everything else is inert
+        return;
+    }
+    // The language dropdown: a pick, or any other click just closes it.
+    if (g_set_dd_open) {
+        for (int i = 0; i < 16; i++)
+            if (s_set_dd_item[i].w > 0 &&
+                inside(&s_set_dd_item[i], in->x, in->y)) {
+                name_lang_set(i);
+                snprintf(g_set_msg, sizeof(g_set_msg), "File names: %s",
+                         TR_LANGS[i].name);
+                break;
+            }
+        g_set_dd_open = false;
+        return;
     }
     if (!inside(&s_set_panel, in->x, in->y)) { g_set_open = false; return; }
     if (inside(&s_set_close, in->x, in->y)) { g_set_open = false; return; }
-    if (inside(&s_set_filter, in->x, in->y)) {
-        // place the caret where it was clicked (word-select on a
-        // double-click) and arm the drag, exactly like the main fields
-        field_click_caret(&s_set_filter, in, g_set_filter,
-                          &g_set_caret, &g_set_anchor,
-                          s_set_filter_tx, L->text_h);
-        g_text_drag = 3;
-        return;
-    }
     if (s_set_clear.w > 0 && inside(&s_set_clear, in->x, in->y)) {
         set_filter_clear();
         set_build_rows();
+        return;
+    }
+    if (inside(&s_set_filter, in->x, in->y)) {
+        field_click_caret(&s_set_filter, in, g_set_filter, &g_set_caret,
+                          &g_set_anchor, s_set_filter_tx, L->text_h);
+        g_text_drag = 3;
         return;
     }
     if (s_set_empty_clear.w > 0 && inside(&s_set_empty_clear, in->x, in->y)) {
@@ -13394,72 +13348,54 @@ static void draw_settings(const Layout* L, const InputState* in) {
          inside(&s_set_sb_track, in->x, in->y)))
         return;                              // handled in the draw section
     if (inside(&s_set_resetall, in->x, in->y)) {
-        // destructive and global: the first click ARMS, the second (a few
-        // seconds later) performs the reset - no silent wipe of a setup
         if (armed) {
             settings_defaults();
             g_set_reset_arm = 0;
             snprintf(g_set_msg, sizeof(g_set_msg),
                      "All settings are back to their defaults.");
         } else {
-            g_set_reset_arm = (unsigned)tick_in(4000);  // ~4s to confirm
+            g_set_reset_arm = (unsigned)tick_in(4000);
             snprintf(g_set_msg, sizeof(g_set_msg),
                      "This resets every setting - press the button again to confirm.");
         }
-        return;
-    }
-    // ---- Interface Scaling card: Reset first, then grab the track ----
-    if (s_scale_rst.w > 0 && inside(&s_scale_rst, in->x, in->y)) {
-        ui_scale_set(100);
-        settings_save();
-        snprintf(g_set_msg, sizeof(g_set_msg),
-                 "Interface scaling is back to 100%% (Default).");
-        return;
-    }
-    if (s_scale_track.w > 0 && inside(&s_scale_track, in->x, in->y)) {
-        g_scale_drag = true;         // live updates run in the draw pass
-        return;
-    }
-    // ---- Theme card: a click on a preview EXPLICITLY picks that theme ----
-    // Only the card the user actually clicks changes anything; the
-    // selection applies live, persists, and leaves Settings usable.
-    for (int i = 0; i < PAL_COUNT_N; i++) {
-        if (s_theme_card[i].w > 0 && inside(&s_theme_card[i], in->x, in->y)) {
-            theme_select(i);
-            snprintf(g_set_msg, sizeof(g_set_msg), "Theme: %s",
-                     pal_name(g_pal_idx));
-            return;
-        }
-    }
-    for (int i = 0; i < SCAT_COUNT; i++) {
-        if (!inside(&s_set_cat[i], in->x, in->y)) continue;
-        g_set_cat = i;
-        set_filter_clear();
-        g_set_focus = 0;
-        g_set_scroll = 0;
-        set_build_rows();
         return;
     }
     for (int v = 0; v < s_set_vis; v++) {
         int ri = g_set_scroll + v;
         if (ri >= g_set_row_n) break;
         int id = g_set_rows[ri];
-        const SetEnt* e = &g_ents[id];
         if (s_set_rst[v].w > 0 && inside(&s_set_rst[v], in->x, in->y)) {
-            set_reset(id);
-            snprintf(g_set_msg, sizeof(g_set_msg), "%s reset to its default.",
-                     e->name);
+            g_set_focus = ri;
+            if (id == SROW_SCALE) {
+                ui_scale_set(100);
+                settings_save();
+                snprintf(g_set_msg, sizeof(g_set_msg),
+                         "Interface size is back to 100%% (Default).");
+            } else if (id >= 0) {
+                set_reset(id);
+                snprintf(g_set_msg, sizeof(g_set_msg),
+                         "%s reset to its default.", g_ents[id].name);
+            }
             return;
         }
         if (s_set_sw[v].w > 0 && inside(&s_set_sw[v], in->x, in->y)) {
+            g_set_focus = ri;
             set_toggle(id);
             g_set_msg[0] = '\0';
             return;
         }
         if (s_set_chip[v].w > 0 && inside(&s_set_chip[v], in->x, in->y)) {
             g_set_focus = ri;
+            if (id == SROW_SCALE) { g_scale_drag = true; return; }
+            if (id < 0) {
+                srow_activate(id);
+                if (id == SROW_THEME)
+                    snprintf(g_set_msg, sizeof(g_set_msg), "Color scheme: %s",
+                             pal_name(g_pal_idx));
+                return;
+            }
+            const SetEnt* e = &g_ents[id];
             if (e->kind == EK_ACTION && !e->rebindable && e->key == 0) {
-                // update action buttons run for real; honest messages only
                 if (id == CMD_UPD_RESTART && !update_ready()) {
                     snprintf(g_set_msg, sizeof(g_set_msg),
                              "No verified update is downloaded yet.");
@@ -13472,7 +13408,7 @@ static void draw_settings(const Layout* L, const InputState* in) {
                     g_set_msg[0] = '\0';
                 return;
             }
-            set_start_capture();       // sets the hint or refuses fixed rows
+            set_start_capture();
             return;
         }
         if (inside(&s_set_row[v], in->x, in->y)) {
@@ -13902,7 +13838,7 @@ static void paint(void) {
     draw_search_popup(&L, in);   // per-pane search overlay (above the list)
     draw_addr_popup(&L, in);     // location-bar overlay (same global anchor)
 
-    draw_status(&L, in);
+    // (each pane drew its own bottom bar inside render_pane_tree)
     if (g_app.menu_open) draw_menu(&L, in);
     if (g_app.view_menu_open) draw_view_menu(&L, in);
     if (g_ctx_open) draw_ctx_menu(&L, in);
@@ -13984,6 +13920,21 @@ static int cmp_entry(const void* a, const void* b) {
     return r * g_sort_dir;
 }
 
+// The search box matches what the row SHOWS as well as the real name: with
+// names shown in English, typing "report" finds a Chinese "...report" file.
+static int entry_search_rank(const DirEntry* e) {
+    int r = search_rank(e->name, g_app.search_buf, g_search_case,
+                        g_search_broad, g_search_word);
+    char lbl[600];
+    const char* shown = entry_label(e, lbl, sizeof lbl);
+    if (shown && shown != e->name) {
+        int r2 = search_rank(shown, g_app.search_buf, g_search_case,
+                             g_search_broad, g_search_word);
+        if (r2 > r) r = r2;
+    }
+    return r;
+}
+
 static void rebuild_view(void) {
     if (g_app.view) {
         free(g_app.view);
@@ -14023,8 +13974,7 @@ static void rebuild_view(void) {
         size_t cnt[5] = {0, 0, 0, 0, 0};         // index by SRCH_* level
         int ranks_alloc = 0;
         for (size_t i = 0; i < g_app.count; i++) {
-            int r = search_rank(g_app.entries[i].name, g_app.search_buf,
-                                g_search_case, g_search_broad, g_search_word);
+            int r = entry_search_rank(&g_app.entries[i]);
             if (r <= SRCH_NONE) continue;
             cnt[r]++;
             ranks_alloc++;
@@ -14041,8 +13991,7 @@ static void rebuild_view(void) {
         for (int r = SRCH_EXACT; r >= SRCH_WORD; r--) { off[r] = pos; pos += cnt[r]; }
         n = pos;
         for (size_t i = 0; i < g_app.count; i++) {
-            int r = search_rank(g_app.entries[i].name, g_app.search_buf,
-                                g_search_case, g_search_broad, g_search_word);
+            int r = entry_search_rank(&g_app.entries[i]);
             if (r <= SRCH_NONE) continue;
             v[off[r]++] = (int)i;
         }
@@ -16838,14 +16787,15 @@ static void toggle_hidden(void) {
 static void run_menu(int i) {
     g_app.menu_open = false;
     switch (i) {
-        case 0: ws_new(g_app.current_path); break;   // duplicate the folder
-        case 1: bookmark_current(); break;
-        case 2: folder_refresh_keep(); set_status("Refreshed"); break;
-        case 3: toggle_hidden(); break;
-        case 4: navigate(platform_get_home_directory(), true); break;
-        case 5: pane_split_right(); break;
-        case 6: pane_close_active(); break;
-        case 7: g_app.running = false; break;
+        case 0: settings_open(); break;
+        case 1: ws_new(g_app.current_path); break;   // duplicate the folder
+        case 2: bookmark_current(); break;
+        case 3: folder_refresh_keep(); set_status("Refreshed"); break;
+        case 4: toggle_hidden(); break;
+        case 5: navigate(platform_get_home_directory(), true); break;
+        case 6: pane_split_right(); break;
+        case 7: pane_close_active(); break;
+        case 8: g_app.running = false; break;
         default: break;
     }
 }
@@ -20539,8 +20489,7 @@ static void draw_tooltips(const Layout* L, const InputState* in) {
     struct { const RectI* r; char text[96]; } t[12];
     int n = 0;
 #define TIP(rect, ...) do { t[n].r = (rect); snprintf(t[n].text, sizeof t[n].text, __VA_ARGS__); n++; } while (0)
-    TIP(&L->menu_btn, "Menu");
-    TIP(&L->set_btn, "Settings  (%s)", kb(CMD_SET_OPEN));
+    TIP(&L->menu_btn, "Menu and Settings  (%s)", kb(CMD_SET_OPEN));
     TIP(&L->side_btn, "%s sidebar  (%s)", g_opt_sidebar ? "Hide" : "Show", kb(CMD_SIDEBAR));
     TIP(&L->new_tab_btn, "New tab  (%s)", kb(CMD_NEW_TAB));
     TIP(&L->nav_btns[0], "Back  (Alt+Left)");
@@ -21274,6 +21223,18 @@ static void handle_mouse(const Layout* L, InputState* in) {
     }
 
     // ---- view mode popup: swallows every click until it closes ----
+    if (g_app.view_menu_open && g_view_menu_lang) {
+        if (in->left_click) {
+            for (int i = 0; i < TR_LANG_COUNT && i < 16; i++)
+                if (inside(&L->lang_items[i], in->x, in->y)) {
+                    name_lang_set(i);
+                    break;
+                }
+            g_app.view_menu_open = false;              // pick or click outside
+            g_view_menu_lang = false;
+        }
+        return;
+    }
     if (g_app.view_menu_open) {
         if (in->left_click) {
             int picked = -1;
@@ -21988,7 +21949,15 @@ static void handle_mouse(const Layout* L, InputState* in) {
         blur_fields();
 
         // right side buttons
-        if (inside(&L->hidden_btn, in->x, in->y)) { toggle_hidden(); return; }
+        if (L->hidden_btn.w > 0 && inside(&L->hidden_btn, in->x, in->y)) {
+            toggle_hidden();
+            return;
+        }
+        if (L->lang_btn.w > 0 && inside(&L->lang_btn, in->x, in->y)) {
+            g_view_menu_lang = true;              // the name-language list
+            g_app.view_menu_open = true;
+            return;
+        }
         if (inside(&L->zoom_lbl, in->x, in->y)) {
             g_zoom_pop_until = tick_in(1700);   // % half pops the slider
             return;
@@ -21996,10 +21965,12 @@ static void handle_mouse(const Layout* L, InputState* in) {
         if (inside(&L->view_btn, in->x, in->y)) {
             // Round 12: the chevron still opens the list; a plain click on
             // the button just steps to the next view automatically.
-            RectI vc = {L->view_btn.x + SC(96) - SC(16), L->view_btn.y,
-                        SC(18), L->view_btn.h};
-            if (inside(&vc, in->x, in->y))
+            RectI vc = {L->view_btn.x + L->view_name_w - SC(16),
+                        L->view_btn.y, SC(18), L->view_btn.h};
+            if (L->view_name_w > 0 && inside(&vc, in->x, in->y)) {
+                g_view_menu_lang = false;
                 g_app.view_menu_open = true;
+            }
             else
                 cycle_view();
             return;
@@ -22981,6 +22952,14 @@ static void session_parse_leaf(SESS_WS* sw, const char* path) {
     // break the restore (spec: skip bad folders, sensible defaults).
     snprintf(leaf->folder.current_path, sizeof(leaf->folder.current_path),
              "%s", dir_exists(path) ? path : platform_get_home_directory());
+    // A snapshot stores PATHS only, and calloc left every view field at 0 -
+    // sort_dir 0 made cmp_entry() return 0 for every pair, so a restored
+    // pane came up in a random order (and stayed that way until a manual
+    // sort).  Give it the same defaults a fresh pane has.
+    leaf->folder.sort_key = SORT_NAME;
+    leaf->folder.sort_dir = 1;
+    leaf->folder.selected = -1;
+    leaf->folder.zoom = g_zoom > 0.01f ? g_zoom : 0.6f;
     sw->stack[sw->sp++] = leaf;
 }
 
@@ -23036,8 +23015,29 @@ static void pane_load_restored(Pane* p) {
         p->folder.load_state = LOAD_ERROR;          // NOT an empty folder
         return;
     }
+    // filter_entries() and cmp_entry() work on the ACTIVE pane's globals
+    // (bottom-bar counts, sort key/direction): run them for THIS pane and
+    // put the active pane's values back, so a background load can never
+    // overwrite the counts the active pane shows or sort with its order.
+    unsigned keep_fo = g_folder_count, keep_fi = g_file_count,
+             keep_hi = g_hidden_total;
+    int keep_sk = g_sort_key, keep_sd = g_sort_dir;
+    if (p->folder.sort_dir == 0) {                  // never sorted: defaults
+        p->folder.sort_key = SORT_NAME;
+        p->folder.sort_dir = 1;
+    }
+    g_sort_key = p->folder.sort_key;
+    g_sort_dir = p->folder.sort_dir;
     filter_entries(entries, &count);                // hidden / system out
     if (count > 1) qsort(entries, count, sizeof(DirEntry), cmp_entry);
+    p->folder.folder_count = g_folder_count;
+    p->folder.file_count = g_file_count;
+    p->folder.hidden_total = g_hidden_total;
+    g_folder_count = keep_fo;
+    g_file_count = keep_fi;
+    g_hidden_total = keep_hi;
+    g_sort_key = keep_sk;
+    g_sort_dir = keep_sd;
     for (size_t i = 0; i < count; i++) {            // fresh cache memos
         entries[i].icon_idx = -1;
         entries[i].tbmp_idx = -1;
@@ -23055,6 +23055,35 @@ static void pane_load_restored(Pane* p) {
         p->folder.view = v;
         p->folder.view_count = (int)count;
     }
+}
+
+// A background pane whose folder could not be read at startup (a drive
+// still spinning up, a network share not connected yet) used to sit on
+// "Cannot open folder" until the user clicked into it and refreshed.  Every
+// ~1.5 s, for the first minute, each such pane (every tab, never the active
+// one - load_retry_pump owns that) is simply read again.
+static int g_bg_retry_left = 40;
+static DWORD g_bg_retry_at = 0;
+static int pane_retry_failed(Pane* p) {
+    if (!p) return 0;
+    if (p->kind != PN_LEAF)
+        return pane_retry_failed(p->left) + pane_retry_failed(p->right);
+    if (p == g_active_pane || p->folder.entries || !p->folder.current_path[0])
+        return 0;
+    pane_load_restored(p);
+    return p->folder.entries ? 0 : 1;           // still failing?
+}
+static Pane* ws_root(int i);
+static void bg_retry_pump(void) {
+    if (g_bg_retry_left <= 0) return;
+    DWORD now = GetTickCount();
+    if (g_bg_retry_at && (int)(now - g_bg_retry_at) < 0) return;
+    g_bg_retry_at = now + 1500;
+    g_bg_retry_left--;
+    int failing = 0;
+    for (int i = 0; i < g_ws_n; i++)
+        failing += pane_retry_failed(i == g_ws_cur ? g_pane_root : ws_root(i));
+    if (failing == 0) g_bg_retry_left = 0;      // all loaded: stop polling
 }
 
 // Walk a pane tree and load every leaf that still has no listing.
@@ -23346,6 +23375,16 @@ static bool app_init(void) {
     settings_init();
     printf("[OK] Settings: %d entries | store %s\n", CMD_COUNT,
            g_set_file[0] ? g_set_file : "memory only");
+
+    // Name translation (display only): cache next to the settings.
+    // NOVA_TRANSLATE_DISABLE=1 keeps a test run fully offline.
+    {
+        char tv[8], tdir[1200];
+        if (GetEnvironmentVariableA("NOVA_TRANSLATE_DISABLE", tv,
+                                    (DWORD)sizeof tv) == 0 &&
+            ct_app_dir(tdir, sizeof tdir))
+            tr_init(tdir, platform_wake);
+    }
 
     // Session snapshot path: resolved AFTER settings so the switch's
     // load-time apply() sees an empty path and can never delete a live
@@ -32048,7 +32087,7 @@ static void run_selftest(void) {
                 S_EXP(before[0] && strcmp(before,
                                           platform_get_home_directory()) != 0,
                       "new tab: C:\\Windows is the active folder");
-                run_menu(0);                      // the hamburger's New tab
+                run_menu(1);                      // the menu's New tab
                 S_EXP(g_ws_n == sav_ws_n + 1, "new tab: one tab is added");
                 S_EXP(g_ws_cur != ws0, "new tab: the new tab becomes active");
                 snprintf(newp, sizeof newp, "%s", g_app.current_path);
@@ -32184,11 +32223,11 @@ static void run_selftest(void) {
             // the panel: opens, lists the category, filters, Escape closes
             g_set_cat = SCAT_GENERAL;
             settings_open();
-            int n_general = 0;
+            int n_listed = SROW_N;
             for (int i = 0; i < CMD_COUNT; i++)
-                if (g_ents[i].cat == SCAT_GENERAL) n_general++;
-            S_EXP(g_set_open && g_set_row_n == n_general,
-                  "settings: the panel opens showing exactly its category");
+                if (!g_ents[i].hidden) n_listed++;
+            S_EXP(g_set_open && g_set_row_n == n_listed,
+                  "settings: the panel opens listing every setting");
             const char* q = "view";
             for (const char* p = q; *p; p++) {
                 InputState f2;
@@ -32213,6 +32252,8 @@ static void run_selftest(void) {
             // owns the keyboard.
             settings_open();
             g_set_focus = 0;
+            for (int i = 0; i < g_set_row_n; i++)
+                if (g_set_rows[i] == CMD_SET_OPEN) { g_set_focus = i; break; }
             set_start_capture();
             S_EXP(g_set_cap == CMD_SET_OPEN,
                   "settings: capture mode starts on the focused row");
@@ -32456,11 +32497,17 @@ static void run_selftest(void) {
         g_drag_split = false;
         g_sort_pending = -1;
 
-        // 1) click the gear: Settings must open AND survive this frame
+        // 1) click the gear (menu + Settings button), then its Settings
+        //    item: Settings must open AND survive this frame
         memset(real, 0, sizeof *real);
         real->left_click = true;
-        real->x = L.set_btn.x + L.set_btn.w / 2;
-        real->y = L.set_btn.y + L.set_btn.h / 2;
+        real->x = L.menu_btn.x + L.menu_btn.w / 2;
+        real->y = L.menu_btn.y + L.menu_btn.h / 2;
+        handle_mouse(&L, real);
+        memset(real, 0, sizeof *real);
+        real->left_click = true;
+        real->x = L.menu_items[0].x + L.menu_items[0].w / 2;
+        real->y = L.menu_items[0].y + L.menu_items[0].h / 2;
         handle_mouse(&L, real);
         bool gopen = g_set_open;
         paint();                       // exactly like app_run(): same frame
@@ -33670,6 +33717,9 @@ static FolderView folder_view_from_app(void) {
     fv.search_focused = g_app.search_focused;
     fv.addr_focused = g_app.addr_focused;
     fv.zoom = g_app.zoom;              // per-pane icon size (live value)
+    fv.folder_count = g_folder_count;
+    fv.file_count = g_file_count;
+    fv.hidden_total = g_hidden_total;
     fv.entries = g_app.entries;
     return fv;
 }
@@ -33708,6 +33758,9 @@ static void app_push_folder(const FolderView* fv) {
     // here - a render swap of an inactive pane must never disturb it; only a
     // real activation (activate_pane) re-syncs g_zoom.
     g_app.zoom = (fv->zoom > 0.01f) ? fv->zoom : 0.6f;
+    g_folder_count = fv->folder_count;
+    g_file_count = fv->file_count;
+    g_hidden_total = fv->hidden_total;
     // NOTE: the theme (light) is deliberately NOT pushed: it is global,
     // and a pane that stored an older value would flip the palette on
     // every pane switch. The sort mirrors cmp_entry reads are pushed.
@@ -34266,6 +34319,7 @@ static void pane_close_active(void) {
 static void pane_list_metrics(Layout* L, RectI rect) {
     rect.y += PANE_TITLE_H;               // the pane's title strip sits
     rect.h -= PANE_TITLE_H;               // above its list ...
+    rect.h -= SC(STATUS_H);               // ... and its own bottom bar below
     if (rect.h < L->list_head_h) rect.h = L->list_head_h;
     L->list = rect;
     // Per-pane icon zoom (Phase 4): recompute the zoom-derived metrics from
@@ -34556,6 +34610,23 @@ static void render_pane_view(Pane* p, const Layout* win) {
     if (g_mq_on && p == g_mq_pane) draw_marquee(&L);   // selection box
     renderer_reset_scissor(g_app.renderer);
     draw_scrollbar(&L);
+
+    // ---- this pane's own bottom bar (counts, Hidden, view + zoom) ----
+    {
+        Layout SL = L;
+        status_metrics(&SL, pane_status_rect(p));
+        draw_status(&SL, in, p == g_active_pane);
+    }
+
+    // ---- focus: the active pane stays at full brightness, every other
+    //      pane is dimmed, so it is obvious at a glance which pane the
+    //      keyboard, the toolbar and the menus act on (split view only) ----
+    if (total > 1 && p != g_active_pane) {
+        RectI b = pane_body_rect(p);
+        Color dim = P->bg;
+        dim.a = 0.42f;
+        fill(b.x, b.y + PANE_TITLE_H, b.w, b.h - PANE_TITLE_H, dim);
+    }
 
     if (swapped) app_push_folder(&keep);   // hand g_app back to the active pane
 }
@@ -35007,7 +35078,7 @@ static void app_run(bool selftest) {
         // Re-attempt a folder that failed to open (bounded, only the active
         // pane's path) so a not-yet-ready drive fills in instead of sitting
         // there looking empty.
-        if (!selftest) load_retry_pump();
+        if (!selftest) { load_retry_pump(); bg_retry_pump(); }
         // Perform a DUE child-list read for the location popup (armed by
         // sug_sync() when the target folder changed).  Running it here - one
         // frame after the arm - is what lets the panel paint its real
@@ -35061,8 +35132,14 @@ static void app_run(bool selftest) {
 
         if (selftest && ++frames >= 3) break;
         if (hot && !minimized) {
-            // Full rate: the same 16 ms frame cadence as before.
-            g_app.platform->sleep(16);
+            // Full rate: ~60 frames a second, but the wait ends the moment
+            // input arrives (MsgWaitForMultipleObjects), and the time the
+            // frame itself took is subtracted.  The old blind Sleep(16)
+            // added 16 ms on top of every paint and let clicks, keys and
+            // wheel steps sit in the queue meanwhile - the "slow" feel.
+            int spent = (int)(GetTickCount() - now);
+            int wait = 16 - spent;
+            if (wait > 0) platform_wait(wait);
         } else {
             // Idle: sleep until input / a worker wakes us, or the next
             // heartbeat is due (minimized: nothing to draw, long wait).

@@ -93,6 +93,65 @@ static int g_af_w = 0, g_af_h = 0;
 static COLORREF g_af_key = 0;     // colour currently stored in the DIB
 static bool g_af_filled = false;
 
+// ---- app strings -> UTF-16 for GDI -------------------------------------
+// Every string the app hands the renderer is in the process code page,
+// which the manifest sets to UTF-8 (activeCodePage).  The *A GDI text
+// calls do NOT honour that setting: GDI converts with its own ANSI page
+// (e.g. Windows-1252), so a Chinese, Urdu, Russian... file name came out
+// as mojibake (three Latin-1 letters per Chinese character).  Converting here with CP_ACP (UTF-8 under the
+// manifest, the classic ANSI page on Windows that ignore it) and calling
+// the *W functions draws every script; GDI's font linking and the
+// complex-script layer then pick fallback fonts, join Arabic/Urdu
+// letters and order right-to-left runs.  Invalid bytes (an old ANSI name
+// that is not UTF-8) fall back to the user's legacy page, never "?".
+typedef struct {
+    WCHAR* w;
+    int n;
+    WCHAR stack[512];
+} WideText;
+
+static bool wide_text(const char* s, WideText* out) {
+    out->w = out->stack;
+    out->n = 0;
+    if (!s || !s[0]) return false;
+    int len = (int)strlen(s);
+    static UINT legacy = 0;               // user's classic ANSI page
+    if (!legacy) {
+        char cpn[8] = "";
+        legacy = 1252;
+        if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_IDEFAULTANSICODEPAGE,
+                           cpn, sizeof cpn) > 0 && atoi(cpn) > 0)
+            legacy = (UINT)atoi(cpn);
+    }
+    bool utf8 = GetACP() == CP_UTF8;
+    UINT cps[2] = {CP_ACP, utf8 ? legacy : CP_ACP};
+    for (int k = 0; k < 2; k++) {
+        DWORD fl = (k == 0 && utf8) ? MB_ERR_INVALID_CHARS : 0;
+        int need = MultiByteToWideChar(cps[k], fl, s, len, NULL, 0);
+        if (need <= 0) continue;
+        WCHAR* buf = out->stack;
+        if (need > (int)(sizeof(out->stack) / sizeof(WCHAR))) {
+            buf = (WCHAR*)malloc(sizeof(WCHAR) * (size_t)need);
+            if (!buf) return false;
+        }
+        int n = MultiByteToWideChar(cps[k], fl, s, len, buf, need);
+        if (n <= 0) {
+            if (buf != out->stack) free(buf);
+            continue;
+        }
+        out->w = buf;
+        out->n = n;
+        return true;
+    }
+    return false;
+}
+
+static void wide_text_free(WideText* t) {
+    if (t->w && t->w != t->stack) free(t->w);
+    t->w = t->stack;
+    t->n = 0;
+}
+
 // ---- font cache: one HFONT per pixel size (DPI scaling needs this) ----
 // 16 slots: DPI steps x the Interface Scaling slider (75-150%) produce
 // more distinct pixel sizes than the fixed DPI steps used to.
@@ -501,7 +560,11 @@ void renderer_draw_text(RendererContext* ctx, const char* text, float x, float y
 
     SetTextColor(g_mem_dc, to_colorref(color));
     SetBkMode(g_mem_dc, TRANSPARENT);
-    TextOutA(g_mem_dc, (int)x, (int)y, text, (int)strlen(text));
+    WideText wt;
+    if (wide_text(text, &wt)) {
+        TextOutW(g_mem_dc, (int)x, (int)y, wt.w, wt.n);
+        wide_text_free(&wt);
+    }
 
     if (old) SelectObject(g_mem_dc, old);
 }
@@ -534,7 +597,11 @@ float renderer_text_width(RendererContext* ctx, const char* text, float font_siz
     HFONT use = font_for((int)(font_size + 0.5f));
     HFONT old = (HFONT)SelectObject(dc, use);
     SIZE sz = {0, 0};
-    GetTextExtentPoint32A(dc, text, (int)len, &sz);
+    WideText wt;
+    if (wide_text(text, &wt)) {
+        GetTextExtentPoint32W(dc, wt.w, wt.n, &sz);
+        wide_text_free(&wt);
+    }
     if (old) SelectObject(dc, old);
     return (float)sz.cx;
 }

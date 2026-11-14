@@ -22,7 +22,7 @@ Option 3:            make            (or: make run / make clean)
 
 The result is always:
 
-                         build\NovaFile.exe        (~955 KB)
+                         build\NovaFile.exe        (~790 KB)
 
 APP ICON
 --------

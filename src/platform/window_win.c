@@ -895,7 +895,14 @@ DirEntry* get_directory_entries_impl(const char* path, size_t* count) {
     // SHGetFileInfo) REFUSES such paths - every folder then fell back to the
     // drawn placeholder (the "flat yellow folders" report).
     const char* sep = path_sep(path);
+    const size_t pl = strlen(path), sl = strlen(sep);
 
+    // Speed (a DirEntry is ~1.3 KB, mostly fixed name/path buffers): only
+    // the bytes a row really uses are written.  The old code zeroed every
+    // new half of the array on growth and strncpy() padded each name
+    // buffer to 256 bytes - for a 20,000-item folder that was a large part
+    // of the listing time.  Every field is still set below (the tails past
+    // each string's NUL are never read).
     do {
         if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0)
             continue;
@@ -903,17 +910,25 @@ DirEntry* get_directory_entries_impl(const char* path, size_t* count) {
             size_t new_cap = cap * 2;
             DirEntry* grown = (DirEntry*)realloc(entries, new_cap * sizeof(DirEntry));
             if (!grown) break;
-            // Zero the new half so unused entries stay clean.
-            memset(grown + cap, 0, (new_cap - cap) * sizeof(DirEntry));
             entries = grown;
             cap = new_cap;
         }
 
         DirEntry* e = &entries[ec];
-        strncpy(e->name, fd.cFileName, sizeof(e->name) - 1);
-        e->name[sizeof(e->name) - 1] = '\0';
+        size_t nl = strlen(fd.cFileName);
+        if (nl > sizeof(e->name) - 1) nl = sizeof(e->name) - 1;
+        memcpy(e->name, fd.cFileName, nl);
+        e->name[nl] = '\0';
 
-        snprintf(e->path, sizeof(e->path), "%s%s%s", path, sep, e->name);
+        if (pl + sl + nl < sizeof(e->path)) {
+            memcpy(e->path, path, pl);
+            memcpy(e->path + pl, sep, sl);
+            memcpy(e->path + pl + sl, e->name, nl + 1);
+        } else {
+            snprintf(e->path, sizeof(e->path), "%s%s%s", path, sep, e->name);
+        }
+        e->depth = 0;
+        e->icon_idx = e->tbmp_idx = e->ct_tbmp_idx = 0;
 
         e->size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
         e->is_directory = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;

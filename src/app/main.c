@@ -230,6 +230,10 @@ typedef struct {
     // (animating) value; this field is the stored value for every pane and
     // is what an inactive pane renders from (swapped into g_app.zoom).
     float zoom;
+    // Per-pane Details column widths (Size / Modified / Type, 96-DPI px).
+    // Dragging a divider changes ONLY the pane it was dragged in; 0 = not
+    // set yet, the pane uses g_col_w (the last width the user chose).
+    int col_w[3];
     // Per-pane bottom bar counts (folders / files / hidden of THIS pane's
     // folder).  The g_folder_count trio is the active pane's live copy;
     // these travel with the view so every pane's bar shows its own folder.
@@ -601,6 +605,7 @@ typedef struct {
     char label[80];
     char path[1024];
     bool is_file;            // open with the OS instead of navigating
+    unsigned long long disk_total, disk_free;   // Storage drive rows only
     RectI rect;
 } SideRow;
 
@@ -704,6 +709,7 @@ typedef struct {
     int sort_dir;            // +1 / -1
     float zoom;              // THIS pane's icon zoom (mirrors FolderView.zoom;
                              // g_zoom is the active pane's animating copy)
+    int col_w[3];            // THIS pane's Details column widths (0 = g_col_w)
 
     char history[MAX_HISTORY][1024];
     int history_count;
@@ -769,6 +775,8 @@ typedef enum {
 static bool g_drag_split = false;
 static bool g_drag_split_armed = false;   // pressed in a pane, might drag
 static int g_drag_start_x = 0, g_drag_start_y = 0;
+static int g_col_drag = -1;             // header divider being dragged
+static int g_col_drag_x0 = 0, g_col_drag_w0 = 0;
 static int g_sort_pending = -1;         // held header press: sort column,
                                         // applied when the click completes
 static Pane* g_drag_pane = NULL;        // the pane captured at drag start
@@ -1458,6 +1466,11 @@ static bool g_opt_restore = true;     // Restore Previous Session (startup)
 // Display only - the real name is never changed and every operation
 // (open, rename, copy, search on disk) keeps using it.
 static int g_name_lang = TR_LANG_ENGLISH;
+// Details column widths (Size / Modified / Type), see col_metrics().
+static const int COL_DEF[3] = {104, 160, 92};
+static int g_col_w[3] = {104, 160, 92};
+static const int COL_MIN[3] = {48, 70, 80};   // Type: text + the star
+#define COL_MAX 480
 // The bottom-bar popup (g_app.view_menu_open) shows either the view modes
 // or, when opened from the language chip, the name languages.
 static bool g_view_menu_lang = false;
@@ -2361,6 +2374,7 @@ static bool set_rebind(int id, int key, unsigned mods,
 }
 
 // ---- persistence ----
+static int col_w_of(int k);   // per-pane Details column width (below)
 static void settings_save(void) {
     if (!g_set_file[0]) return;
     char tmp[1400];
@@ -2384,6 +2398,10 @@ static void settings_save(void) {
     // way - the command table only stores booleans.  Older builds skip
     // the unknown id; a missing line keeps the Midnight default.
     fprintf(f, "palette\t%d\t0\t1\n", g_pal_idx);
+    // Details column widths (Size, Modified, Type): own line.
+    // The ACTIVE pane's widths: the next start begins with the layout the
+    // user last set up.
+    fprintf(f, "cols\t%d\t%d\t%d\n", col_w_of(0), col_w_of(1), col_w_of(2));
     // Name language (bottom bar language chip): own line, like palette.
     fprintf(f, "name_lang\t%s\t0\t1\n",
             g_name_lang == TR_LANG_ORIGINAL ? "orig"
@@ -2428,6 +2446,16 @@ static void settings_load(void) {
             if (end2 && (*end2 == '\0' || *end2 == '\t') &&
                 pi >= 0 && pi < PAL_COUNT_N)
                 g_pal_idx = (int)pi;
+            continue;
+        }
+        // Details column widths: "cols<TAB>size<TAB>modified<TAB>type".
+        if (strncmp(line, "cols\t", 5) == 0) {
+            int a = 0, b = 0, c = 0;
+            if (sscanf(line + 5, "%d\t%d\t%d", &a, &b, &c) == 3) {
+                int v[3] = {a, b, c};
+                for (int k = 0; k < 3; k++)
+                    if (v[k] >= COL_MIN[k] && v[k] <= COL_MAX) g_col_w[k] = v[k];
+            }
             continue;
         }
         // Name language: "name_lang<TAB>code".  An unknown code keeps the
@@ -3546,6 +3574,159 @@ static bool fs_rename(const char* old_path, const char* new_name_in,
     return true;
 }
 
+// ---- parallel file engine: permanent delete + folder copy ----------------
+// One file at a time on one thread left the disk idle most of the time:
+// 5000 small files took ~3.4 s to copy.  The walk (folder creation, listing)
+// stays on the calling thread, in the same order as before; the per-file
+// work (CopyFile / DeleteFile) goes to a bounded queue that a few threads
+// drain together.  The queue is flushed every FSQ_CAP files, so memory
+// stays small even for a million-file tree.  First error wins and stops
+// the job, like the old serial code.
+#define FSQ_CAP 2048
+typedef struct {
+    char* a[FSQ_CAP];            // source (copy) or target (delete)
+    char* b[FSQ_CAP];            // copy destination (copy only)
+    int n;
+    volatile LONG next;
+    volatile LONG failed;
+    volatile LONG* cancel;       // NULL = not cancellable
+    bool copy;
+    char err[256];
+} FsQueue;
+
+static bool fsq_stop(FsQueue* q) {
+    return q->failed ||
+           (q->cancel && InterlockedCompareExchange(q->cancel, 0, 0));
+}
+static void fsq_fail(FsQueue* q, const char* msg) {
+    if (InterlockedExchange(&q->failed, 1) == 0)
+        snprintf(q->err, sizeof q->err, "%s", msg);
+}
+// DeleteFile refuses read-only files; Explorer clears the flag first.
+static bool fsq_delete_file(const char* p) {
+    if (DeleteFileA(p)) return true;
+    if (GetLastError() != ERROR_ACCESS_DENIED) return false;
+    DWORD a = GetFileAttributesA(p);
+    if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_READONLY))
+        return false;
+    if (!SetFileAttributesA(p, a & ~(DWORD)FILE_ATTRIBUTE_READONLY))
+        return false;
+    return DeleteFileA(p) != 0;
+}
+static DWORD WINAPI fsq_worker(LPVOID arg) {
+    FsQueue* q = (FsQueue*)arg;
+    for (;;) {
+        if (fsq_stop(q)) break;
+        LONG i = InterlockedIncrement(&q->next) - 1;
+        if (i >= q->n) break;
+        char m[256];
+        if (q->copy) {
+            if (!CopyFileA(q->a[i], q->b[i], TRUE)) {   // TRUE: never overwrite
+                snprintf(m, sizeof m, "Copy of \"%s\" failed (error %lu)",
+                         file_name_of(q->a[i]), GetLastError());
+                fsq_fail(q, m);
+            }
+        } else if (!fsq_delete_file(q->a[i])) {
+            snprintf(m, sizeof m, "Could not delete \"%s\" (in use?)",
+                     file_name_of(q->a[i]));
+            fsq_fail(q, m);
+        }
+    }
+    return 0;
+}
+static void fsq_flush(FsQueue* q) {
+    if (q->n > 0) {
+        q->next = 0;
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        int want = (int)si.dwNumberOfProcessors;
+        if (want > 8) want = 8;
+        if (want > q->n / 8) want = q->n / 8;   // tiny batch: fewer threads
+        if (want < 1) want = 1;
+        HANDLE th[8];
+        int nt = 0;
+        for (int t = 1; t < want; t++) {
+            th[nt] = CreateThread(NULL, 64 * 1024, fsq_worker, q,
+                                  STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+            if (th[nt]) nt++;
+        }
+        fsq_worker(q);                          // this thread works too
+        if (nt) WaitForMultipleObjects((DWORD)nt, th, TRUE, INFINITE);
+        for (int t = 0; t < nt; t++) CloseHandle(th[t]);
+    }
+    for (int i = 0; i < q->n; i++) {
+        free(q->a[i]);
+        free(q->b[i]);
+        q->a[i] = q->b[i] = NULL;
+    }
+    q->n = 0;
+}
+static void fsq_push(FsQueue* q, const char* a, const char* b) {
+    char* x = _strdup(a);
+    char* y = b ? _strdup(b) : NULL;
+    if (!x || (b && !y)) {
+        free(x);
+        free(y);
+        fsq_fail(q, "Out of memory");
+        return;
+    }
+    q->a[q->n] = x;
+    q->b[q->n] = y;
+    if (++q->n == FSQ_CAP) fsq_flush(q);
+}
+// Folder listing with the fast flags (no 8.3 names, big batches).
+static HANDLE fsq_find(const char* dir, WIN32_FIND_DATAA* fd) {
+    char search[2048];
+    snprintf(search, sizeof(search), "%s\\*", dir);
+    HANDLE h = FindFirstFileExA(search, FindExInfoBasic, fd,
+                                FindExSearchNameMatch, NULL,
+                                2 /* FIND_FIRST_EX_LARGE_FETCH */);
+    if (h == INVALID_HANDLE_VALUE &&
+        GetLastError() == ERROR_INVALID_PARAMETER)
+        h = FindFirstFileA(search, fd);
+    return h;
+}
+static bool fsq_dot(const char* n) {
+    return n[0] == '.' && (n[1] == '\0' || (n[1] == '.' && n[2] == '\0'));
+}
+
+// Delete walk: files go to the queue, folders to `dirs` in pre-order
+// (removed back to front = children before parents).  A junction /
+// folder symlink is removed as a link and NEVER walked into - walking
+// it deleted the files of the folder it points to.
+typedef struct { char** v; int n, cap; } FsDirs;
+static void fsd_add(FsDirs* d, const char* p, FsQueue* q) {
+    if (d->n == d->cap) {
+        int nc = d->cap ? d->cap * 2 : 64;
+        char** g = (char**)realloc(d->v, (size_t)nc * sizeof(char*));
+        if (!g) { fsq_fail(q, "Out of memory"); return; }
+        d->v = g;
+        d->cap = nc;
+    }
+    d->v[d->n] = _strdup(p);
+    if (!d->v[d->n]) { fsq_fail(q, "Out of memory"); return; }
+    d->n++;
+}
+static void fs_delete_walk(const char* dir, bool walk, FsQueue* q, FsDirs* d) {
+    fsd_add(d, dir, q);
+    if (!walk || fsq_stop(q)) return;
+    WIN32_FIND_DATAA fd;
+    HANDLE h = fsq_find(dir, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fsq_dot(fd.cFileName)) continue;
+        char child[2048];
+        snprintf(child, sizeof(child), "%s\\%s", dir, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            fs_delete_walk(child,
+                           !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT),
+                           q, d);
+        else
+            fsq_push(q, child, NULL);
+    } while (!fsq_stop(q) && FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
 // ---- delete (recursive for folders) ----
 static bool fs_delete_one(const char* path, char* err, size_t en) {
     DWORD a = GetFileAttributesA(path);
@@ -3553,36 +3734,33 @@ static bool fs_delete_one(const char* path, char* err, size_t en) {
         snprintf(err, en, "Not found: %s", file_name_of(path));
         return false;
     }
-    if (a & FILE_ATTRIBUTE_DIRECTORY) {
-        // Remove the folder's contents first, then the folder itself.
-        char search[2048];
-        snprintf(search, sizeof(search), "%s\\*", path);
-        WIN32_FIND_DATAA fd;
-        HANDLE h = FindFirstFileA(search, &fd);
-        if (h != INVALID_HANDLE_VALUE) {
-            do {
-                if (strcmp(fd.cFileName, ".") == 0 ||
-                    strcmp(fd.cFileName, "..") == 0)
-                    continue;
-                char child[2048];
-                snprintf(child, sizeof(child), "%s\\%s", path, fd.cFileName);
-                if (!fs_delete_one(child, err, en)) { FindClose(h); return false; }
-            } while (FindNextFileA(h, &fd));
-            FindClose(h);
-        }
-        if (!RemoveDirectoryA(path)) {
+    if (!(a & FILE_ATTRIBUTE_DIRECTORY)) {
+        if (!fsq_delete_file(path)) {
             snprintf(err, en, "Could not delete \"%s\" (in use?)",
                      file_name_of(path));
             return false;
         }
         return true;
     }
-    if (!DeleteFileA(path)) {
-        snprintf(err, en, "Could not delete \"%s\" (in use?)",
-                 file_name_of(path));
-        return false;
+    // Remove the folder's contents first, then the folders themselves.
+    FsQueue* q = (FsQueue*)calloc(1, sizeof *q);
+    if (!q) { snprintf(err, en, "Out of memory"); return false; }
+    FsDirs d = {0};
+    fs_delete_walk(path, !(a & FILE_ATTRIBUTE_REPARSE_POINT), q, &d);
+    fsq_flush(q);
+    bool ok = !q->failed;
+    if (!ok) snprintf(err, en, "%s", q->err);
+    for (int i = d.n - 1; i >= 0; i--) {
+        if (ok && !RemoveDirectoryA(d.v[i])) {
+            snprintf(err, en, "Could not delete \"%s\" (in use?)",
+                     file_name_of(d.v[i]));
+            ok = false;
+        }
+        free(d.v[i]);
     }
-    return true;
+    free(d.v);
+    free(q);
+    return ok;
 }
 
 // ---- new ----
@@ -3685,6 +3863,32 @@ static bool fs_unique_dst(const char* dst_dir, const char* name, bool is_dir,
 
 // Recursive copy to an exact NEW path (never overwrites anything).
 static volatile LONG g_paste_cancel = 0;
+// Copy walk: makes each folder, queues its files, recurses into its
+// sub-folders (same order and same rules as the old serial copy).
+static void fs_copy_walk(const char* src, const char* dst, FsQueue* q) {
+    if (!CreateDirectoryA(dst, NULL) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        char m[256];
+        snprintf(m, sizeof m, "Could not create the folder \"%s\"",
+                 file_name_of(dst));
+        fsq_fail(q, m);
+        return;
+    }
+    WIN32_FIND_DATAA fd;
+    HANDLE h = fsq_find(src, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fsq_dot(fd.cFileName)) continue;
+        char cs[2048], cd[2048];
+        snprintf(cs, sizeof cs, "%s\\%s", src, fd.cFileName);
+        snprintf(cd, sizeof cd, "%s\\%s", dst, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            fs_copy_walk(cs, cd, q);
+        else
+            fsq_push(q, cs, cd);
+    } while (!fsq_stop(q) && FindNextFileA(h, &fd));
+    FindClose(h);
+}
 static bool fs_copy_to(const char* src, const char* dst, char* err, size_t en) {
     if (InterlockedCompareExchange(&g_paste_cancel, 0, 0)) {
         snprintf(err, en, "Cancelled");
@@ -3696,29 +3900,21 @@ static bool fs_copy_to(const char* src, const char* dst, char* err, size_t en) {
         return false;
     }
     if (a & FILE_ATTRIBUTE_DIRECTORY) {
-        if (!CreateDirectoryA(dst, NULL) &&
-            GetLastError() != ERROR_ALREADY_EXISTS) {
-            snprintf(err, en, "Could not create the folder \"%s\"",
-                     file_name_of(dst));
-            return false;
+        // Folders are created here, in walk order; the files are copied by
+        // the parallel queue (fsq_*), several at once.
+        FsQueue* q = (FsQueue*)calloc(1, sizeof *q);
+        if (!q) { snprintf(err, en, "Out of memory"); return false; }
+        q->copy = true;
+        q->cancel = &g_paste_cancel;
+        fs_copy_walk(src, dst, q);
+        fsq_flush(q);
+        bool ok = !q->failed;
+        if (!ok) snprintf(err, en, "%s", q->err);
+        else if (InterlockedCompareExchange(&g_paste_cancel, 0, 0)) {
+            snprintf(err, en, "Cancelled");
+            ok = false;
         }
-        char search[2048];
-        snprintf(search, sizeof(search), "%s\\*", src);
-        WIN32_FIND_DATAA fd;
-        HANDLE h = FindFirstFileA(search, &fd);
-        bool ok = true;
-        if (h != INVALID_HANDLE_VALUE) {
-            do {
-                if (strcmp(fd.cFileName, ".") == 0 ||
-                    strcmp(fd.cFileName, "..") == 0)
-                    continue;
-                char cs[2048], cd[2048];
-                snprintf(cs, sizeof cs, "%s\\%s", src, fd.cFileName);
-                snprintf(cd, sizeof cd, "%s\\%s", dst, fd.cFileName);
-                if (!fs_copy_to(cs, cd, err, en)) { ok = false; break; }
-            } while (FindNextFileA(h, &fd));
-            FindClose(h);
-        }
+        free(q);
         return ok;
     }
     if (!CopyFileA(src, dst, TRUE)) {           // TRUE: fail if it exists
@@ -4391,7 +4587,9 @@ static int fs_recycle_many(char** paths, int n, bool* gone, char* err, size_t en
     if (at > 0) {
         SHFILEOPSTRUCTW op;
         memset(&op, 0, sizeof op);
-        op.hwnd = (HWND)g_app.hwnd;
+        // No owner window: this also runs on the delete worker thread, and
+        // with these flags the shell never shows a dialog to own anyway.
+        op.hwnd = NULL;
         op.wFunc = FO_DELETE;
         op.pFrom = list;
         op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT |
@@ -4431,42 +4629,79 @@ static void delete_confirm_mode(bool permanent) {
     g_modal_click_latch = true;        // ctx/menu click: not the panel's
 }
 
-static void delete_do(void) {
-    if (g_del_n <= 0) return;
-    int done = 0;
-    char err[256] = {0};
-    bool recycle = !g_del_permanent && !g_st_running;
-    if (recycle) {
-        // stamp first: the undo only reads bin records from here on
-        FILETIME ft;
-        GetSystemTimeAsFileTime(&ft);
-        char stamp[32];
-        snprintf(stamp, sizeof stamp, "%llu",
-                 ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
-        bool* gone = (bool*)calloc((size_t)g_del_n, sizeof(bool));
-        if (gone) {
-            done = fs_recycle_many(g_del_paths, g_del_n, gone, err, sizeof err);
-            // Ctrl+Z brings recycled items back (a permanent delete
-            // leaves nothing to bring back, so it records nothing).
-            if (done > 0) {
-                int id = undo_begin(UNDO_RECYCLE);
-                for (int i = 0; i < g_del_n; i++)
-                    if (gone[i]) undo_add_id(id, g_del_paths[i], stamp);
-            }
-            if (done < g_del_n && err[0]) set_status("%s", err);
-            free(gone);
-        }
+// ---- background delete --------------------------------------------------
+// Deleting (or recycling) a big folder used to run on the UI thread: the
+// window froze until the last file was gone.  The work now runs on a
+// worker; the UI thread lands the result exactly as before (undo record,
+// reload, status) in del_pump().  The selftest still deletes inline.
+typedef struct {
+    char** paths;
+    int n;
+    bool recycle;
+    bool* gone;                  // recycle: which items reached the bin
+    int done;
+    char err[256];
+    char stamp[32];              // recycle undo stamp (taken before)
+} DelJob;
+static DelJob g_dj;
+static volatile LONG g_del_running = 0;   // 0 idle, 1 running, 2 finished
+static HANDLE g_del_thread = NULL;
+
+static void del_run(void) {
+    DelJob* j = &g_dj;
+    j->done = 0;
+    j->err[0] = '\0';
+    if (j->recycle) {
+        if (j->gone)
+            j->done = fs_recycle_many(j->paths, j->n, j->gone, j->err,
+                                      sizeof j->err);
     } else {
-        for (int i = 0; i < g_del_n; i++) {
-            if (fs_delete_one(g_del_paths[i], err, sizeof(err))) done++;
-            else set_status("%s", err);
+        for (int i = 0; i < j->n; i++) {
+            char e[256] = {0};
+            if (fs_delete_one(j->paths[i], e, sizeof e)) j->done++;
+            else snprintf(j->err, sizeof j->err, "%s", e);
         }
     }
-    for (int i = 0; i < g_del_n; i++) free(g_del_paths[i]);
-    free(g_del_paths);
-    g_del_paths = NULL;
-    g_del_n = 0;
-    g_confirm_kind = CONFIRM_NONE;
+}
+static DWORD WINAPI del_worker(LPVOID arg) {
+    (void)arg;
+    // the shell's recycle runs COM: give this thread an apartment
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    del_run();
+    if (SUCCEEDED(hr)) CoUninitialize();
+    InterlockedExchange(&g_del_running, 2);
+    platform_wake();
+    return 0;
+}
+static bool del_busy(void) {
+    return InterlockedCompareExchange(&g_del_running, 0, 0) != 0;
+}
+// Land a finished delete (UI thread, every frame).
+static void del_pump(void) {
+    if (InterlockedCompareExchange(&g_del_running, 0, 0) != 2) return;
+    if (g_del_thread) {
+        WaitForSingleObject(g_del_thread, INFINITE);
+        CloseHandle(g_del_thread);
+        g_del_thread = NULL;
+    }
+    DelJob* j = &g_dj;
+    int done = j->done;
+    if (j->recycle) {
+        // Ctrl+Z brings recycled items back (a permanent delete
+        // leaves nothing to bring back, so it records nothing).
+        if (done > 0) {
+            int id = undo_begin(UNDO_RECYCLE);
+            for (int i = 0; i < j->n; i++)
+                if (j->gone[i]) undo_add_id(id, j->paths[i], j->stamp);
+        }
+    }
+    if (j->err[0]) set_status("%s", j->err);
+    for (int i = 0; i < j->n; i++) free(j->paths[i]);
+    free(j->paths);
+    free(j->gone);
+    bool recycle = j->recycle;
+    memset(j, 0, sizeof *j);
+    InterlockedExchange(&g_del_running, 0);
     if (done > 0) {
         load_dir(g_app.current_path);
         folder_watch_quiet();
@@ -4476,6 +4711,40 @@ static void delete_do(void) {
         else
             set_status("Deleted %d item%s", done, done == 1 ? "" : "s");
     }
+}
+
+static void delete_do(void) {
+    if (g_del_n <= 0) return;
+    g_confirm_kind = CONFIRM_NONE;
+    if (del_busy()) {
+        set_status("Another delete is still running");
+        return;
+    }
+    DelJob* j = &g_dj;
+    memset(j, 0, sizeof *j);
+    j->recycle = !g_del_permanent && !g_st_running;
+    if (j->recycle) {
+        // stamp first: the undo only reads bin records from here on
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        snprintf(j->stamp, sizeof j->stamp, "%llu",
+                 ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+        j->gone = (bool*)calloc((size_t)g_del_n, sizeof(bool));
+    }
+    j->paths = g_del_paths;              // the job owns the list now
+    j->n = g_del_n;
+    g_del_paths = NULL;
+    g_del_n = 0;
+    InterlockedExchange(&g_del_running, 1);
+    if (!g_st_running)
+        g_del_thread = CreateThread(NULL, 0, del_worker, NULL, 0, NULL);
+    if (!g_del_thread) {                 // selftest, or no thread: inline
+        del_run();
+        InterlockedExchange(&g_del_running, 2);
+        del_pump();
+        return;
+    }
+    set_status("Deleting %d item%s...", j->n, j->n == 1 ? "" : "s");
 }
 
 // ---- properties ---------------------------------------------------------
@@ -4672,6 +4941,47 @@ static void drive_label(const char* root, char* out, size_t cap) {
         dl_n++;
     }
     snprintf(out, cap, "%s", label);
+}
+
+// Capacity / free bytes of a local drive root ("C:\\"), CACHED for a few
+// seconds: build_sidebar() and This PC ask on every navigation, and a
+// removable drive without media can make GetDiskFreeSpaceEx slow.  A
+// failed query is cached too, so it is not retried every folder change.
+static bool drive_space(const char* root, unsigned long long* total,
+                        unsigned long long* freeb) {
+    enum { DS_MAX = 26 };
+    static char ds_root[DS_MAX][12];
+    static unsigned long long ds_tot[DS_MAX], ds_free[DS_MAX];
+    static ULONGLONG ds_at[DS_MAX];
+    static bool ds_ok[DS_MAX];
+    static int ds_n = 0;
+    *total = *freeb = 0;
+    if (!root || !root[0]) return false;
+    ULONGLONG now = GetTickCount64();
+    int i;
+    for (i = 0; i < ds_n; i++)
+        if (_stricmp(ds_root[i], root) == 0) break;
+    if (i == ds_n) {
+        if (ds_n >= DS_MAX) return false;
+        snprintf(ds_root[i], sizeof(ds_root[0]), "%s", root);
+        ds_at[i] = 0;
+        ds_n++;
+    }
+    // A failed or slow answer (card reader without a card) is not asked
+    // again for 60 s, so it can never stall navigation over and over.
+    // ds_at = when the next query is allowed (0 = never asked yet)
+    if (ds_at[i] == 0 || now >= ds_at[i]) {
+        ULARGE_INTEGER fr, tot;
+        ds_ok[i] = GetDiskFreeSpaceExA(root, &fr, &tot, NULL) != 0;
+        ds_tot[i] = ds_ok[i] ? tot.QuadPart : 0;
+        ds_free[i] = ds_ok[i] ? fr.QuadPart : 0;
+        ULONGLONG t1 = GetTickCount64();
+        bool slow = !ds_ok[i] || t1 - now > 250;
+        ds_at[i] = t1 + (slow ? 60000 : 5000);
+    }
+    *total = ds_tot[i];
+    *freeb = ds_free[i];
+    return ds_ok[i];
 }
 
 static const char* path_name(const char* p) {
@@ -5161,6 +5471,11 @@ static void build_sidebar(void) {
             char label[64];
             drive_label(d, label, sizeof(label));
             side_add(SIDE_ITEM, label, d, false);
+            // usage bar under the name (network drives are never asked:
+            // a dead share would stall the sidebar)
+            if (t != DRIVE_REMOTE && g_side_n > 0)
+                drive_space(d, &g_side[g_side_n - 1].disk_total,
+                            &g_side[g_side_n - 1].disk_free);
         }
     }
 
@@ -8489,6 +8804,111 @@ static void bar_popups_metrics(Layout* L) {
                              pw2 - SC(8), zcap};
 }
 
+
+// ---- Details columns: Size | Modified | Type widths (user adjustable) ---
+// Widths are 96-DPI design pixels (SC() scales them) and include the gap to
+// the next column.  Drag a divider in the header to change one (like
+// Explorer); double-click a divider to put that column back to default.
+// The Name column takes whatever is left.  Saved in the settings file.
+
+// Pixels the three right-hand columns may use together in a list `w`
+// wide: the Name column always keeps room for a readable name - 35% of
+// the list, between SC(120) and SC(260), so a narrow split pane still has
+// room for some of Size / Modified / Type (see col_metrics).
+static int col_room(int w, int pad) {
+    int keep = (w - pad) * 35 / 100;
+    if (keep < SC(120)) keep = SC(120);
+    if (keep > SC(260)) keep = SC(260);
+    return w - pad - keep;
+}
+
+// Is Details column k (1 Size, 2 Modified, 3 Type) on screen?  A column
+// dropped for a narrow pane keeps its index (= sort key) with w = 0.
+static bool col_shown(const Layout* L, int k) {
+    return L->show_extra_cols && k >= 1 && k <= 3 && L->hdr[k].w > 0;
+}
+
+// Width of Details column k (0 Size, 1 Modified, 2 Type) in the pane now in
+// g_app: its own width once the user dragged it there, else g_col_w.
+static int col_w_of(int k) {
+    int v = g_app.col_w[k];
+    return (v >= COL_MIN[k] && v <= COL_MAX) ? v : g_col_w[k];
+}
+
+static void col_metrics(Layout* L, int x, int w, int y, int pad) {
+    int S = SC(col_w_of(0)), M = SC(col_w_of(1)), T = SC(col_w_of(2));
+    int right = x + w - pad;
+    // Whether the columns show depends ONLY on the pane width (never on how
+    // wide the user made them - wide columns used to make all of them
+    // vanish).  When they do not fit, they shrink together for display.
+    // Split panes are often far narrower than a full window (the old fixed
+    // SC(700) cut-off hid every column there), so a tight pane drops them
+    // one at a time instead: Type first, then Size; Modified stays longest.
+    // A dropped Type leaves T = SC(30) as the favorite star's gutter.
+    int room = col_room(w, pad);
+    int lvl = 0;                                   // 3 all, 2 S+M, 1 M
+    if (room >= SC(COL_MIN[0] + COL_MIN[1] + COL_MIN[2])) lvl = 3;
+    else if (room >= SC(COL_MIN[0] + 80 + 30)) lvl = 2;
+    else if (room >= SC(80 + 30)) lvl = 1;
+    if (g_app.view_mode != MODE_DETAILS) lvl = 0;
+    L->show_extra_cols = lvl > 0;
+    if (lvl == 3 && S + M + T > room && room > 0) {
+        float f = (float)room / (float)(S + M + T);
+        S = (int)(S * f);
+        M = (int)(M * f);
+        T = (int)(T * f);
+        if (S < SC(COL_MIN[0])) S = SC(COL_MIN[0]);
+        if (M < SC(COL_MIN[1])) M = SC(COL_MIN[1]);
+        if (T < SC(COL_MIN[2])) T = SC(COL_MIN[2]);
+    } else if (lvl == 2) {
+        T = SC(30);
+        int r2 = room - T;
+        if (S + M > r2) {
+            float f = (float)r2 / (float)(S + M);
+            S = (int)(S * f);
+            M = (int)(M * f);
+            if (S < SC(COL_MIN[0])) S = SC(COL_MIN[0]);
+            if (M < SC(80)) M = SC(80);
+        }
+    } else if (lvl == 1) {
+        T = SC(30);
+        S = 0;
+        if (M > SC(100)) M = SC(100);   // date only fits - rest to Name
+        if (M > room - T) M = room - T;
+    }
+    L->col_type_left = right - T;
+    L->col_mod_left = L->col_type_left - M;
+    int size_left = L->col_mod_left - S;
+    L->col_size_right = L->col_mod_left - SC(12);
+    L->name_w = L->show_extra_cols ? (size_left - SC(36) - x)
+                                   : (w - SC(40) - pad);
+    if (L->name_w < SC(40)) L->name_w = SC(40);
+    L->hdr_count = L->show_extra_cols ? 4 : 1;
+    L->hdr[0] = (RectI){x + SC(8), y, L->name_w + SC(20), L->list_head_h};
+    L->hdr[1] = (RectI){size_left, y, lvl >= 2 ? S - SC(12) : 0,
+                        L->list_head_h};
+    L->hdr[2] = (RectI){L->col_mod_left, y, M - SC(12), L->list_head_h};
+    L->hdr[3] = (RectI){L->col_type_left, y, lvl == 3 ? T - SC(2) : 0,
+                        L->list_head_h};
+}
+
+// Which header divider is under (x, y)?  0 = Name|Size (resizes Size),
+// 1 = Size|Modified (Modified), 2 = Modified|Type (Type); -1 = none.
+// Divider k exists only while column k + 1 is shown.
+static int col_divider_at(const Layout* L, int x, int y) {
+    if (!L->show_extra_cols) return -1;
+    if (y < L->list.y || y >= L->list.y + L->list_head_h) return -1;
+    int b[3] = {L->hdr[1].x, L->col_mod_left, L->col_type_left};
+    // centred on the divider mark draw_header() paints (b - SC(6)), so the
+    // line the user sees is exactly what they can grab
+    for (int k = 0; k < 3; k++) {
+        if (!col_shown(L, k + 1)) continue;
+        int m = b[k] - SC(6);
+        if (x >= m - SC(5) && x <= m + SC(5)) return k;
+    }
+    return -1;
+}
+
 // Last computed layout, for the custom-title-bar hit callback
 // (platform_set_drag_hit): WM_NCHITTEST runs outside the frame loop, so
 // the rects of tabs / window controls must be readable at any time.
@@ -8868,6 +9288,8 @@ static void compute_layout(Layout* L, int w, int h) {
     int content_h = SC(4);                       // top padding inside panel
     for (int i = 0; i < g_side_n; i++) {
         int rh = (g_side[i].kind == SIDE_HEAD) ? L->side_head_h : L->side_row_h;
+        if (g_side[i].kind == SIDE_ITEM && g_side[i].disk_total)
+            rh += SC(8);                         // room for the usage bar
         g_side[i].rect = (RectI){L->side_panel.x + SC(4),
                                  L->side_panel.y + content_h - g_side_scroll,
                                  L->side_panel.w - SC(8), rh};
@@ -8917,24 +9339,8 @@ static void compute_layout(Layout* L, int w, int h) {
     L->scroll_thumb = (RectI){L->scroll_track.x, thumb_y, L->scroll_w, thumb_h};
 
     // ---- columns ----
-    int pad = L->has_scroll ? L->scroll_w : 0;
-    L->show_extra_cols = (g_app.view_mode == MODE_DETAILS) &&
-                         (L->list.w >= SC(700));
-    L->name_w = L->show_extra_cols ? (L->list.w - SC(374) - pad)
-                                   : (L->list.w - SC(40) - pad);
-    if (L->name_w < SC(40)) L->name_w = SC(40);
-
-    L->col_size_right = L->list.x + L->list.w - SC(246) - pad;
-    L->col_mod_left = L->list.x + L->list.w - SC(234) - pad;
-    L->col_type_left = L->list.x + L->list.w - SC(92) - pad;
-
-    L->hdr_count = L->show_extra_cols ? 4 : 1;
-    L->hdr[0] = (RectI){L->list.x + SC(8), L->list.y, L->name_w + SC(20),
-                        L->list_head_h};
-    L->hdr[1] = (RectI){L->col_size_right - SC(92), L->list.y, SC(92),
-                        L->list_head_h};
-    L->hdr[2] = (RectI){L->col_mod_left, L->list.y, SC(130), L->list_head_h};
-    L->hdr[3] = (RectI){L->col_type_left, L->list.y, SC(90), L->list_head_h};
+    col_metrics(L, L->list.x, L->list.w, L->list.y,
+                L->has_scroll ? L->scroll_w : 0);
 
     g_top_layout = *L;   // publish for the title-bar hit callback
 }
@@ -11227,6 +11633,8 @@ static void draw_toolbar(const Layout* L, const InputState* in) {
 // ------------------------------------------------------------
 // Sidebar: RECENTS / BOOKMARKS / STORAGE / PLACES
 // ------------------------------------------------------------
+static void draw_drive_bar(int x, int y, int w, int h, uint64_t total,
+                           uint64_t freeb);   // defined with draw_details
 static void draw_sidebar(const Layout* L, const InputState* in) {
     if (L->side_panel.w <= 0) return;           // hidden (or sliding shut)
     // (the filter box moved to the STATUS BAR, bottom left)
@@ -11268,8 +11676,16 @@ static void draw_sidebar(const Layout* L, const InputState* in) {
 
         char label[96];
         fit_text(s->label, label, sizeof(label), r->w - SC(34), L->text_med);
-        text_px(label, r->x + SC(28), r->y + (r->h - L->text_med) / 2,
-                L->text_med, P->text);
+        if (s->disk_total) {
+            // Storage drive: name on top, thin usage bar below (This PC look)
+            text_px(label, r->x + SC(28), r->y + SC(3), L->text_med, P->text);
+            draw_drive_bar(r->x + SC(28), r->y + r->h - SC(8),
+                           r->w - SC(28) - SC(10), SC(4), s->disk_total,
+                           s->disk_free);
+        } else {
+            text_px(label, r->x + SC(28), r->y + (r->h - L->text_med) / 2,
+                    L->text_med, P->text);
+        }
     }
     renderer_reset_scissor(g_app.renderer);
 
@@ -11302,16 +11718,36 @@ static void draw_header(const Layout* L, const InputState* in, Color bg) {
 
     static const char* labels[4] = {"Name", "Size", "Modified", "Type"};
     for (int i = 0; i < L->hdr_count; i++) {
+        if (i > 0 && !col_shown(L, i)) continue;   // dropped (narrow pane)
         if (inside(&L->hdr[i], in->x, in->y))
             fill(L->hdr[i].x, L->hdr[i].y, L->hdr[i].w, L->hdr[i].h, P->row_hover);
 
         char lbl[48];
         snprintf(lbl, sizeof(lbl), "%s%s", labels[i], sort_arrow(i));
 
-        if (i == 0) text_px(lbl, L->hdr[0].x, hy, L->text_small, P->dim);
-        else if (i == 1) text_right_px(lbl, L->col_size_right, hy, L->text_small, P->dim);
-        else if (i == 2) text_px(lbl, L->col_mod_left, hy, L->text_small, P->dim);
-        else text_px(lbl, L->col_type_left, hy, L->text_small, P->dim);
+        char fl[48];
+        fit_text(lbl, fl, sizeof fl, i == 0 ? L->hdr[0].w : L->hdr[i].w,
+                 L->text_small);
+        if (i == 0) text_px(fl, L->hdr[0].x, hy, L->text_small, P->dim);
+        else if (i == 1) text_right_px(fl, L->col_size_right, hy, L->text_small, P->dim);
+        else if (i == 2) text_px(fl, L->col_mod_left, hy, L->text_small, P->dim);
+        else text_px(fl, L->col_type_left, hy, L->text_small, P->dim);
+    }
+    // column dividers: thin marks, the hovered / dragged one in accent
+    if (L->show_extra_cols) {
+        int hk = (g_col_drag >= 0) ? g_col_drag
+                                   : col_divider_at(L, in->x, in->y);
+        int b[3] = {L->hdr[1].x, L->col_mod_left, L->col_type_left};
+        for (int k = 0; k < 3; k++) {
+            if (!col_shown(L, k + 1)) continue;
+            int bx = b[k] - SC(6);
+            if (k == hk)
+                fill(bx - 1, L->list.y + SC(3), 2, L->list_head_h - SC(6),
+                     P->accent);
+            else
+                vline(bx, L->list.y + SC(6), L->list.y + L->list_head_h - SC(6),
+                      P->border);
+        }
     }
     hline(L->list.x, L->list.x + L->list.w, L->list.y + L->list_head_h, P->border);
 }
@@ -11386,6 +11822,30 @@ static const char* entry_label(const DirEntry* e, char* buf, size_t cap) {
     return buf;
 }
 
+// ---- drive storage, like Explorer's This PC: a usage bar + free space ----
+// In This PC a row's size is the drive's capacity and its "modified" field
+// carries the FREE bytes (make_pc_entries).  The bar turns red above 90%.
+static void draw_drive_bar(int x, int y, int w, int h, uint64_t total,
+                           uint64_t freeb) {
+    if (w < 4 || total == 0) return;
+    double used = 1.0 - (double)freeb / (double)total;
+    if (used < 0) used = 0;
+    if (used > 1) used = 1;
+    fill(x, y, w, h, P->field);
+    Color c = used > 0.9 ? (Color){0.86f, 0.25f, 0.25f, 1.0f} : P->accent;
+    int fw = (int)(w * used + 0.5);
+    if (fw > 0) fill(x, y, fw, h, c);
+    box(x, y, w, h, P->border);
+}
+static void drive_free_text(uint64_t total, uint64_t freeb, char* out,
+                            size_t cap, bool with_total) {
+    char f[32], t[32];
+    format_size(freeb, f, sizeof f);
+    format_size(total, t, sizeof t);
+    if (with_total) snprintf(out, cap, "%s free of %s", f, t);
+    else snprintf(out, cap, "%s free", f);
+}
+
 static void draw_details(const Layout* L, const InputState* in) {
     // <= rows_visible: the LAST row may be only half visible at big zoom
     // sizes - draw it too, the body scissor cuts it at the edge.
@@ -11450,14 +11910,43 @@ static void draw_details(const Layout* L, const InputState* in) {
         if (L->show_extra_cols) {
             char size_buf[32];
             size_buf[0] = '\0';
-            if (!e->is_directory) format_size(e->size, size_buf, sizeof(size_buf));
+            bool pc = is_this_pc(g_app.current_path);
+            if (col_shown(L, 1) && (!e->is_directory || (pc && e->size)))
+                format_size(e->size, size_buf, sizeof(size_buf));
             text_right_px(size_buf, L->col_size_right, ty, L->text_h, P->dim);
 
-            char mod[32];
-            format_modified(e->modified, mod, sizeof(mod));
-            text_px(mod, L->col_mod_left, ty, L->text_h, P->dim);
+            int mw = L->col_type_left - L->col_mod_left - SC(6);
+            if (pc && e->size) {
+                // drive: usage bar + "X GB free" in the Modified column
+                int bw = mw * 45 / 100;
+                draw_drive_bar(L->col_mod_left, ry + (L->row_h - SC(8)) / 2,
+                               bw, SC(8), e->size, e->modified);
+                char ft[64], ff[64];
+                drive_free_text(e->size, e->modified, ft, sizeof ft, false);
+                fit_text(ft, ff, sizeof ff, mw - bw - SC(8), L->text_small);
+                text_px(ff, L->col_mod_left + bw + SC(8),
+                        ry + (L->row_h - L->text_small) / 2, L->text_small,
+                        P->dim);
+            } else {
+                char mod[32], modf[40];
+                format_modified(e->modified, mod, sizeof(mod));
+                // narrow column (split panes): the date alone, not "2026-1..."
+                if ((int)measure_px(mod, L->text_h) > mw && strlen(mod) > 10)
+                    mod[10] = '\0';
+                fit_text(mod, modf, sizeof modf, mw, L->text_h);
+                text_px(modf, L->col_mod_left, ty, L->text_h, P->dim);
+            }
 
+            if (!col_shown(L, 3)) goto row_done;   // narrow pane: no Type
             const char* ext = e->is_directory ? "Folder" : get_file_extension(e->name);
+            if (pc && e->is_directory) {
+                // This PC rows are drives, not folders (Explorer wording)
+                UINT dt = GetDriveTypeA(e->path);
+                ext = dt == DRIVE_REMOVABLE ? "USB Drive"
+                    : dt == DRIVE_REMOTE    ? "Network Drive"
+                    : dt == DRIVE_CDROM     ? "CD Drive"
+                                            : "Local Disk";
+            }
             char type_buf[48];
             // SC(38), not SC(20): the right end of the row now belongs to
             // the favorite star, so the Type text stops clear of it.
@@ -11466,6 +11955,7 @@ static void draw_details(const Layout* L, const InputState* in) {
                      L->text_h);
             text_px(type_buf, L->col_type_left, ty, L->text_h, P->dim);
         }
+    row_done:
         draw_item_star(L, (int)vi, e, hov);
     }
 }
@@ -11592,7 +12082,17 @@ static void draw_grid(const Layout* L, const InputState* in) {
                                  cut ? P->dim : P->text, hlq, hlcs);
             else
                 text_centered_px(nms, &ln1, L->text_med, cut ? P->dim : P->text);
-            if (sz[0]) {
+            if (is_this_pc(g_app.current_path) && e->size) {
+                // drive tile: usage bar + "X free of Y", like Explorer
+                int bx = cx + SC(8), bw = L->cell_w - SC(16);
+                int by = ny + L->text_med + SC(4);
+                draw_drive_bar(bx, by, bw, SC(6), e->size, e->modified);
+                char ft[64], ff[64];
+                drive_free_text(e->size, e->modified, ft, sizeof ft, true);
+                fit_text(ft, ff, sizeof ff, L->cell_w - SC(4), L->text_small);
+                RectI ln2 = {cx, by + SC(8), L->cell_w, L->text_small};
+                text_centered_px(ff, &ln2, L->text_small, P->dim);
+            } else if (sz[0]) {
                 RectI ln2 = {cx, ny + L->text_med + SC(2), L->cell_w, L->text_small};
                 text_centered_px(sz, &ln2, L->text_small, P->dim);
             }
@@ -13920,6 +14420,43 @@ static int cmp_entry(const void* a, const void* b) {
     return r * g_sort_dir;
 }
 
+// Sort a listing by cmp_entry.  A DirEntry is ~1.3 KB, and qsort on the
+// array itself moved whole entries on every swap (~400 MB of copying for a
+// 20,000-item folder).  This sorts POINTERS, then moves every entry to its
+// place exactly once (cycle walk, one spare entry).  Same order as
+// qsort(arr, n, sizeof(DirEntry), cmp_entry).
+static int cmp_entry_ptr(const void* a, const void* b) {
+    return cmp_entry(*(const DirEntry* const*)a, *(const DirEntry* const*)b);
+}
+static void sort_entries(DirEntry* arr, size_t n) {
+    if (!arr || n < 2) return;
+    DirEntry** ps = (DirEntry**)malloc(n * sizeof *ps);
+    DirEntry* tmp = (DirEntry*)malloc(sizeof *tmp);
+    if (!ps || !tmp) {                       // no memory: the plain way
+        free(ps);
+        free(tmp);
+        qsort(arr, n, sizeof(DirEntry), cmp_entry);
+        return;
+    }
+    for (size_t i = 0; i < n; i++) ps[i] = &arr[i];
+    qsort(ps, n, sizeof *ps, cmp_entry_ptr);
+    // slot i must receive *ps[i]; follow each cycle once
+    for (size_t i = 0; i < n; i++) {
+        if (ps[i] == &arr[i]) continue;
+        *tmp = arr[i];
+        size_t j = i;
+        for (;;) {
+            size_t k = (size_t)(ps[j] - arr);   // where slot j's entry is
+            ps[j] = &arr[j];                    // slot j: done
+            if (k == i) { arr[j] = *tmp; break; }
+            arr[j] = arr[k];
+            j = k;
+        }
+    }
+    free(tmp);
+    free(ps);
+}
+
 // The search box matches what the row SHOWS as well as the real name: with
 // names shown in English, typing "report" finds a Chinese "...report" file.
 static int entry_search_rank(const DirEntry* e) {
@@ -14028,10 +14565,10 @@ static void set_sort(int key) {
         // the tree list is spliced - sort the FLAT list and rebuild, so the
         // open branches keep their place instead of being shuffled
         if (g_root && g_root_n > 1)
-            qsort(g_root, g_root_n, sizeof(DirEntry), cmp_entry);
+            sort_entries(g_root, g_root_n);
         tree_build();
     } else if (g_app.entries && g_app.count > 1) {
-        qsort(g_app.entries, g_app.count, sizeof(DirEntry), cmp_entry);
+        sort_entries(g_app.entries, g_app.count);
     }
 
     rebuild_view();
@@ -14063,6 +14600,13 @@ static DirEntry* make_pc_entries(size_t* count) {
             arr[k].is_directory = true;
             arr[k].size = 0;
             arr[k].modified = 0;
+            if (t != DRIVE_REMOTE) {
+                unsigned long long tot, fr;
+                if (drive_space(d, &tot, &fr)) {
+                    arr[k].size = tot;          // capacity
+                    arr[k].modified = fr;       // free (This PC only)
+                }
+            }
             k++;
         }
         *count = (size_t)k;
@@ -14482,7 +15026,7 @@ static bool tree_walk(DirEntry** arr, size_t* n, size_t* cap,
     DirEntry* ch = g_app.platform->get_directory_entries(parent->path, &cn);
     if (!ch) return true;                          // unreadable: no children
     filter_entries_quiet(ch, &cn);
-    if (cn > 1) qsort(ch, cn, sizeof(DirEntry), cmp_entry);
+    if (cn > 1) sort_entries(ch, cn);
     bool ok = true;
     for (size_t k = 0; k < cn && ok; k++) {
         ch[k].depth = (uint16_t)(parent->depth + 1);
@@ -14654,7 +15198,7 @@ static void load_dir(const char* path) {
     }
     load_retry_cancel();                     // a real listing ends any retry
     filter_entries(entries, &count);          // hidden / system out
-    if (count > 1) qsort(entries, count, sizeof(DirEntry), cmp_entry);
+    if (count > 1) sort_entries(entries, count);
 
     if (g_app.entries) free(g_app.entries);
     g_app.entries = entries;
@@ -15356,8 +15900,7 @@ static void srch_display(DirEntry* snap, size_t n) {
     g_app.entries = snap;
     g_app.count = n;
     filter_entries(g_app.entries, &g_app.count);   // hidden out + counts
-    if (g_app.count > 1) qsort(g_app.entries, g_app.count, sizeof(DirEntry),
-                               cmp_entry);
+    if (g_app.count > 1) sort_entries(g_app.entries, g_app.count);
     for (size_t i = 0; i < g_app.count; i++) {     // fresh cache memos
         g_app.entries[i].icon_idx = -1;
         g_app.entries[i].tbmp_idx = -1;
@@ -17314,6 +17857,7 @@ static void select_paths_in_view(char** paths, int n) {
 // press takes ONE more record off the stack.
 static void undo_run(void) {
     if (paste_busy()) { set_status("Wait for the copy to finish"); return; }
+    if (del_busy()) { set_status("Wait for the delete to finish"); return; }
     undo_lock();
     while (g_ustack_n > 0 && g_ustack[g_ustack_n - 1].n == 0)
         undo_rec_free(&g_ustack[--g_ustack_n]);
@@ -20951,12 +21495,106 @@ static void handle_mouse(const Layout* L, InputState* in) {
         g_drag_src = DRAG_NONE;           // gesture fully over: drop the tag
         g_tab_flipped = false;
     }
-    platform_set_cursor(NOVA_CURSOR_ARROW);   // refined below (spec 9)
+    // Over a Details column divider (or dragging one) the resize cursor
+    // stays put: resetting to the arrow first and back every frame made
+    // the pointer flicker between the two shapes.
+    int col_hk = -1;
+    if (g_col_drag < 0 && !overlay_owns_input() && !g_set_open &&
+        g_app.view_mode == MODE_DETAILS && !g_drag_split && !g_splitter_drag) {
+        Layout CL;
+        pane_input_build(&CL, L);
+        col_hk = col_divider_at(&CL, in->x, in->y);
+    }
+    if (g_col_drag >= 0 || col_hk >= 0) platform_set_cursor(NOVA_CURSOR_COL);
+    else platform_set_cursor(NOVA_CURSOR_ARROW);   // refined below (spec 9)
     // A held header press is a sort waiting to happen: apply it only when
     // the click completes, and never if the press grew into a pane drag.
     if (!in->left_down && g_sort_pending >= 0) {
         if (!g_drag_split) set_sort(g_sort_pending);
         g_sort_pending = -1;
+    }
+
+    // ---- Details column widths: drag a header divider, like Explorer;
+    //      double-click it to restore that column's default width ----
+    if (g_col_drag >= 0) {
+        platform_set_cursor(NOVA_CURSOR_COL);
+        if (in->left_down) {
+            int nw = g_col_drag_w0 -
+                     (int)((float)(in->x - g_col_drag_x0) / g_dpi);
+            // never wider than the pane leaves room for (the Name column
+            // keeps its space; the other two columns keep theirs)
+            Layout DL;
+            pane_input_build(&DL, L);
+            int pad = DL.has_scroll ? DL.scroll_w : 0;
+            // only what is on screen counts: a dropped Size takes no room,
+            // a dropped Type leaves the star's 30 px gutter
+            int others = 0;
+            for (int k = 0; k < 3; k++) {
+                if (k == g_col_drag) continue;
+                if (col_shown(&DL, k + 1)) others += col_w_of(k);
+                else if (k == 2) others += 30;
+            }
+            int maxw = (int)((float)col_room(DL.list.w, pad) / g_dpi) - others;
+            if (maxw > COL_MAX) maxw = COL_MAX;
+            if (nw > maxw) nw = maxw;
+            if (nw < COL_MIN[g_col_drag]) nw = COL_MIN[g_col_drag];
+            // ONLY the pane being dragged in (g_app = the active pane).
+            // g_col_w is left alone: panes never resized fall back to it,
+            // so changing it would resize every other pane as well.
+            g_app.col_w[g_col_drag] = nw;
+            for (int j = 0; j < 3; j++)          // pin the other two too
+                if (!g_app.col_w[j]) g_app.col_w[j] = g_col_w[j];
+        } else {
+            g_col_drag = -1;
+            if (GetCapture() == (HWND)g_app.hwnd) ReleaseCapture();
+            settings_save();
+        }
+        return;
+    }
+    {
+        int k = col_hk;
+        if (k >= 0) {
+            if (in->double_click) {
+                g_app.col_w[k] = COL_DEF[k];   // this pane only
+                for (int j = 0; j < 3; j++)
+                    if (!g_app.col_w[j]) g_app.col_w[j] = g_col_w[j];
+                settings_save();
+                return;
+            }
+            if (in->left_click) {
+                // Start from what the pane SHOWS: when its columns were
+                // shrunk to fit, store those widths first - otherwise the
+                // saved (wider) widths already fill the room and a drag
+                // to widen a column made it jump narrower instead.
+                Layout DL;
+                pane_input_build(&DL, L);
+                int pad = DL.has_scroll ? DL.scroll_w : 0;
+                int right = DL.list.x + DL.list.w - pad;
+                int vis[3] = {DL.col_mod_left - DL.hdr[1].x,
+                              DL.col_type_left - DL.col_mod_left,
+                              right - DL.col_type_left};
+                for (int j = 0; j < 3; j++) {
+                    if (!col_shown(&DL, j + 1)) {
+                        if (!g_app.col_w[j]) g_app.col_w[j] = g_col_w[j];
+                        continue;
+                    }
+                    int v = (int)((float)vis[j] / g_dpi + 0.5f);
+                    if (v < COL_MIN[j]) v = COL_MIN[j];
+                    if (v > COL_MAX) v = COL_MAX;
+                    g_app.col_w[j] = v;
+                }
+                g_col_drag = k;
+                g_col_drag_x0 = in->x;
+                g_col_drag_w0 = col_w_of(k);
+                g_sort_pending = -1;
+                g_drag_split_armed = false;
+                SetCapture((HWND)g_app.hwnd);   // keep the drag outside too
+                return;
+            }
+            // Hovering a divider: the resize cursor must stay - nothing
+            // below may hover-style this point or reset the cursor.
+            if (!in->left_down) return;
+        }
     }
 
     // ---- settings panel: modal, swallows every click (its own clicks
@@ -22330,30 +22968,54 @@ static void drop_pump(void) {
     free(v);
 }
 
-// ---- AUTO-REFRESH: watch the open folder like Explorer does ------------
-// Before this, a file another program created, renamed or deleted only
-// appeared after F5.  The ACTIVE pane's folder now carries a change
-// notification; a burst of changes is debounced (one reload, ~0.4 s after
-// the burst starts), and the reload keeps the selection and the scroll
-// position, so the view never jumps under the user.  Skipped while a
-// deep search shows results, a copy runs, a field is being edited, in
-// the Tree view (its open branches would collapse) and in test runs.
-static HANDLE g_fw_handle = INVALID_HANDLE_VALUE;
-static char   g_fw_path[1024];
-static unsigned long g_fw_due = 0;       // debounce deadline, 0 = none
+// ---- AUTO-REFRESH: watch every open folder like Explorer does ----------
+// EVERY pane of EVERY tab is watched, not only the active one: with several
+// tabs / panes open (and focus following the mouse) the old single watch
+// was closed and reopened on every pane switch, so a folder made a moment
+// earlier - "New folder", a paste, another program - was simply missed and
+// only showed after F5.  One change notification per distinct folder; a
+// burst of changes is debounced (~0.3 s), then every pane showing that
+// folder is re-read: the active pane keeps its selection and scroll
+// (folder_refresh_keep), a background pane keeps its selected item and
+// scroll too (pane_reload_bg).  Skipped while a deep search shows results,
+// a copy runs, a field is being edited, in the Tree view (its open
+// branches would collapse) and in test runs.
+#define FW_MAX 32
+typedef struct {
+    char path[1024];
+    HANDLE h;
+    unsigned long due;            // debounce deadline, 0 = none
+    bool used;                    // still shown by some pane this frame
+} FwSlot;
+static FwSlot g_fw[FW_MAX];
+static int g_fw_n = 0;
+static unsigned long g_fw_due = 0;       // app asked: refresh the ACTIVE pane
 static bool   g_fw_off = false;          // tests / benchmarks: never
+// The app changed the active folder itself AND already reloaded it: the
+// notice it caused must not reload the ACTIVE pane a second time - but
+// other panes showing the same folder still need it.
+static char   g_fw_quiet_path[1024];
+static unsigned long g_fw_quiet_until = 0;
 
 static void folder_watch_close(void) {
-    if (g_fw_handle != INVALID_HANDLE_VALUE) FindCloseChangeNotification(g_fw_handle);
-    g_fw_handle = INVALID_HANDLE_VALUE;
-    g_fw_path[0] = '\0';
+    for (int i = 0; i < g_fw_n; i++)
+        if (g_fw[i].h != INVALID_HANDLE_VALUE)
+            FindCloseChangeNotification(g_fw[i].h);
+    g_fw_n = 0;
 }
 
 static void folder_watch_poke(void) { g_fw_due = tick_in(150); }
-// The app itself just changed the folder AND reloaded it (delete, undo):
-// drop the change notice it caused, or the watch reloads it all again
-// 0.4 s later for nothing.  A fresh watch is opened on the next frame.
-static void folder_watch_quiet(void) { folder_watch_close(); g_fw_due = 0; }
+static void folder_watch_quiet(void) {
+    g_fw_due = 0;
+    snprintf(g_fw_quiet_path, sizeof g_fw_quiet_path, "%s", g_app.current_path);
+    g_fw_quiet_until = tick_in(1500);
+}
+// Is a change notice still pending somewhere?  (keeps the loop awake)
+static bool folder_watch_pending(void) {
+    if (g_fw_due) return true;
+    for (int i = 0; i < g_fw_n; i++) if (g_fw[i].due) return true;
+    return false;
+}
 
 // Items made by a Windows menu verb ("New > Folder", "Compressed (zipped)
 // folder"...) appear a moment later through the folder watch.  Explorer
@@ -22457,34 +23119,131 @@ static bool g_bench;                     // (defined with the bench code)
 // after a silent update.  The full --selftest checks THIS machine's shell
 // (drives, 7-Zip, Send to...) and must never roll a user's update back.
 static bool g_smoke = false;
-static void folder_watch_pump(void) {
-    if (g_fw_off || g_st_running || g_bench) { folder_watch_close(); return; }
-    const char* cur = g_app.current_path;
-    if (!cur[0] || is_this_pc(cur) || g_app.load_state == LOAD_ERROR) {
-        folder_watch_close();
+// Re-read a BACKGROUND pane's folder in place, keeping the item it had
+// selected and its scroll position.  A failed read keeps the old listing.
+static void pane_load_restored(Pane* p);
+static void pane_reload_bg(Pane* p) {
+    FolderView* f = &p->folder;
+    char sel_path[1024] = "";
+    if (f->entries && f->view && f->selected >= 0 &&
+        (size_t)f->selected < f->view_count) {
+        int ei = f->view[f->selected];
+        if (ei >= 0 && (size_t)ei < f->count)
+            snprintf(sel_path, sizeof sel_path, "%s", f->entries[ei].path);
+    }
+    int scroll = f->scroll;
+    DirEntry* old_e = f->entries;
+    int* old_v = f->view;
+    size_t old_n = f->count, old_vn = f->view_count;
+    int old_sel = f->selected, old_ls = f->load_state;
+    f->entries = NULL;
+    f->view = NULL;
+    pane_load_restored(p);
+    if (!f->entries) {                           // keep what it showed
+        f->entries = old_e;
+        f->view = old_v;
+        f->count = old_n;
+        f->view_count = old_vn;
+        f->selected = old_sel;
+        f->scroll = scroll;
+        f->load_state = old_ls;
         return;
     }
-    if (g_fw_handle == INVALID_HANDLE_VALUE || _stricmp(g_fw_path, cur) != 0) {
-        folder_watch_close();
-        g_fw_handle = FindFirstChangeNotificationA(
-            cur, FALSE,
-            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
-                FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE |
-                FILE_NOTIFY_CHANGE_ATTRIBUTES);
-        if (g_fw_handle != INVALID_HANDLE_VALUE)
-            snprintf(g_fw_path, sizeof g_fw_path, "%s", cur);
-        g_fw_due = 0;
-        return;                       // a fresh watch starts quiet
+    free(old_e);
+    free(old_v);
+    memset(f->sel_bits, 0, sizeof f->sel_bits);
+    f->selected = -1;
+    if (sel_path[0])
+        for (size_t vi = 0; vi < f->view_count; vi++)
+            if (_stricmp(f->entries[f->view[vi]].path, sel_path) == 0) {
+                f->selected = (int)vi;
+                if (vi < SEL_MAX) f->sel_bits[vi / 32] |= 1u << (vi % 32);
+                break;
+            }
+    f->scroll = ((size_t)scroll < f->view_count) ? scroll : 0;
+}
+
+// Mark the folders shown by a pane tree (every leaf, active one included).
+static void fw_collect(Pane* p) {
+    if (!p) return;
+    if (p->kind != PN_LEAF) { fw_collect(p->left); fw_collect(p->right); return; }
+    const char* path = (p == g_active_pane) ? g_app.current_path
+                                            : p->folder.current_path;
+    if (!path[0] || is_this_pc(path)) return;
+    if (p != g_active_pane && p->folder.load_state == LOAD_ERROR) return;
+    if (p == g_active_pane && g_app.load_state == LOAD_ERROR) return;
+    for (int i = 0; i < g_fw_n; i++)
+        if (_stricmp(g_fw[i].path, path) == 0) { g_fw[i].used = true; return; }
+    if (g_fw_n >= FW_MAX) return;
+    FwSlot* w = &g_fw[g_fw_n];
+    w->h = FindFirstChangeNotificationA(
+        path, FALSE,
+        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+            FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE |
+            FILE_NOTIFY_CHANGE_ATTRIBUTES);
+    if (w->h == INVALID_HANDLE_VALUE) return;
+    snprintf(w->path, sizeof w->path, "%s", path);
+    w->due = 0;                                  // a fresh watch starts quiet
+    w->used = true;
+    g_fw_n++;
+}
+
+// Every background pane (all tabs) showing `path` is re-read.
+static void fw_reload_bg(Pane* p, const char* path) {
+    if (!p) return;
+    if (p->kind != PN_LEAF) {
+        fw_reload_bg(p->left, path);
+        fw_reload_bg(p->right, path);
+        return;
     }
-    if (WaitForSingleObject(g_fw_handle, 0) == WAIT_OBJECT_0) {
-        if (!FindNextChangeNotification(g_fw_handle)) folder_watch_close();
-        if (!g_fw_due) g_fw_due = tick_in(400);
+    if (p == g_active_pane || p->folder.view_mode == MODE_TREE ||
+        p->folder.search_buf[0] || _stricmp(p->folder.current_path, path) != 0)
+        return;
+    pane_reload_bg(p);
+}
+
+static void folder_watch_pump(void) {
+    if (g_fw_off || g_st_running || g_bench) { folder_watch_close(); return; }
+    // 1) watch exactly the folders some pane shows right now
+    for (int i = 0; i < g_fw_n; i++) g_fw[i].used = false;
+    for (int t = 0; t < g_ws_n; t++)
+        fw_collect(t == g_ws_cur ? g_pane_root : ws_root(t));
+    for (int i = 0; i < g_fw_n;) {
+        if (!g_fw[i].used) {
+            if (g_fw[i].h != INVALID_HANDLE_VALUE)
+                FindCloseChangeNotification(g_fw[i].h);
+            g_fw[i] = g_fw[--g_fw_n];
+            continue;
+        }
+        i++;
     }
+    // 2) collect change notices (debounced per folder)
+    for (int i = 0; i < g_fw_n; i++) {
+        FwSlot* w = &g_fw[i];
+        if (WaitForSingleObject(w->h, 0) == WAIT_OBJECT_0) {
+            FindNextChangeNotification(w->h);
+            if (!w->due) w->due = tick_in(300);
+        }
+    }
+    bool busy = paste_busy() || del_busy() || g_rename_vi >= 0 ||
+                g_confirm_kind != CONFIRM_NONE ||
+                g_srch_state != SRCH_IDLE || g_app.addr_focused ||
+                g_app.view_mode == MODE_TREE;
+    // 3) folders whose burst is over: reload every pane showing them
+    for (int i = 0; i < g_fw_n; i++) {
+        FwSlot* w = &g_fw[i];
+        if (!w->due || tick_before(w->due)) continue;
+        w->due = 0;
+        for (int t = 0; t < g_ws_n; t++)
+            fw_reload_bg(t == g_ws_cur ? g_pane_root : ws_root(t), w->path);
+        if (_stricmp(w->path, g_app.current_path) == 0) {
+            bool quiet = tick_before(g_fw_quiet_until) &&
+                         _stricmp(g_fw_quiet_path, w->path) == 0;
+            if (!quiet && !g_fw_due) g_fw_due = tick_in(0);
+        }
+    }
+    // 4) the active pane (asked for by a change notice or by the app)
     if (g_fw_due && !tick_before(g_fw_due)) {
-        bool busy = paste_busy() || g_rename_vi >= 0 ||
-                    g_confirm_kind != CONFIRM_NONE ||
-                    g_srch_state != SRCH_IDLE || g_app.addr_focused ||
-                    g_app.view_mode == MODE_TREE;
         if (busy) { g_fw_due = tick_in(400); return; }
         g_fw_due = 0;
         folder_refresh_keep();
@@ -22500,6 +23259,7 @@ static void handle_input(void) {
     search_pump();                  // finish / progress / retry a folder scan
     update_pump();                  // publish the update worker's status
     paste_pump();                   // background copy: progress / landing
+    del_pump();                     // background delete: landing
     drop_pump();                    // files dropped in from Explorer
     folder_watch_pump();            // auto-refresh when the folder changes
 
@@ -22759,6 +23519,7 @@ static char g_init_path[MAX_PATH + 8];
 // --bench harness state (see run_bench): engine + display timings on a
 // fixed dataset. Measurement only - it never runs with the GUI loop.
 static bool g_bench = false;
+static bool g_bench_ops = false;   // copy / delete bench (--bench-ops)
 static bool g_bench_nav = false;   // navigation/icon bench instead of search
 static char g_bench_root[1024];
 static char g_bench_query[64] = "zeta";
@@ -23029,7 +23790,7 @@ static void pane_load_restored(Pane* p) {
     g_sort_key = p->folder.sort_key;
     g_sort_dir = p->folder.sort_dir;
     filter_entries(entries, &count);                // hidden / system out
-    if (count > 1) qsort(entries, count, sizeof(DirEntry), cmp_entry);
+    if (count > 1) sort_entries(entries, count);
     p->folder.folder_count = g_folder_count;
     p->folder.file_count = g_file_count;
     p->folder.hidden_total = g_hidden_total;
@@ -23264,6 +24025,11 @@ static bool app_init(void) {
     pal_apply();                        // the default: Midnight
     g_sort_key = SORT_NAME;
     g_sort_dir = 1;
+    // the live view's own copy too: app_push_folder() hands g_app.sort_dir
+    // to cmp_entry, and 0 there compared every pair as equal (random order
+    // in a split / new pane until the user clicked a column)
+    g_app.sort_key = SORT_NAME;
+    g_app.sort_dir = 1;
     setvbuf(stdout, NULL, _IONBF, 0);
     SetUnhandledExceptionFilter(nova_on_crash);   // never "just close"
 
@@ -33449,6 +34215,78 @@ static void bench_print_mem(void) {
                (double)pmc.PeakWorkingSetSize / 1048576.0);
 }
 
+// "--bench-ops": copy / permanent delete timings on a scratch tree in
+// %TEMP% (5000 small files in 10 folders + 2 big files).  Never touches
+// the Recycle Bin or anything outside its own fixture.
+static void bench_ops_write(const char* p, DWORD bytes) {
+    HANDLE f = CreateFileA(p, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    static char buf[1 << 20];
+    for (int i = 0; i < (int)sizeof buf; i++) buf[i] = (char)(i * 31);
+    while (bytes > 0) {
+        DWORD n = bytes > sizeof buf ? (DWORD)sizeof buf : bytes, w = 0;
+        if (!WriteFile(f, buf, n, &w, NULL) || w == 0) break;
+        bytes -= w;
+    }
+    CloseHandle(f);
+}
+static void run_bench_ops(void) {
+    char tmp[MAX_PATH + 16], fix[1024], big[1024];
+    GetTempPathA((DWORD)sizeof tmp, tmp);
+    snprintf(fix, sizeof fix, "%snova_opfix", tmp);
+    snprintf(big, sizeof big, "%snova_opbig", tmp);
+    char err[256];
+    if (GetFileAttributesA(fix) == INVALID_FILE_ATTRIBUTES) {
+        printf("[bench] generating %s ...\n", fix);
+        CreateDirectoryA(fix, NULL);
+        for (int d = 0; d < 10; d++) {
+            char dir[1100];
+            snprintf(dir, sizeof dir, "%s\\dir%02d", fix, d);
+            CreateDirectoryA(dir, NULL);
+            for (int i = 0; i < 500; i++) {
+                char p[1200];
+                snprintf(p, sizeof p, "%s\\file%04d.txt", dir, i);
+                bench_ops_write(p, 4096 + (DWORD)(i % 7) * 1000);
+            }
+        }
+    }
+    if (GetFileAttributesA(big) == INVALID_FILE_ATTRIBUTES) {
+        CreateDirectoryA(big, NULL);
+        for (int i = 0; i < 2; i++) {
+            char p[1200];
+            snprintf(p, sizeof p, "%s\\big%d.bin", big, i);
+            bench_ops_write(p, 256u << 20);
+        }
+    }
+    int runs = (g_bench_runs > 0 && g_bench_runs <= BENCH_MAX_RUNS)
+                   ? g_bench_runs : 3;
+    const char* srcs[2] = {fix, big};
+    const char* names[2] = {"small x5000", "big 2x256MB"};
+    for (int s = 0; s < 2; s++) {
+        double c[BENCH_MAX_RUNS], d[BENCH_MAX_RUNS];
+        for (int r = 0; r < runs; r++) {
+            char dst[1100];
+            snprintf(dst, sizeof dst, "%s_copy", srcs[s]);
+            if (GetFileAttributesA(dst) != INVALID_FILE_ATTRIBUTES)
+                fs_delete_one(dst, err, sizeof err);
+            double t0 = nova_now_ms();
+            bool ok = fs_copy_to(srcs[s], dst, err, sizeof err);
+            c[r] = nova_now_ms() - t0;
+            t0 = nova_now_ms();
+            bool ok2 = fs_delete_one(dst, err, sizeof err);
+            d[r] = nova_now_ms() - t0;
+            printf("[bench] ops %s run %d: copy %.1f ms%s | delete %.1f ms%s\n",
+                   names[s], r + 1, c[r], ok ? "" : " FAIL", d[r],
+                   ok2 ? "" : " FAIL");
+        }
+        qsort(c, (size_t)runs, sizeof(double), bench_cmp_d);
+        qsort(d, (size_t)runs, sizeof(double), bench_cmp_d);
+        printf("[bench] MEDIAN ops %s: copy %.1f ms | delete %.1f ms\n",
+               names[s], c[runs / 2], d[runs / 2]);
+    }
+}
+
 static void run_bench_nav(void) {
     char fix[1024], tmp[MAX_PATH + 16];
     GetTempPathA((DWORD)sizeof tmp, tmp);
@@ -33717,6 +34555,7 @@ static FolderView folder_view_from_app(void) {
     fv.search_focused = g_app.search_focused;
     fv.addr_focused = g_app.addr_focused;
     fv.zoom = g_app.zoom;              // per-pane icon size (live value)
+    memcpy(fv.col_w, g_app.col_w, sizeof(fv.col_w));   // per-pane columns
     fv.folder_count = g_folder_count;
     fv.file_count = g_file_count;
     fv.hidden_total = g_hidden_total;
@@ -33744,7 +34583,7 @@ static void app_push_folder(const FolderView* fv) {
     g_app.scroll = fv->scroll;
     g_app.view_mode = fv->view_mode;
     g_app.sort_key = fv->sort_key;
-    g_app.sort_dir = fv->sort_dir;
+    g_app.sort_dir = fv->sort_dir ? fv->sort_dir : 1;   // never "no order"
     memcpy(g_app.history, fv->history, sizeof(g_app.history));
     g_app.history_count = fv->history_count;
     memcpy(g_app.fwd_history, fv->fwd_history, sizeof(g_app.fwd_history));
@@ -33758,6 +34597,7 @@ static void app_push_folder(const FolderView* fv) {
     // here - a render swap of an inactive pane must never disturb it; only a
     // real activation (activate_pane) re-syncs g_zoom.
     g_app.zoom = (fv->zoom > 0.01f) ? fv->zoom : 0.6f;
+    memcpy(g_app.col_w, fv->col_w, sizeof(g_app.col_w));
     g_folder_count = fv->folder_count;
     g_file_count = fv->file_count;
     g_hidden_total = fv->hidden_total;
@@ -34361,20 +35201,7 @@ static void pane_list_metrics(Layout* L, RectI rect) {
     if (L->max_scroll > 0 && travel > 0)
         thumb_y += travel * g_app.scroll / L->max_scroll;
     L->scroll_thumb = (RectI){L->scroll_track.x, thumb_y, L->scroll_w, thumb_h};
-    int pad = L->has_scroll ? L->scroll_w : 0;
-    L->show_extra_cols = (g_app.view_mode == MODE_DETAILS)
-        && (rect.w >= SC(700));
-    L->name_w = L->show_extra_cols ? (rect.w - SC(374) - pad)
-        : (rect.w - SC(40) - pad);
-    if (L->name_w < SC(40)) L->name_w = SC(40);
-    L->col_size_right = rect.x + rect.w - SC(246) - pad;
-    L->col_mod_left = rect.x + rect.w - SC(234) - pad;
-    L->col_type_left = rect.x + rect.w - SC(92) - pad;
-    L->hdr_count = L->show_extra_cols ? 4 : 1;
-    L->hdr[0] = (RectI){rect.x + SC(8), rect.y, L->name_w + SC(20), L->list_head_h};
-    L->hdr[1] = (RectI){L->col_size_right - SC(92), rect.y, SC(92), L->list_head_h};
-    L->hdr[2] = (RectI){L->col_mod_left, rect.y, SC(130), L->list_head_h};
-    L->hdr[3] = (RectI){L->col_type_left, rect.y, SC(90), L->list_head_h};
+    col_metrics(L, rect.x, rect.w, rect.y, L->has_scroll ? L->scroll_w : 0);
 }
 
 // The layout used for input: window chrome + the ACTIVE pane's title
@@ -34976,6 +35803,7 @@ static bool app_busy(void) {
     if (g_srch_state == SRCH_RUN) return true;               // folder scan
     if (InterlockedCompareExchange(&g_props_running, 0, 0)) return true;
     if (paste_busy()) return true;                           // copy / move
+    if (del_busy()) return true;                             // delete
     if (zoom_settling() || g_shell_burst > 0) return true;   // animations
     if (g_drag_split || g_tab_drag || g_splitter_drag || g_size_drag)
         return true;
@@ -34986,6 +35814,7 @@ static bool app_busy(void) {
     if (g_sb_drag) return true;
     if (g_side_anim != (g_opt_sidebar ? 1.0f : 0.0f)) return true;   // sliding
     if (g_tip_pending) return true;                                  // tooltip due
+    if (folder_watch_pending()) return true;      // a folder change lands soon
     return false;
 }
 
@@ -35041,6 +35870,7 @@ static void app_run(bool selftest) {
     if (selftest && !g_smoke) run_selftest();
     if (g_bench) {                     // benchmark mode: measure, then out
         if (g_bench_nav) run_bench_nav();
+        else if (g_bench_ops) run_bench_ops();
         else run_bench();
         g_app.running = false;
         return;
@@ -35221,6 +36051,10 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--bench") == 0) g_bench = true;
         else if (strcmp(argv[i], "--update-check") == 0) update_cli_mode = 1;
         else if (strcmp(argv[i], "--update-apply") == 0) update_cli_mode = 2;
+        else if (strcmp(argv[i], "--bench-ops") == 0) {
+            g_bench = true;
+            g_bench_ops = true;
+        }
         else if (strcmp(argv[i], "--bench-nav") == 0) {
             g_bench = true;
             g_bench_nav = true;
